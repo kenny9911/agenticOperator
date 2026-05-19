@@ -44,14 +44,18 @@ export interface ValidationReport {
   missingInstructions: string[];
 }
 
-// ───── Runtime input ─────
+// ───── Runtime input + scope ─────
 
-export interface RuntimeClient {
-  /** Rendered as `client_name: <name>`. */
-  name: string;
-  /** Rendered as `department: <department>` when present. */
+/**
+ * Tenant scope. Passed as the third arg to `fillRuntimeInput`, sourced from
+ * `client` + `clientDepartment` at the `generatePrompt` call site.
+ *   - `client` drives rule filtering (build-time) AND renders the
+ *     `### client` block (fill-time).
+ *   - `department` is rendered into the `### client` block when present.
+ */
+export interface RuntimeScope {
+  client: string;
   department?: string;
-  [key: string]: unknown;
 }
 
 export interface RuntimeJob {
@@ -65,21 +69,8 @@ export interface RuntimeResume {
 }
 
 export interface MatchResumeRuntimeInput {
-  kind: "matchResume";
-  client: RuntimeClient;
   job: RuntimeJob;
   resume: RuntimeResume;
 }
 
-export type RuntimeInputV4 =
-  | MatchResumeRuntimeInput
-  | string
-  | Record<string, unknown>;
-
-export function isMatchResumeRuntimeInput(x: unknown): x is MatchResumeRuntimeInput {
-  return (
-    typeof x === "object" &&
-    x !== null &&
-    (x as { kind?: unknown }).kind === "matchResume"
-  );
-}
+export type RuntimeInputV4 = string | Record<string, unknown>;

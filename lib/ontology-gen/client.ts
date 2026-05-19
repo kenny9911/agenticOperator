@@ -27,20 +27,54 @@ export interface ClientCallOptions {
  * body on 2xx, throws a typed `OntologyGenError` on any failure.
  */
 export async function getJson(opts: ClientCallOptions): Promise<unknown> {
+  return requestJson({ ...opts, method: "GET" });
+}
+
+/**
+ * POST/PUT `<apiBase><path>` with a JSON body, bearer auth, and timeout.
+ * Mirrors `getJson` for instance writes (e.g. `POST /api/v1/ontology/instances/{label}`).
+ */
+export async function postJson(
+  opts: ClientCallOptions & { body: unknown; method?: "POST" | "PUT" | "PATCH" | "DELETE" },
+): Promise<unknown> {
+  return requestJson({
+    apiBase: opts.apiBase,
+    apiToken: opts.apiToken,
+    path: opts.path,
+    timeoutMs: opts.timeoutMs,
+    method: opts.method ?? "POST",
+    body: opts.body,
+  });
+}
+
+interface RequestJsonOptions extends ClientCallOptions {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  body?: unknown;
+}
+
+async function requestJson(opts: RequestJsonOptions): Promise<unknown> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const url = `${opts.apiBase.replace(/\/+$/, "")}${opts.path}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${opts.apiToken}`,
+    Accept: "application/json",
+  };
+  let bodyInit: BodyInit | undefined;
+  if (opts.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    bodyInit = JSON.stringify(opts.body);
+  }
+
   let response: Response;
   try {
     response = await fetch(url, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${opts.apiToken}`,
-        Accept: "application/json",
-      },
+      method: opts.method,
+      headers,
+      body: bodyInit,
       signal: controller.signal,
     });
   } catch (err) {
@@ -80,6 +114,7 @@ export async function getJson(opts: ClientCallOptions): Promise<unknown> {
   const errDetails: Record<string, unknown> = {
     url,
     status: response.status,
+    method: opts.method,
     ...(env?.details && typeof env.details === "object" ? { upstreamDetails: env.details } : {}),
   };
 
@@ -89,17 +124,22 @@ export async function getJson(opts: ClientCallOptions): Promise<unknown> {
     case 401:
       throw new OntologyAuthError(errMessage, { ...errDetails, errorCode: errCode });
     case 404: {
-      const resource = errCode === "action-not-found" ? "action" : "node";
+      const resource = errCode === "action-not-found"
+        ? "action"
+        : errCode === "schema-not-found"
+          ? "schema"
+          : errCode === "instance-not-found"
+            ? "instance"
+            : "node";
       throw new OntologyNotFoundError(resource, errMessage, { ...errDetails, errorCode: errCode });
     }
+    case 409:
+      throw new OntologyRequestError(errMessage, { ...errDetails, errorCode: errCode });
     case 502:
       throw new OntologyUpstreamError(errMessage, { ...errDetails, errorCode: errCode });
     case 500:
       throw new OntologyServerError(errMessage, { ...errDetails, errorCode: errCode });
     default:
-      // Anything else in the 4xx/5xx range we don't have a specific class for.
-      // Bucket 4xx as request error and 5xx as server error so callers see a
-      // typed error rather than a raw `Error`.
       if (response.status >= 400 && response.status < 500) {
         throw new OntologyRequestError(errMessage, { ...errDetails, errorCode: errCode });
       }

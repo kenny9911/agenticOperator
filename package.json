@@ -25,20 +25,29 @@
     "publish:test": "tsx --env-file=.env.local scripts/publish-test-event.ts",
     "minio:list": "tsx --env-file=.env.local scripts/list-minio-resumes.ts",
     "minio:pick": "tsx --env-file=.env.local scripts/pick-test-resume.ts",
-    "gen:v4-snapshot": "node --env-file=.env.local --import tsx scripts/gen-v4-snapshot.ts"
+    "gen:v4-snapshot": "node --env-file=.env.local --import tsx scripts/gen-v4-snapshot.ts",
+    "simple-rule-check-yy": "node --env-file=.env.local --import tsx scripts/simple-rule-check-yy.ts",
+    "simple-rule-check-yy:seed": "node --env-file=.env.local --import tsx scripts/simple-rule-check-yy-seed.ts",
+    "simple-rule-check-yy:seed:check": "node --env-file=.env.local --import tsx scripts/simple-rule-check-yy-seed.ts --check-only",
+    "rule-check-yy": "node --env-file=.env.local --import tsx scripts/rule-check-yy.ts",
+    "rule-check-yy:seed": "npm run simple-rule-check-yy:seed",
+    "rule-check-yy:seed:check": "npm run simple-rule-check-yy:seed:check",
+    "dev:dump-match-resume-prompt": "node --env-file=.env.local --import tsx scripts/dump-match-resume-prompt.ts"
   },
   "dependencies": {
+    "@types/uuid": "^10.0.0",
     "clsx": "^2.1.1",
     "eventsource-parser": "^3.0.8",
     "inngest": "^4.3.0",
     "minio": "^8.0.7",
     "neo4j-driver": "^6.0.1",
     "next": "16.2.4",
-    "openai": "^6.34.0",
+    "openai": "^6.37.0",
     "pdf-parse": "^2.4.5",
     "react": "19.2.5",
     "react-dom": "19.2.5",
     "unpdf": "^1.6.0",
+    "uuid": "^14.0.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

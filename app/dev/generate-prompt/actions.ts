@@ -10,13 +10,16 @@
 
 import { OntologyGenError } from "@/lib/ontology-gen";
 import { generatePrompt } from "@/lib/ontology-gen/v4";
-import type { MatchResumeRuntimeInput } from "@/lib/ontology-gen/v4";
+import type { RuntimeInputV4 } from "@/lib/ontology-gen/v4";
 
 export interface RunLiveOptions {
   actionRef: string;
   domain: string;
-  client?: string;
-  runtimeInput?: MatchResumeRuntimeInput;
+  /** Required — drives rule filter AND renders the `### client` block. */
+  client: string;
+  /** Optional — renders the `department:` line in the `### client` block. */
+  clientDepartment?: string;
+  runtimeInput?: RuntimeInputV4;
 }
 
 export type RunLiveResult =
@@ -41,6 +44,7 @@ export async function runLive(opts: RunLiveOptions): Promise<RunLiveResult> {
       actionRef: opts.actionRef,
       domain: opts.domain,
       client: opts.client,
+      clientDepartment: opts.clientDepartment,
       runtimeInput: opts.runtimeInput,
     });
     return {

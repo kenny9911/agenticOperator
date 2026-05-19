@@ -78,3 +78,8 @@ data/e2e-out/
 # External projects (separate git repos that happen to live in this dir)
 event_manager/
 raas_v4/
+
+# yy rule-check namespace — runtime audit traces + dev-time artifacts
+data/simple-rule-check-yy-runs/
+data/rule-check-yy-runs/
+data/dev/
