@@ -10,7 +10,7 @@
 | Phase | Module path | npm scripts | Dev UI | Status |
 |---|---|---|---|---|
 | **MVP (current)** | `lib/simple-rule-check/` | `simple-rule-check`, `simple-rule-check:seed`, `simple-rule-check:seed:check` | `/dev/simple-rule-check` | **Shipped, frozen** |
-| **Full impl (future)** | `lib/rule-check/` (empty placeholder) | `rule-check`, `rule-check:seed*` | `/rule-check/*` | Not started |
+| **Full impl** | `lib/rule-check/` (active) | `rule-check`, `rule-check:seed*` | `/rule-check/*` | **Shipped — Path C runtime** |
 
 The MVP is intentionally preserved as a separate module. Full impl is a **new module**, not a rewrite of the MVP — the MVP stays as the simple baseline so we can A/B against the full implementation.
 
@@ -136,10 +136,10 @@ The graph database does **not** currently contain the candidates, jobs, applicat
 | Rules covered | **5 rules**: 10-7 (期望薪资), 10-17 / 10-18 / 10-25 (blacklist class — candidate-internal), **10-32 (岗位冷冻期 — cross-object Application)** | All matchResume rules (40+), extensible to other actions |
 | Instance fetch shapes exercised | Candidate single-field, Candidate nested (work_experience), **Application list-with-filter** | + Blacklist, Locks, cross-action results |
 | Prompt strategy | **B**: extract single rule's text + execution-constraint wrapper | **A**: verbatim consumption of `generatePrompt`'s output (no section discard); `generatePrompt` template is rewritten so output schema embeds `rule_judgments[]` per step (shared with matchResume executor) |
-| LLM call pattern | **One call per rule** | **One call per matchResume run**; output is execution-shaped envelope (`step_results.*.rule_judgments[]` + `final_output`). Per-rule parallel (§14 Path A) and per-step batching (§14 Path C) are reserved backup paths if single-call performance is unacceptable. |
+| LLM call pattern | **One call per rule** | **Path C (active runtime, locked 2026-05-13)**: per-step sequential LLM calls — one per `actionStep` with `rules.length > 0`. Each call returns `{ rule_judgments[] }` using `StepResultJsonSchema`. Orchestrator-controlled short-circuit on red-line `blocked` (when `canBlock !== false`). Path B (single-envelope `step_results.*.rule_judgments[]` + `final_output`) is the historical contract — its envelope (`MatchResumeEvalEnvelopeZod` / `renderEnvelopeSkeleton`) is retained for `/dev/generate-prompt` review only and not used at runtime. Path A (per-rule parallel) is a documented but unused alternative in §14.1. |
 | Confidence | LLM self-reported `∈ [0, 1]` | Composite: `0.4 × logprob_score + 0.3 × evidence_count_factor + 0.3 × consistency_factor` |
 | Storage | Filesystem `data/simple-rule-check-runs/<runId>.json` | Filesystem `data/rule-check-runs/<runId>.json` (Neo4j write-back is **forbidden** per §2 Non-goals; any future external store, e.g. OpenSearch or S3, is out-of-Ontology-API) |
-| Public API | `checkRule()` only; `checkRules()` reserved (throws `NotImplementedError`) | `checkRule()` + `checkRules()` (batch with internal parallelism) |
+| Public API | `checkRule()` only; `checkRules()` reserved (throws `Error("checkRules() is reserved for the full implementation")`) | `checkRule()` + `checkRules()` (batch via Path C per-step orchestration) |
 | Validation | rule_id exists + evidence grounded + schema valid | + block-semantic check via rule classification metadata |
 | Audit Q&A | Inspect trace JSON manually | LLM-driven Q&A panel + cross-run analytics |
 | UI | `/dev/simple-rule-check` dev tool | `/rule-check/*` commercial product UI on port 3002 |
@@ -283,34 +283,77 @@ lib/
 │   │   └── index.ts                   # Orchestrator interface
 │   ├── checker.ts                     # Public: checkRule(); checkRules() throws NotImplementedError
 │   └── index.ts                       # Barrel exports
-└── rule-check/                       ◄── FULL impl module (NOT YET CREATED — empty placeholder)
-    │                                    will hold the all-rules orchestrator,
-    │                                    composite confidence, full-action prompt strategy
-    │                                    when built. Does NOT replace simple-rule-check.
-    └── (empty)
+└── rule-check/                       ◄── FULL impl module (Path C runtime, active)
+    ├── index.ts                       # ABI: { checkRule, checkRules } + audited types
+    ├── checker.ts                     # checkRules() → allInOneOrchestrator.run(); checkRule() = filter sugar
+    ├── types.ts                       # re-export MVP base types + FetchedRuleClassified
+    ├── types-audited.ts               # RuleJudgmentAudited / RuleCheckRunAudited /
+    │                                  # RuleCheckBatchRunAudited / StepCallRecord / etc.
+    ├── output-schema-audited.ts       # Zod + JSON Schema (re-export from v4/envelope-schema)
+    ├── debug.ts                       # rcLog / rcInfo / rcDebug / rcWarn + RULE_CHECK_DEBUG
+    ├── aggregate-decision.ts          # cascade aggregate: blocked > pending_human > passed > not_started
+    ├── llm-client.ts                  # OpenAI SDK + streaming + strict json_schema + logprobs env
+    ├── fetch-rules.ts                 # wrap fetchAction + applyClientFilter; derive canBlock / requiredInstances
+    ├── fetch-instances.ts             # Ontology GET single/list via tracedGetJson
+    ├── fetch-extra-instances.ts       # rule.spec-driven prefetch (Candidate / Application / Blacklist)
+    ├── rule-instance-map.ts           # ruleId → InstanceSpec for 10-7 / 10-17 / 10-18 / 10-25 / 10-32
+    ├── instance-overview.ts           # UI overview-card data shapers
+    ├── server-actions.ts              # /rule-check/* server actions
+    ├── orchestrator/
+    │   ├── all-in-one.ts              # ★ Path C core: A-G stages, per-step LLM, short-circuit
+    │   └── index.ts                   # Orchestrator interface + re-export allInOneOrchestrator
+    ├── prompt/
+    │   ├── build.ts                   # buildEvalPrompt: generatePrompt → fillRuntimeInput → SHA256 provenance
+    │   ├── focusing-system.ts         # FOCUSING_SYSTEM_MESSAGE
+    │   └── runtime-input-loader.ts    # loadMatchResumeRuntimeInput
+    ├── validation/
+    │   ├── index.ts                   # runValidationAudited orchestrator (4 checks)
+    │   ├── schema.ts                  # Zod safeParse → issues
+    │   ├── rule-id.ts                 # rule_id ∈ fetchedRules
+    │   ├── evidence-grounded.ts       # JSONPath-lite + deepEqual; tags ev.grounded; lenient (Q4)
+    │   └── block-semantic.ts          # canBlock=false ∧ decision=blocked → warning
+    ├── confidence/
+    │   ├── index.ts                   # ConfidenceCalculator interface + composite re-export
+    │   └── composite.ts               # 0.4·logprob + 0.3·evidenceCount + 0.3·consistency
+    └── store/
+        ├── index.ts                   # RunStore interface + RunQuery / RunIndexEntry
+        ├── filesystem.ts              # writeRun / writeBatch / listRuns / getRun / getBatch (JSONL index)
+        ├── external.ts                # OpenSearch / ClickHouse stubs (throw NOT_IMPLEMENTED)
+        └── ontology-trace-recorder.ts # tracedGetJson: wraps getJson, records every HTTP into traceCtx.trace[]
 
 scripts/
-├── simple-rule-check.ts              # MVP CLI entry → simple-rule-check checkRule()
-├── simple-rule-check-seed.ts         # MVP seed: 48 instances to RAAS-v1
-├── rule-check.ts                     # (future) full impl CLI
-└── rule-check-seed.ts                # (future) full impl seed if needed
+├── simple-rule-check.ts              # MVP CLI → simple-rule-check.checkRule()
+├── simple-rule-check-seed.ts         # MVP seed: 14 instances to RAAS-v1
+├── rule-check.ts                     # Full impl CLI → checkRules()
+└── rule-check-seed.ts                # alias for simple-rule-check-seed.ts (declared in package.json)
 
 app/dev/simple-rule-check/             # MVP dev UI (URL-only, not in LeftNav)
 ├── page.tsx
 └── actions.ts                         # Server action wrapper
 
-app/rule-check/                        # FULL product UI (stub dir, §9.2)
-├── page.tsx                           # dashboard
-├── runs/page.tsx                      # list
-├── runs/[runId]/page.tsx              # detail
-├── candidates/[id]/page.tsx
-└── rules/page.tsx
+app/dev/rule-check/                    # Full impl engineering preview
+├── page.tsx
+└── actions.ts                         # Calls runCheckBatch
+
+app/rule-check/                        # Full product UI (Trust nav group)
+├── page.tsx                           # / — aggregate (BatchList + BatchPreview)
+├── actions.ts                         # thin "use server" re-export + LOCAL type redeclarations
+├── matrix/page.tsx                    # /matrix — rules × candidates grid
+├── rules/page.tsx                     # /rules — rule library
+├── batches/[batchId]/page.tsx         # /batches/<id> — verdict + stepCalls + per-step rule cards
+├── runs/[runId]/page.tsx              # /runs/<id> — 8-layer Prove detail page
+├── runs/page.tsx                      # /runs — Next.js redirect("/rule-check") (307)
+├── candidates/[id]/page.tsx           # /candidates/<id> — timeline (MOCK_RUNS demo)
+├── audit/page.tsx                     # /audit — compliance export stub
+└── settings/page.tsx                  # /settings — settings stub
 
 data/simple-rule-check-runs/           # MVP audit traces (gitignored)
 └── <YYYYMMDD>/<runId>.json
 
-data/rule-check-runs/                  # FULL impl audit traces (gitignored, when built)
-└── <YYYYMMDD>/<runId>.json
+data/rule-check-runs/                  # Full impl audit traces (gitignored)
+├── <YYYYMMDD>/<runId>.json            # per-rule run
+├── batches/<batchId>.json             # per checkRules() invocation
+└── index.jsonl                        # append-only listing index
 ```
 
 ### 5.2 Ontology API capabilities the Checker depends on
@@ -452,7 +495,7 @@ export interface RuleCheckRun {
       id: string;
       name: string;
       sourceText: string;
-      stepId: string;
+      stepOrder: number;
       applicableScope: string;
     };
     instances: Array<{
@@ -563,17 +606,26 @@ export interface MatchResumeEvalEnvelope {
  *  step4 rule_judgments[i] shape without breaking existing consumers. */
 ```
 
-#### Per-judgment `RuleJudgmentAudited` shape (unchanged from prior drafts)
+#### Per-judgment `RuleJudgmentAudited` shape
+
+In code, `RuleJudgmentAudited` is a **standalone** interface (not a TS `extends RuleJudgment`) that restates the MVP base fields plus the audit-rich additions. See `lib/rule-check/types-audited.ts:55-67`.
 
 ```ts
-export interface RuleJudgmentAudited extends RuleJudgment {
-  /** 4-section Chinese narrative — same as MVP, but the UI parses it as structured. */
+export interface RuleJudgmentAudited {
+  ruleId: string;
+  decision: "passed" | "blocked" | "pending_human" | "not_started";
+  nextAction: { type: "..."; ... };
+  confidence: number;
+
+  /** 3-section Chinese narrative. The UI parses it as structured. */
   rootCause: string;
 
-  /** NEW: parsed view of rootCause sections — the LLM emits this in parallel
-   *  with the prose `rootCause` so the UI doesn't have to regex-split. */
+  /** Parsed view of rootCause sections — the LLM emits this in parallel
+   *  with the prose `rootCause` so the UI doesn't have to regex-split.
+   *  (v3 schema update, 2026-05-13: dropped `ruleRequirement`. The rule's
+   *  原文 lives once on `/rule-check/batches/[batchId]`, no longer repeated
+   *  inside every judgment.) */
   rootCauseSections: {
-    ruleRequirement: string;     // 【规则要求】
     dataObservation: string;     // 【数据观察】
     contrastReasoning: string;   // 【对照推理】
     conclusion: string;          // 【结论】
@@ -599,8 +651,24 @@ export interface RuleJudgmentAudited extends RuleJudgment {
   }>;
 }
 
-export interface RuleCheckRunAudited extends Omit<RuleCheckRun, "llmParsed"> {
+// In code, `RuleCheckRunAudited` is also a standalone interface (not extends
+// Omit<RuleCheckRun,…>) restating all fields from `RuleCheckRun` plus the
+// audited extensions. See `lib/rule-check/types-audited.ts:135-159`. The
+// addition is `auditPath?: string` (path to the persisted JSON, set by
+// orchestrator after filesystem write).
+
+export interface RuleCheckRunAudited {
+  runId: string;
+  batchId?: string;
+  timestamp: string;
+  input: CheckRuleInput;
+  fetched: { rule: { ...; stepOrder: number; ... }; instances: ... };
+  prompt: string;
+  llmRaw: { model: string; response: unknown; ... };
   llmParsed: RuleJudgmentAudited | null;
+  validation: ValidationReport;
+  finalDecision: FinalDecision;
+  auditPath?: string;
 
   /** NEW: which prompt template + actionObject version produced this prompt.
    *  Lets the diff view in §9.2 detect drift since the run. */
@@ -887,33 +955,43 @@ const response = await openai.chat.completions.create({
 });
 ```
 
-#### Full impl — execution envelope (Path B locked)
+#### Full impl — per-step `StepResult` (Path C, active runtime)
+
+At runtime the Full impl issues **N LLM calls per matchResume run**, one per `actionStep` with `rules.length > 0`. Each call asks the LLM for that step's `rule_judgments[]` only, using `StepResultJsonSchema` (a sub-shape of the historical envelope's `step_results.<step_N>` cell). The orchestrator concatenates the per-step results into a single `RuleCheckBatchRunAudited.results[]`.
+
+The call is also **streaming**, with `stream_options: { include_usage: true }` so the final frame carries `prompt_tokens` / `completion_tokens`. The streaming switch was made because Kimi-k2.6 via new-api was 504-ing before completing the historical full-envelope (~10-15K-token) output. Per-step calls fit under the proxy timeout cleanly.
 
 ```ts
-// lib/rule-check/llm-client.ts
+// lib/rule-check/llm-client.ts (active shape)
 
-import { MatchResumeEvalEnvelopeSchema } from "./output-schema-audited";  // §6.3
+import { StepResultJsonSchema } from "./output-schema-audited";
 
-const response = await openai.chat.completions.create({
+const stream = await openai.chat.completions.create({
   model: process.env.OPENAI_MODEL ?? "gpt-4o",
   messages: [
     { role: "system", content: FOCUSING_SYSTEM_MESSAGE },
-    { role: "user",   content: resolved.prompt },        // verbatim generatePrompt output
+    { role: "user",   content: stepResolvedPrompt },     // generatePrompt({ focusStep: stepN })
   ],
   response_format: {
     type: "json_schema",
     json_schema: {
-      name: "MatchResumeEvalEnvelope",
-      schema: matchResumeEvalEnvelopeJsonSchema,         // mirrors §6.3 Zod
+      name: "StepResult",
+      schema: StepResultJsonSchema,
       strict: true,
     },
   },
+  stream: true,
+  stream_options: { include_usage: true },
   // logprobs: false by default — opt-in via RULE_CHECK_LOGPROBS=1 env.
   // Composite confidence degrades gracefully when absent (see §7.5).
 });
+
+// Stream is assembled in llm-client.ts into a synthetic non-streaming
+// response object compatible with the historical `response.choices[0]`
+// shape that downstream Zod parsing expects.
 ```
 
-The single LLM call produces one `MatchResumeEvalEnvelope` containing all `step_results[*].rule_judgments[]` for the action. No batch flat array; no per-rule call.
+**Path B**'s `MatchResumeEvalEnvelopeZod` + `renderEnvelopeSkeleton` survive only as the rendered output-schema-teaching block inside `/dev/generate-prompt`'s prompt preview — they are not used to decode runtime LLM output.
 
 ### 7.4 Step 9 — Validation (deterministic)
 
@@ -1526,14 +1604,15 @@ These were evaluated during design (2026-05-12) and **not selected** for the Ful
 | When to pivot | If Path B's single envelope keeps hitting provider 504s, output-size limits, or strict-schema enforcement bugs that can't be resolved at the provider layer. |
 | Impact on `generatePrompt` template | Same rewritten output schema can still be reused — Path A's orchestrator would target a **single-judgment subset** of the envelope shape per call. No second template needed. |
 
-#### Path C — Per-step batching (折中 backup)
+#### Path C — Per-step sequential (**ACTIVE RUNTIME**, locked 2026-05-13)
 
 | | |
 |---|---|
-| Topology | `actionSteps.length` LLM calls (typically 3-5), each producing one step's `rule_judgments[]`. Run in parallel or in step.order. |
-| Pros | Intermediate between Path A and Path B. Preserves step boundary semantics (a step's rules judged together). Each call's output is bounded by step.rules.length (typically 2-4 rules), avoiding the full-N output explosion that hurts Path B. |
-| Cons | Per-step envelope reliability still has multi-rule risk. Aggregation logic is more complex (need to stitch step_results across responses). |
-| When to pivot | If Path B is unreliable due to output volume but the single-call mental model is still desired; Path C is the smallest deviation that preserves step grouping. |
+| Topology | `actionSteps.length` LLM calls, executed **sequentially** in `step.order`. Each call produces one step's `rule_judgments[]` via `StepResultJsonSchema`. |
+| Short-circuit | If any rule in step N returns `decision: "blocked"` AND `rule.canBlock !== false`, the orchestrator skips remaining steps and synthesizes `not_started` runs for their rules (`overrideReason = "short_circuit:step_<N>:rule_<id>"`), so the matrix / aggregate views still get a full grid. |
+| Pros | Preserves step boundary semantics. Per-call output is bounded by `step.rules.length` (typically 2-4 rules) → fits under proxy timeouts (the 504 issue that killed Path B). Streaming + `stream_options.include_usage` per call. Short-circuit saves LLM cost on terminal rules. |
+| Cons | More wall-clock latency than Path A's parallelism. Aggregation logic stitches step_results across responses (handled in `lib/rule-check/orchestrator/all-in-one.ts`). |
+| Why it won | Kimi-k2.6 via new-api 504'd on Path B's full-envelope output. Sequential per-step output stays under proxy timeout. Decision logged in §15 (2026-05-13). |
 
 #### Agentic dynamic fetch (含义 B, future work)
 

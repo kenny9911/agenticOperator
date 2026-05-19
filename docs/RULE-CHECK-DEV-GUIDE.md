@@ -5,8 +5,6 @@
 > 作用: 给接手 / 继续开发的同学一份**自包含**的指南。在本文档中能找到代码结构、运行方式、数据流、扩展点、调试技巧、已知缺陷与路线图。
 >
 > 上游设计依据: [docs/RUNTIME-RULE-CHECKER-SPEC.md](RUNTIME-RULE-CHECKER-SPEC.md)。本文聚焦"代码层实际实现"——历史决策与设计原则查上面那份 SPEC。
->
-> 本文档日期: 2026-05-14。
 
 ---
 
@@ -36,12 +34,12 @@ parseResume → matchResume agent
 
 | 维度 | `lib/simple-rule-check/` (MVP, frozen) | `lib/rule-check/` (Full, active) |
 |---|---|---|
-| 入口 | `checkRule(input)` 单条规则; `checkRules` 抛 `NotImplementedError` | `checkRules(input)` 一次性跑完一个 action 的所有规则; `checkRule()` 是 `checkRules` 的过滤器糖 |
+| 入口 | `checkRule(input)` 单条规则; `checkRules` 抛 `Error("checkRules() is reserved for the full implementation")` | `checkRules(input)` 一次性跑完一个 action 的所有规则; `checkRule()` 是 `checkRules` 的过滤器糖 |
 | Prompt 来源 | 手写 `prompt/extractor.ts`(单 rule 抽出 + 包一层执行约束) | **直接消费** `generatePrompt()` 输出 + 短 focusing system 消息(`prompt/build.ts` + `prompt/focusing-system.ts`) |
 | LLM 调用拓扑 | 1 rule = 1 LLM call(单条) | **Path C**: 1 action 内每个 `actionStep` 一个 LLM call(按 `stepOrder` 串行), 整批 = N calls;触发 `blocked` 且 `canBlock !== false` 时短路后续 step |
 | 输出 schema | `RuleJudgmentJsonSchema`(扁平判定) | `MatchResumeEvalEnvelopeJsonSchema` / 单 step 用 `StepResultJsonSchema`,与 `matchResume` executor agent **共享 envelope** |
 | 置信度 | `LLMSelfReported` 直接透传 | `Composite`: `0.4·logprob + 0.3·evidenceCount + 0.3·consistency`;无 logprobs 时降级到 `0.5·evidenceCount + 0.5·consistency` |
-| 校验失败处理 | 校验未通过强制 `pending_human`(`overrideReason = "validation_failed: ..."`) | **v3.1 起仅当 LLM 输出 Zod 解析失败(`parsed === null`)才强制 `pending_human`**;其他校验信号(`ruleIdExists` / `schemaValid` per-field / `blockSemantic warning` / `evidenceGrounded`)只记入 `validation.failures[]` 作审计观测,**不再覆盖** LLM 的 `decision` |
+| 校验失败处理 | 校验未通过强制 `pending_human`(`overrideReason = "validation_failed: ..."`,见 `orchestrator/single-call.ts:263`) | **v3.1 起仅当 LLM 输出 Zod 解析失败(`parsed === null`)才强制 `pending_human`**(`overrideReason = "llm_output_unparseable: ..."`,见 `orchestrator/all-in-one.ts:721`)。其他校验信号(`ruleIdExists` / `schemaValid` per-field / `blockSemantic warning`)会影响 `overallOk` 这个软指标(`overallOk = ruleIdResult.ok && schemaResult.ok && blockOutcome !== "warning"`,见 `validation/index.ts:101-104`),但**不会** override LLM 的 `decision`。`evidenceGrounded` 信号仅记入 `validation.failures[]`,不进 `overallOk` 合取(Q4 lenient lock,见 `validation/index.ts:9-15`) |
 | 审计存储 | `data/simple-rule-check-runs/<YYYYMMDD>/<runId>.json` | `data/rule-check-runs/<YYYYMMDD>/<runId>.json` + `data/rule-check-runs/batches/<batchId>.json` + `data/rule-check-runs/index.jsonl` |
 | HTTP trace | 无 | `OntologyApiTrace`: 每一个 Ontology API GET 都进 `ontologyApiTrace[]`(`store/ontology-trace-recorder.ts` 拦截层) |
 | 输出类型 | `RuleCheckRun` | `RuleCheckRunAudited` + `RuleCheckBatchRunAudited`(扩展了 provenance / counterfactuals / stepCalls / ontologyApiTrace / confidenceBreakdown 等审计字段) |
@@ -62,7 +60,7 @@ parseResume → matchResume agent
 agenticOperator/
 ├── lib/
 │   ├── rule-check/                          ← Full / production impl (active)
-│   │   ├── index.ts                         ABI: { checkRule, checkRules, 全部 audited 类型 }
+│   │   ├── index.ts                         ABI: { checkRule, checkRules } + audited 类型(EvidenceAudited / RootCauseSections / CounterfactualEntry / RuleJudgmentAudited / PromptProvenance / OntologyApiTraceEntry / CompositeConfidenceBreakdown / HumanOverride / AskWhyEntry / RuleCheckRunAudited / BatchAggregateDecision / RuleCheckBatchRunAudited)。caveat: `StepCallRecord` 类型当前**未**从 index.ts re-export,需要时 deep-import `lib/rule-check/types-audited`
 │   │   ├── checker.ts                       checkRules() → allInOneOrchestrator.run(); checkRule() = 单 rule 过滤糖
 │   │   ├── types.ts                         re-export MVP 基础类型 + 加 FetchedRuleClassified
 │   │   ├── types-audited.ts                 RuleJudgmentAudited / RuleCheckRunAudited / RuleCheckBatchRunAudited / PromptProvenance / OntologyApiTraceEntry / StepCallRecord / BatchAggregateDecision / HumanOverride / AskWhyEntry
@@ -109,7 +107,7 @@ agenticOperator/
 │   │   │   └── all-in-one.ts                throw "not implemented in MVP"
 │   │   ├── validation/                      四个 check 模块 + index 聚合(逻辑同 full 但不写 ev.grounded)
 │   │   ├── confidence/                      self-reported.ts / composite.ts / index.ts
-│   │   ├── store/                           filesystem.ts(无 index.jsonl,只按日期分目录) + neo4j.ts(写 Neo4j 是禁的,文件存在但不应使用)
+│   │   ├── store/                           filesystem.ts(无 index.jsonl,只按日期分目录) + neo4j.ts(stub:文件存在但任何方法都 throw `"neo4jRunStore is not implemented in MVP"`,写 Neo4j 已锁死禁止)
 │   │   ├── rule-instance-map.ts             硬编码 5 条 MVP rule;未映射的 rule 直接 throw(与 full 的"返回 null"不同)
 │   │   ├── fetch-rules.ts / fetch-instances.ts
 │   │
@@ -136,7 +134,7 @@ agenticOperator/
 │   │   ├── rules/page.tsx                   /rule-check/rules —— 规则字典
 │   │   ├── batches/[batchId]/page.tsx       /rule-check/batches/<id> —— 单 batch 详情(verdict + stepCalls + step 分组规则卡)
 │   │   ├── runs/[runId]/page.tsx            /rule-check/runs/<id> —— 单 rule 判定的 Prove 详情(8 layers,Inference Chain 等)
-│   │   ├── runs/page.tsx                    308 redirect → /rule-check (legacy URL)
+│   │   ├── runs/page.tsx                    Next.js `redirect("/rule-check")` (307 temporary,legacy URL)
 │   │   ├── candidates/[id]/page.tsx         候选人时间线(目前只读 MOCK_RUNS,未串实际数据)
 │   │   ├── audit/page.tsx                   合规导出(stub)
 │   │   └── settings/page.tsx                设置(stub,未持久化)
@@ -155,7 +153,7 @@ agenticOperator/
 │   ├── SettingsContent.tsx / AuditContent.tsx             stubs
 │   ├── mock.ts                                            MOCK_RUNS — 三条样例 RuleCheckRunAudited(passed / blocked / pending_human),dev fallback 用
 │   └── atoms/                                             所有 Prove UI 原子
-│       ├── DecisionBadge.tsx / StatusDot 等价
+│       ├── DecisionBadge.tsx                判定徽章(passed / blocked / pending_human / not_started)
 │       ├── InferenceChain.tsx                             Rule → Evidence cards → Verdict 三类节点
 │       ├── FactCard.tsx                                   evidence 单卡(展开内嵌不弹抽屉, hydration 安全)
 │       ├── EvidenceCard.tsx                               证据账本行
@@ -167,8 +165,8 @@ agenticOperator/
 │       ├── PromptPanel.tsx + ResponsePanel.tsx            Prompt + LLM raw response 标签页
 │       ├── AskWhyChat.tsx                                 占位
 │       ├── MatrixGrid.tsx                                 candidates × rules 单元格
-│       ├── RunsList.tsx / RunsPreview.tsx / RunsDashboard.tsx  历史 /rule-check 列表组件(v3 之后大量被 BatchList/BatchPreview 替代)
-│       ├── BatchPreview.tsx                               /rule-check 右侧实时预览面板
+│       ├── RunsList.tsx / RunsPreview.tsx / RunsDashboard.tsx  历史 /rule-check 列表组件(v3 之后大量被 BatchList(AggregateContent.tsx 内部函数) + BatchPreview 替代)
+│       ├── BatchPreview.tsx                               /rule-check 右侧实时预览面板(BatchList 不是独立文件,在 `AggregateContent.tsx` 内定义)
 │       ├── ReplayButton.tsx                               重跑按钮
 │       └── formatElapsed.ts                               毫秒美化
 │
@@ -457,7 +455,7 @@ fetchedInstances 锚定顺序(贯穿所有 audit 写入):
 | `candidateId` / `jobRef` 缺失 | Stage 起手就 throw |
 | 候选人没 Resume | Stage B `loadMatchResumeRuntimeInput` throw |
 | Ontology API 单次 fetch 失败(Stage C 内) | `rcWarn` 记录, 跳过该 fetch, **不中断**;下游 rule 没拿到 instance 时,evidence-grounded 会 fail |
-| LLM 调用失败 / 流式断开 (`LLMUnreachableError` 或其他) | 该 step 内所有 rule → `buildFallbackRun`(decision = `pending_human`, overrideReason = `llm_unreachable:...` / `llm_unknown_error:...`); **不影响后续 step** |
+| LLM 调用失败 / 流式断开 (`LLMUnreachableError` 或其他) | 该 step 内所有 rule → `buildFallbackRun`(decision = `pending_human`, overrideReason = `llm_unreachable:...` / `llm_unknown_error:...`); **不短路、不抛**——orchestrator 继续下一 step(`all-in-one.ts:342-344`,"LLM unreachable inside a step: continue to the next step rather than aborting") |
 | LLM 返回非 JSON / 不符 schema | 同上 fallback;`stepCalls` 仍记 promptProvenance + llmRaw(用来追问"那一次到底返回了啥") |
 | 单条 rule_judgment Zod 解析失败 | `parsedJudgment = null` → `finalDecision = pending_human`(`overrideReason: "llm_output_unparseable: ..."`);其他 judgment 不受影响 |
 | 文件系统持久化失败 | `rcWarn` 不抛,run 返回内存对象(但 `auditPath` 为 undefined) |
@@ -546,7 +544,7 @@ interface RunStore {
 | `/rule-check/rules` | `app/rule-check/rules/page.tsx` | 静态规则字典(id / name / sourceText / canBlock / stepOrder) |
 | `/rule-check/batches/[batchId]` | `app/rule-check/batches/[batchId]/page.tsx` | 单 batch:verdict + stepCalls + candidate/job overview + 按 step 分组的 rule 卡(`规则原文` + 3 段 rootCause)|
 | `/rule-check/runs/[runId]` | `app/rule-check/runs/[runId]/page.tsx` | 单 rule judgment 的 **8 layers Prove 详情**:L1 Verdict / L2 Inference Chain / L3 Why / L4 Evidence ledger / L5 Counterfactuals / L6 ValidationLight / L7 Prompt+Response / L8 Ask Why。dev 环境 fallback 到 `MOCK_RUNS` 当 audit 文件缺失时 |
-| `/rule-check/runs` | `app/rule-check/runs/page.tsx` | 308 redirect → `/rule-check`(legacy URL stability) |
+| `/rule-check/runs` | `app/rule-check/runs/page.tsx` | Next.js `redirect("/rule-check")` (307 temporary,legacy URL stability。如需 permanent,改 `permanentRedirect()`) |
 | `/rule-check/candidates/[id]` | `...candidates/[id]/page.tsx` | 候选人时间线(目前是 MOCK_RUNS 演示, **未串实际数据**)|
 | `/rule-check/audit` | `audit/page.tsx` | 合规导出 stub |
 | `/rule-check/settings` | `settings/page.tsx` | 设置 stub |
@@ -780,7 +778,7 @@ npm run dev:dump-match-resume-prompt
 |---|---|
 | `LLMUnreachableError: stream returned no content` | LLM 代理在首字节前断;`rcInfo` 的 `first_byte` 没出现 → 代理 504。换 model / 降 prompt 大小 |
 | `envelope_invalid` 或 `schema_invalid:...` | LLM 输出不符 `StepResultJsonSchema`;看 `llmRaw.response.choices[0].message.content` 排查 |
-| 所有 rule 都 `pending_human` 且 `overrideReason: validation_failed` | 你用的是 **MVP** 不是 full。Full v3.1 起不再因 validation 强制 override(只 unparseable 触发) |
+| 所有 rule 都 `pending_human` 且 `overrideReason: validation_failed:...` | 你用的是 **MVP**(`simple-rule-check/orchestrator/single-call.ts:263` 用 `validation_failed:` 前缀)。Full v3.1 起不再因 validation 强制 override,只 unparseable 触发,`overrideReason` 前缀是 `llm_output_unparseable:`(`rule-check/orchestrator/all-in-one.ts:721`) |
 | matrix 单元格颜色变 ⚫ `not_started`(未触发) | rule 被短路了, 或 LLM 真的判 `not_started`;到 `/rule-check/batches/<id>` 看 `terminalAtStep` |
 | `Ontology API unavailable` 报错 | `ONTOLOGY_API_BASE` 不可达 / token 失效;`/rule-check/matrix` 与 `/rule-check/rules` 都有 graceful degrade(空列表) |
 | Turbopack server-action 起 `ReferenceError: SomeType is not defined` | 在 `app/.../actions.ts` 用了 `export type { Foo } from "..."` re-export — 改成本地 `export interface Foo {}` 重声明(见 §6.1) |

@@ -16,7 +16,7 @@ The lib is **action-extensible**: a registry of `ActionRuntimeAdapter`s tells co
 | Mode | Function | Imports | When to use |
 |---|---|---|---|
 | **A. Snapshot import + fill** | `fillRuntimeInput(obj, input, scope)` | `generated/v4/match-resume.action-object` + `lib/ontology-gen/v4` | Zero-fetch, deterministic. **Default for production.** |
-| **B. Runtime resolve** | `generatePrompt({ actionRef, client, clientDepartment?, runtimeInput? })` | `lib/ontology-gen/v4` | Live prompt against the current Ontology API; picks up rule changes since the snapshot. |
+| **B. Runtime resolve** | `generatePrompt({ actionRef, client, clientDepartment?, domain?, runtimeInput? })` | `lib/ontology-gen/v4` | Live prompt against the current Ontology API; picks up rule changes since the snapshot. |
 
 Both modes return the same `ActionObjectV4` shape:
 
@@ -100,6 +100,18 @@ await llm.complete({ messages: [{ role: "user", content: obj.prompt }] });
 ```
 
 Without `runtimeInput`, the returned `prompt` retains the placeholders — useful when you want to fetch once and fill with multiple candidates later. `{{CURRENT_TIME}}` is substituted only at fill time.
+
+### Advanced `generatePrompt` options
+
+Beyond the core fields, `GeneratePromptOptions` exposes three optional knobs:
+
+| Option | Type | Effect |
+|---|---|---|
+| `extraInstances` | `Record<string, Record<string, unknown>[]>` | Adds a `## 额外数据 (按 rule 依赖预取)` section between `## 运行时输入` and `## 最终输出 JSON 结构`. Keyed by entity label (e.g. `"Candidate_Expectation"`), value is the list of fetched instance objects. Each entry is rendered as a fenced ```` ```json ```` block. Indexing convention: `fetchedInstanceIndex` 0 = Job, 1 = Resume, 2..N = extras in insertion order. |
+| `focusStep` | `string` | Path-C single-step mode. The assembler renders **only** the named action step's rule cluster + a slim per-step envelope (`StepResultJsonSchema`), suppressing the batch-level `final_output { ... }` block. Used by `lib/rule-check`'s orchestrator for one-LLM-call-per-step execution. |
+| `timeoutMs` | `number` | Forwarded to `fetchAction` and `fillRuntimeInput`. Default: provider-dependent (no explicit cap). |
+
+`domain` defaults to `"RAAS-v1"` if omitted.
 
 ## The runtime input contract
 
@@ -216,8 +228,9 @@ lib/ontology-gen/
 ├── compile/filter.ts                 # applyClientFilter (used by v4-4)
 ├── index.ts                          # slim re-exports (errors, fetch, types)
 └── v4/
-    ├── assemble.ts                   # RUNTIME_INPUT_PLACEHOLDER / CURRENT_TIME_PLACEHOLDER
-    ├── assemble-v4-4.ts              # v4-4 prompt assembler; accepts string sentinel
+    ├── assemble.ts                   # v4-1/2/3 alternative assembler + re-exports RUNTIME_INPUT_PLACEHOLDER / CURRENT_TIME_PLACEHOLDER
+    ├── assemble-v4-4.ts              # v4-4 canonical prompt assembler; accepts string sentinel; renders `## 额外数据` from extraInstances; per-step "focusStep" Path C mode
+    ├── envelope-schema.ts            # final-output JSON skeleton + per-step skeleton renderers; MatchResumeEvalEnvelopeZod / StepResultZod
     ├── types.ts                      # ActionObjectV4 / Meta / EnrichedAction
     ├── fill-runtime-input.ts         # core sync filler; dispatches via registry by meta
     ├── generate-prompt.ts            # canonical async entry; sentinel via registry
@@ -331,7 +344,7 @@ The adapter registry makes this a 3-step operation. Example: adding `screenCandi
    registerAdapter(screenCandidateAdapter);
    ```
 
-   Optionally re-export the input type from the same barrel + from `lib/ontology-gen/v4/index.ts` if consumers want static import.
+   Re-export the input type from the same barrel + from `lib/ontology-gen/v4/index.ts` (recommended) so consumers can `import type { ScreenCandidateRuntimeInput } from "@/lib/ontology-gen/v4"` without reaching into adapter modules.
 
 3. **Generate the snapshot** (if you want a committed snapshot):
 
