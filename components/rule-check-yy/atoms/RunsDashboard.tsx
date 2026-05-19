@@ -8,7 +8,7 @@
  */
 
 import { Metric, Spark } from "@/components/shared/atoms";
-import type { AggregateMetrics } from "@/app/rule-check/actions";
+import type { AggregateMetrics } from "@/app/rule-check-yy/actions";
 
 export interface RunsDashboardProps {
   aggregate: AggregateMetrics;

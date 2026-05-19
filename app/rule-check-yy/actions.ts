@@ -1,13 +1,13 @@
 "use server";
 
 /**
- * Server actions for the commercial `/rule-check/*` UI.
+ * Server actions for the commercial `/rule-check-yy/*` UI.
  *
- * Pattern matches `app/dev/simple-rule-check/actions.ts`: types are
+ * Pattern matches `app/dev/simple-rule-check-yy/actions.ts`: types are
  * DECLARED LOCALLY — re-exporting types via `export type { ... } from ...`
  * breaks Next.js 16's Turbopack "use server" transform with runtime
  * ReferenceErrors. The shapes below mirror the internal declarations in
- * `lib/rule-check/server-actions.ts` (that file is the source of truth
+ * `lib/rule-check-yy/server-actions.ts` (that file is the source of truth
  * for the implementation; keep these in sync manually).
  *
  * `getRunDetail` is intentionally NOT re-exported — the run-detail page
@@ -23,7 +23,7 @@ import {
   getRunPreview as _getRunPreview,
   getBatchSummary as _getBatchSummary,
   listActiveRules as _listActiveRules,
-} from "@/lib/rule-check/server-actions";
+} from "@/lib/rule-check-yy/server-actions";
 import type {
   CheckRuleInput,
   CheckRulesInput,
@@ -31,8 +31,8 @@ import type {
   Instance,
   RuleDecision,
   ValidationReport,
-} from "@/lib/rule-check";
-import type { BatchAggregateDecision } from "@/lib/rule-check/types-audited";
+} from "@/lib/rule-check-yy";
+import type { BatchAggregateDecision } from "@/lib/rule-check-yy/types-audited";
 
 // ─── Public types (mirror lib internals) ─────────────────────────────────
 

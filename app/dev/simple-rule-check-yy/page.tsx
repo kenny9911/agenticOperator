@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * /dev/simple-rule-check — interactive preview of the Simple Rule Checker (MVP).
+ * /dev/simple-rule-check-yy — interactive preview of the Simple Rule Checker (MVP).
  *
  * Form mirrors `/dev/generate-prompt`'s shape (Panel / Field / Stat). Submits
  * to a server action that calls `checkRule()`. Renders the decision badge,

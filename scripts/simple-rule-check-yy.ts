@@ -12,7 +12,7 @@
  * Always writes a brief audit-path note to stderr.
  */
 
-import { checkRule } from "../lib/simple-rule-check";
+import { checkRule } from "../lib/simple-rule-check-yy";
 
 interface CliArgs {
   rule: string;
@@ -90,7 +90,7 @@ async function main(): Promise<void> {
   }
 }
 
-function printPretty(run: import("../lib/simple-rule-check").RuleCheckRun): void {
+function printPretty(run: import("../lib/simple-rule-check-yy").RuleCheckRun): void {
   const fd = run.finalDecision;
   const parsed = run.llmParsed;
   const v = run.validation;

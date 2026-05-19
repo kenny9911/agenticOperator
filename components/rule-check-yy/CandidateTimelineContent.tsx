@@ -1,6 +1,6 @@
 "use client";
 /**
- * /rule-check/candidates/[id] — candidate-centric timeline.
+ * /rule-check-yy/candidates/[id] — candidate-centric timeline.
  *
  * Chronological list of runs for one candidate. Stub until real data wiring.
  */
@@ -23,7 +23,7 @@ export function CandidateTimelineContent({ candidateId }: CandidateTimelineConte
     <div className="flex flex-col gap-4 p-6">
       <header>
         <h1 className="text-xl font-semibold text-ink-1">
-          {t("rc_candidate")}: <span className="font-mono">{candidateId}</span>
+          {t("rc_yy_candidate")}: <span className="font-mono">{candidateId}</span>
         </h1>
         <p className="mt-1 text-xs text-ink-3">{runs.length} runs</p>
       </header>
@@ -34,13 +34,13 @@ export function CandidateTimelineContent({ candidateId }: CandidateTimelineConte
         <div className="divide-y divide-line">
           {runs.length === 0 && (
             <div className="px-3 py-6 text-center text-ink-3 text-[12px]">
-              {t("rc_no_runs")} for {candidateId}
+              {t("rc_yy_no_runs")} for {candidateId}
             </div>
           )}
           {runs.map((r) => (
             <Link
               key={r.runId}
-              href={`/rule-check/runs/${r.runId}`}
+              href={`/rule-check-yy/runs/${r.runId}`}
               className="flex items-center gap-3 px-3 py-3 hover:bg-panel"
             >
               <DecisionBadge value={r.finalDecision.decision} size="sm" />

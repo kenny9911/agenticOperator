@@ -1,6 +1,6 @@
 "use client";
 /**
- * /rule-check/settings — operator self-service.
+ * /rule-check-yy/settings — operator self-service.
  *
  * Stub: defaults, thresholds, retention. Persistence wired in UI-5.
  */
@@ -18,7 +18,7 @@ export function SettingsContent() {
   return (
     <div className="flex flex-col gap-4 p-6 max-w-2xl">
       <header>
-        <h1 className="text-xl font-semibold text-ink-1">{t("rc_settings")}</h1>
+        <h1 className="text-xl font-semibold text-ink-1">{t("rc_yy_settings")}</h1>
         <p className="mt-1 text-xs text-ink-3">Operator-level defaults (not yet persisted).</p>
       </header>
 

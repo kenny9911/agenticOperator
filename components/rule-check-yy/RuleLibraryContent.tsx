@@ -1,6 +1,6 @@
 "use client";
 /**
- * /rule-check/rules — Static rule dictionary (SPEC §9.2 + §15 locked
+ * /rule-check-yy/rules — Static rule dictionary (SPEC §9.2 + §15 locked
  * 2026-05-13).
  *
  * Pure reference catalog. No run aggregation, no firing-rate, no recent
@@ -16,7 +16,7 @@
 import { useMemo, useState } from "react";
 import { Badge, Btn, Card, CardHead } from "@/components/shared/atoms";
 import { useApp } from "@/lib/i18n";
-import type { FetchedRuleClassified } from "@/lib/rule-check";
+import type { FetchedRuleClassified } from "@/lib/rule-check-yy";
 
 export interface RuleLibraryContentProps {
   rules: FetchedRuleClassified[];
@@ -63,7 +63,7 @@ export function RuleLibraryContent({
     <div className="flex flex-col h-full min-h-0 gap-4 p-6">
       <header className="flex items-end justify-between flex-shrink-0">
         <div>
-          <h1 className="text-xl font-semibold text-ink-1">{t("rc_rules")}</h1>
+          <h1 className="text-xl font-semibold text-ink-1">{t("rc_yy_rules")}</h1>
           <p className="mt-1 text-[12px] text-ink-3">
             {scopeLabel} · {rules.length} rules
           </p>

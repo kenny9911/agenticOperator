@@ -1,5 +1,5 @@
 /**
- * Shared elapsed-time formatter. Consumed by /dev/rule-check page and the
+ * Shared elapsed-time formatter. Consumed by /dev/rule-check-yy page and the
  * commercial ReplayButton — keep them in lock-step.
  */
 

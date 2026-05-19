@@ -1,9 +1,9 @@
 "use client";
 /**
- * /rule-check matrix landing — rules × candidates pass/fail grid.
+ * /rule-check-yy matrix landing — rules × candidates pass/fail grid.
  *
  * Top KPI strip (5 metrics derived from cells) + matrix grid below.
- * Empty state when zero cells: instruction + link to /dev/rule-check.
+ * Empty state when zero cells: instruction + link to /dev/rule-check-yy.
  *
  * Server component parent fetches via `listMatrixCells` + `listActiveRules`
  * and passes data as props; this client component handles Shell context
@@ -14,8 +14,8 @@ import Link from "next/link";
 import { Metric } from "@/components/shared/atoms";
 import { useApp } from "@/lib/i18n";
 import { MatrixGrid } from "./atoms/MatrixGrid";
-import type { MatrixCell } from "@/app/rule-check/actions";
-import type { FetchedRuleClassified, RuleDecision } from "@/lib/rule-check";
+import type { MatrixCell } from "@/app/rule-check-yy/actions";
+import type { FetchedRuleClassified, RuleDecision } from "@/lib/rule-check-yy";
 
 export interface MatrixContentProps {
   cells: MatrixCell[];
@@ -47,19 +47,19 @@ export function MatrixContent({
       <header className="flex items-end justify-between flex-shrink-0">
         <div>
           <h1 className="text-xl font-semibold text-ink-1">
-            {t("rc_matrix_title")}
+            {t("rc_yy_matrix_title")}
           </h1>
           <p className="mt-1 text-[12px] text-ink-3">{scopeLabel}</p>
         </div>
         <div className="flex items-center gap-2">
           <Link
-            href="/rule-check"
+            href="/rule-check-yy"
             className="rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] text-ink-1 hover:bg-panel"
           >
-            {t("rc_runs")} →
+            {t("rc_yy_runs")} →
           </Link>
           <Link
-            href="/dev/rule-check"
+            href="/dev/rule-check-yy"
             className="rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] text-ink-1 hover:bg-panel"
           >
             ↻ run new batch
@@ -77,11 +77,11 @@ export function MatrixContent({
 
       {cells.length === 0 || rules.length === 0 ? (
         <div className="rounded-lg border border-dashed border-line bg-surface p-8 text-center">
-          <div className="text-[14px] text-ink-2">{t("rc_matrix_empty")}</div>
+          <div className="text-[14px] text-ink-2">{t("rc_yy_matrix_empty")}</div>
           <div className="mt-2 text-[11.5px] text-ink-3">
             Trigger one from{" "}
-            <Link href="/dev/rule-check" className="text-accent hover:underline">
-              /dev/rule-check
+            <Link href="/dev/rule-check-yy" className="text-accent hover:underline">
+              /dev/rule-check-yy
             </Link>{" "}
             then refresh this page.
           </div>

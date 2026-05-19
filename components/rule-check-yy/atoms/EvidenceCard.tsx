@@ -10,7 +10,7 @@
 import React from "react";
 import { Badge } from "@/components/shared/atoms";
 import { useApp } from "@/lib/i18n";
-import type { EvidenceAudited, Instance } from "@/lib/rule-check";
+import type { EvidenceAudited, Instance } from "@/lib/rule-check-yy";
 
 export interface EvidenceCardProps {
   evidence: EvidenceAudited;
@@ -60,7 +60,7 @@ export function EvidenceCard({
           className="self-start text-[11px] text-accent hover:underline"
           onClick={() => onViewSource?.(sourceInstance)}
         >
-          {t("rc_view_source")} →
+          {t("rc_yy_view_source")} →
         </button>
       )}
     </div>

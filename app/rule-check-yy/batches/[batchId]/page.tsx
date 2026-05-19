@@ -1,5 +1,5 @@
-import { getBatchSummary } from "@/lib/rule-check/server-actions";
-import { BatchDetailPageView } from "@/components/rule-check/BatchDetailPageView";
+import { getBatchSummary } from "@/lib/rule-check-yy/server-actions";
+import { BatchDetailPageView } from "@/components/rule-check-yy/BatchDetailPageView";
 
 export default async function BatchDetailPage({
   params,

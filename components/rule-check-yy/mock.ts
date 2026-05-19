@@ -1,5 +1,5 @@
 /**
- * Mock fixtures for the /rule-check UI.
+ * Mock fixtures for the /rule-check-yy UI.
  *
  * Three representative `RuleCheckRunAudited` records that exercise every
  * UI pattern:
@@ -8,12 +8,12 @@
  *   - run-003: pending_human (forced by validation; LLM said blocked but
  *     `evidence_grounded=false`, override badge shown)
  *
- * Replaced in Phase UI-5 with re-exports from `lib/rule-check/`.
+ * Replaced in Phase UI-5 with re-exports from `lib/rule-check-yy/`.
  *
  * Per repo convention these objects are declared inline (FleetContent pattern).
  */
 
-import type { RuleCheckRunAudited } from "@/lib/rule-check";
+import type { RuleCheckRunAudited } from "@/lib/rule-check-yy";
 
 const PROMPT_SAMPLE = `[system]
 你是一名 Rule Evaluation Agent。基于给定的 rule 原文 + candidate 的真实数据,

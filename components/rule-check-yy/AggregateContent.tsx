@@ -1,6 +1,6 @@
 "use client";
 /**
- * /rule-check — Runs aggregate page (Path C v3: row = batch).
+ * /rule-check-yy — Runs aggregate page (Path C v3: row = batch).
  *
  * 3-region layout:
  *   Top:    Header (title + scope + actions: Matrix link, Run new batch)
@@ -9,7 +9,7 @@
  *           Equal-height; each column scrolls independently.
  *
  * 1 row = 1 batch ("运行"). Click row → preview updates.
- * Preview's [打开运行详情 →] navigates to /rule-check/batches/<batchId>.
+ * Preview's [打开运行详情 →] navigates to /rule-check-yy/batches/<batchId>.
  */
 
 import Link from "next/link";
@@ -18,7 +18,7 @@ import { Card, CardHead, Badge } from "@/components/shared/atoms";
 import { DecisionBadge } from "./atoms/DecisionBadge";
 import { BatchPreview } from "./atoms/BatchPreview";
 import { useApp } from "@/lib/i18n";
-import type { BatchRow, BatchAggregateMetrics } from "@/app/rule-check/actions";
+import type { BatchRow, BatchAggregateMetrics } from "@/app/rule-check-yy/actions";
 
 export interface AggregateContentProps {
   rows: BatchRow[];
@@ -41,26 +41,26 @@ export function AggregateContent({
       <header className="flex items-end justify-between flex-shrink-0">
         <div>
           <h1 className="text-xl font-semibold text-ink-1">
-            {t("rc_aggregate_title")}
+            {t("rc_yy_aggregate_title")}
           </h1>
           <p className="mt-1 text-[12px] text-ink-3">
-            {scopeLabel} · {aggregate.totalBatches} {t("rc_runs_count")}
+            {scopeLabel} · {aggregate.totalBatches} {t("rc_yy_runs_count")}
           </p>
         </div>
         <div className="flex items-center gap-2">
           <Link
-            href="/rule-check/matrix"
+            href="/rule-check-yy/matrix"
             className="rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] text-ink-1 hover:bg-panel"
           >
-            {t("rc_matrix_link")} →
+            {t("rc_yy_matrix_link")} →
           </Link>
           <Link
-            href="/dev/rule-check"
+            href="/dev/rule-check-yy"
             target="_blank"
             rel="noopener noreferrer"
             className="rounded-md border border-accent bg-accent px-3 py-1.5 text-[12px] text-white hover:opacity-90"
           >
-            ↻ {t("rc_run_new_batch")}
+            ↻ {t("rc_yy_run_new_batch")}
           </Link>
         </div>
       </header>

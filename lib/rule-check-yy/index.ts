@@ -1,5 +1,5 @@
 /**
- * Public ABI for `lib/rule-check/` (full implementation).
+ * Public ABI for `lib/rule-check-yy/` (full implementation).
  *
  * The full impl is parallel to (not a rewrite of) `lib/simple-rule-check/`.
  * MVP stays as the frozen baseline; this module evolves independently and

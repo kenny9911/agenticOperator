@@ -10,7 +10,7 @@
  * renders as 4 labeled cells (for the run-detail Layer 4 board).
  */
 import React from "react";
-import type { ValidationReport } from "@/lib/rule-check";
+import type { ValidationReport } from "@/lib/rule-check-yy";
 import { useApp } from "@/lib/i18n";
 
 export interface ValidationLightProps {
@@ -39,10 +39,10 @@ function blockSemState(s: ValidationReport["blockSemanticCheck"]): CellState {
 export function ValidationLight({ report, variant = "full" }: ValidationLightProps) {
   const { t } = useApp();
   const cells: Array<{ label: string; state: CellState }> = [
-    { label: t("rc_v_rule_exists"), state: report.ruleIdExists ? "ok" : "err" },
-    { label: t("rc_v_evidence_grounded"), state: report.evidenceGrounded ? "ok" : "err" },
-    { label: t("rc_v_schema"), state: report.schemaValid ? "ok" : "err" },
-    { label: t("rc_v_block_semantic"), state: blockSemState(report.blockSemanticCheck) },
+    { label: t("rc_yy_v_rule_exists"), state: report.ruleIdExists ? "ok" : "err" },
+    { label: t("rc_yy_v_evidence_grounded"), state: report.evidenceGrounded ? "ok" : "err" },
+    { label: t("rc_yy_v_schema"), state: report.schemaValid ? "ok" : "err" },
+    { label: t("rc_yy_v_block_semantic"), state: blockSemState(report.blockSemanticCheck) },
   ];
 
   if (variant === "mini") {

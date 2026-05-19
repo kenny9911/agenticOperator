@@ -1,5 +1,5 @@
 /**
- * Public entry points for `lib/rule-check` (full impl).
+ * Public entry points for `lib/rule-check-yy` (full impl).
  *
  * - `checkRules(input)` runs `AllInOneOrchestrator`: one LLM call evaluates
  *   all rules of the action → `RuleCheckBatchRunAudited`.

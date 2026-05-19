@@ -1,7 +1,7 @@
 "use client";
 import React from "react";
 import { Shell } from "@/components/shared/Shell";
-import { CandidateTimelineContent } from "@/components/rule-check/CandidateTimelineContent";
+import { CandidateTimelineContent } from "@/components/rule-check-yy/CandidateTimelineContent";
 import { useApp } from "@/lib/i18n";
 
 export default function CandidateTimelinePage({
@@ -14,12 +14,12 @@ export default function CandidateTimelinePage({
   return (
     <Shell
       crumbs={[
-        t("nav_group_trust"),
-        t("nav_rule_check"),
-        t("rc_candidates"),
+        t("nav_group_trust_yy"),
+        t("nav_rule_check_yy"),
+        t("rc_yy_candidates"),
         id,
       ]}
-      directionTag={t("rc_candidates")}
+      directionTag={t("rc_yy_candidates")}
     >
       <CandidateTimelineContent candidateId={id} />
     </Shell>

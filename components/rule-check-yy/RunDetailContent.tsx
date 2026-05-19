@@ -1,6 +1,6 @@
 "use client";
 /**
- * /rule-check/runs/[runId] — the Prove page.
+ * /rule-check-yy/runs/[runId] — the Prove page.
  *
  * Eight vertical layers (SPEC §9.2), each a Card with an anchor id. L2 and
  * L5 are new in this iteration (2026-05-13):
@@ -29,7 +29,7 @@ import { LogprobInlineChart } from "./atoms/LogprobInlineChart";
 import { AskWhyChat } from "./atoms/AskWhyChat";
 import { CounterfactualsList } from "./atoms/CounterfactualsList";
 import { ReplayButton } from "./atoms/ReplayButton";
-import type { Instance, RuleCheckRunAudited } from "@/lib/rule-check";
+import type { Instance, RuleCheckRunAudited } from "@/lib/rule-check-yy";
 
 export interface RunDetailContentProps {
   run: RuleCheckRunAudited;
@@ -71,7 +71,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
             <ConfidenceRing
               value={run.llmParsed.confidence}
               size={80}
-              label={t("rc_confidence")}
+              label={t("rc_yy_confidence")}
               breakdown={run.confidenceBreakdown}
             />
           )}
@@ -85,20 +85,20 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
               {run.finalDecision.overrideReason?.startsWith("short_circuit:") ? (
                 <Badge variant="warn">↯ Skipped (short-circuit)</Badge>
               ) : run.finalDecision.overrideReason ? (
-                <Badge variant="warn">{t("rc_overridden")}</Badge>
+                <Badge variant="warn">{t("rc_yy_overridden")}</Badge>
               ) : null}
             </div>
             <div className="text-[12px] text-ink-3">
               <span>
-                {t("rc_candidate")}: <span className="font-mono text-ink-2">{run.input.candidateId}</span>
+                {t("rc_yy_candidate")}: <span className="font-mono text-ink-2">{run.input.candidateId}</span>
               </span>{" "}
               ·{" "}
               <span>
-                {t("rc_job")}: <span className="font-mono text-ink-2">{run.input.jobRef}</span>
+                {t("rc_yy_job")}: <span className="font-mono text-ink-2">{run.input.jobRef}</span>
               </span>{" "}
               ·{" "}
               <span>
-                {t("rc_client")}: <span className="text-ink-2">{run.input.scope.client}{run.input.scope.department ? " / " + run.input.scope.department : ""}</span>
+                {t("rc_yy_client")}: <span className="text-ink-2">{run.input.scope.client}{run.input.scope.department ? " / " + run.input.scope.department : ""}</span>
               </span>
             </div>
             <div className="text-[11px] text-ink-3">
@@ -108,13 +108,13 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
           <div className="flex flex-col gap-1.5 items-end">
             <ReplayButton runId={run.runId} />
             <Btn variant="ghost" size="sm" onClick={() => navigator.clipboard?.writeText(run.runId)}>
-              {t("rc_copy_run_id")}
+              {t("rc_yy_copy_run_id")}
             </Btn>
             <Link
-              href={`/rule-check/candidates/${run.input.candidateId}`}
+              href={`/rule-check-yy/candidates/${run.input.candidateId}`}
               className="rounded-md border border-line bg-surface px-2.5 py-1 text-[11.5px] text-ink-1 hover:bg-panel"
             >
-              {t("rc_candidates")} →
+              {t("rc_yy_candidates")} →
             </Link>
           </div>
         </div>
@@ -132,7 +132,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
         <CardHead>
           <a id="layer-2" />
           <span className="text-[12.5px] font-medium text-ink-1">
-            {t("rc_chain_title")}
+            {t("rc_yy_chain_title")}
           </span>
         </CardHead>
         <div className="p-2">
@@ -145,7 +145,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
         <Card>
           <CardHead>
             <a id="layer-3" />
-            <span className="text-[12.5px] font-medium text-ink-1">{t("rc_why")}</span>
+            <span className="text-[12.5px] font-medium text-ink-1">{t("rc_yy_why")}</span>
           </CardHead>
           <div className="p-4">
             <RootCauseTimeline
@@ -165,7 +165,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
       <Card>
         <CardHead>
           <a id="layer-4" />
-          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_evidence")}</span>
+          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_yy_evidence")}</span>
           <span className="ml-2 text-[11px] text-ink-3">{evidence.length}</span>
         </CardHead>
         <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -191,7 +191,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
           <CardHead>
             <a id="layer-5" />
             <span className="text-[12.5px] font-medium text-ink-1">
-              {t("rc_cf_title")}
+              {t("rc_yy_cf_title")}
             </span>
           </CardHead>
           <div className="p-4">
@@ -204,7 +204,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
       <Card>
         <CardHead>
           <a id="layer-6" />
-          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_validation")}</span>
+          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_yy_validation")}</span>
         </CardHead>
         <div className="p-4 flex flex-col gap-3">
           <ValidationLight report={run.validation} variant="full" />
@@ -222,7 +222,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
       <Card>
         <CardHead>
           <a id="layer-7" />
-          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_prompt")} + {t("rc_response")}</span>
+          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_yy_prompt")} + {t("rc_yy_response")}</span>
         </CardHead>
         <div className="p-4 grid grid-cols-1 lg:grid-cols-2 gap-3">
           <PromptPanel
@@ -246,7 +246,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
       <Card>
         <CardHead>
           <a id="layer-8" />
-          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_ask_why")}</span>
+          <span className="text-[12.5px] font-medium text-ink-1">{t("rc_yy_ask_why")}</span>
         </CardHead>
         <div className="p-4">
           <AskWhyChat run={run} />
@@ -266,7 +266,7 @@ export function RunDetailContent({ run }: RunDetailContentProps) {
             <div className="sticky top-0 flex items-center justify-between border-b border-line bg-surface px-4 py-3">
               <div>
                 <div className="text-[10.5px] uppercase tracking-wide text-ink-3">
-                  {t("rc_drawer_source")}
+                  {t("rc_yy_drawer_source")}
                 </div>
                 <div className="font-mono text-[13px] text-ink-1">
                   {drawer.objectType}/{drawer.objectId}

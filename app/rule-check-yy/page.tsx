@@ -1,5 +1,5 @@
-import { listAggregateBatches } from "@/lib/rule-check/server-actions";
-import { AggregatePageView } from "@/components/rule-check/AggregatePageView";
+import { listAggregateBatches } from "@/lib/rule-check-yy/server-actions";
+import { AggregatePageView } from "@/components/rule-check-yy/AggregatePageView";
 
 export default async function RuleCheckLandingPage({
   searchParams,

@@ -1,6 +1,6 @@
 "use client";
 /**
- * `/rule-check/batches/[batchId]` — single-run (batch) detail page.
+ * `/rule-check-yy/batches/[batchId]` — single-run (batch) detail page.
  *
  * Sections (top → bottom):
  *   1. Verdict + step calls (2-col grid)
@@ -18,8 +18,8 @@ import { useState } from "react";
 import { Badge, Btn, Card, CardHead } from "@/components/shared/atoms";
 import { DecisionBadge } from "./atoms/DecisionBadge";
 import { useApp } from "@/lib/i18n";
-import type { BatchSummary, BatchRuleEntry, BatchStepCallSlim, BatchStepGroup } from "@/app/rule-check/actions";
-import type { Instance } from "@/lib/rule-check";
+import type { BatchSummary, BatchRuleEntry, BatchStepCallSlim, BatchStepGroup } from "@/app/rule-check-yy/actions";
+import type { Instance } from "@/lib/rule-check-yy";
 
 export interface BatchDetailContentProps {
   summary: BatchSummary;
@@ -38,17 +38,17 @@ export function BatchDetailContent({ summary }: BatchDetailContentProps) {
         <header className="flex items-end justify-between">
           <div>
             <h1 className="text-xl font-semibold text-ink-1">
-              {t("rc_aggregate_title")} · <span className="font-mono">{summary.batchId.slice(0, 12)}…</span>
+              {t("rc_yy_aggregate_title")} · <span className="font-mono">{summary.batchId.slice(0, 12)}…</span>
             </h1>
             <p className="mt-1 text-[12px] text-ink-3">{summary.timestamp}</p>
           </div>
           <Link
-            href="/dev/rule-check"
+            href="/dev/rule-check-yy"
             target="_blank"
             rel="noopener noreferrer"
             className="rounded-md border border-accent bg-accent px-3 py-1.5 text-[12px] text-white hover:opacity-90"
           >
-            ↻ {t("rc_run_new_batch")}
+            ↻ {t("rc_yy_run_new_batch")}
           </Link>
         </header>
 
@@ -66,12 +66,12 @@ export function BatchDetailContent({ summary }: BatchDetailContentProps) {
         {/* Section 2: Candidate / Job overview */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <OverviewCard
-            title={t("rc_candidate_overview")}
+            title={t("rc_yy_candidate_overview")}
             instance={summary.candidateOverview.instance}
             fields={summary.candidateOverview.mainFields}
           />
           <OverviewCard
-            title={t("rc_job_overview")}
+            title={t("rc_yy_job_overview")}
             instance={summary.jobOverview.instance}
             fields={summary.jobOverview.mainFields}
           />
@@ -82,7 +82,7 @@ export function BatchDetailContent({ summary }: BatchDetailContentProps) {
           <Card>
             <CardHead>
               <span className="text-[12.5px] font-medium text-ink-1">
-                {t("rc_other_instances")} ({summary.otherInstances.length})
+                {t("rc_yy_other_instances")} ({summary.otherInstances.length})
               </span>
             </CardHead>
             <div className="p-3 flex flex-col gap-1.5">
@@ -108,7 +108,7 @@ function VerdictCard({ summary }: { summary: BatchSummary }) {
   return (
     <Card>
       <CardHead>
-        <span className="text-[12.5px] font-medium text-ink-1">{t("rc_total_verdict")}</span>
+        <span className="text-[12.5px] font-medium text-ink-1">{t("rc_yy_total_verdict")}</span>
       </CardHead>
       <div className="p-4 flex flex-col gap-3">
         <div className="flex items-center gap-3">
@@ -159,7 +159,7 @@ function StepCallsCard({
   return (
     <Card>
       <CardHead>
-        <span className="text-[12.5px] font-medium text-ink-1">{t("rc_step_calls")}</span>
+        <span className="text-[12.5px] font-medium text-ink-1">{t("rc_yy_step_calls")}</span>
       </CardHead>
       <div className="p-4 flex flex-col gap-2">
         {stepCalls.map((sc) => (
@@ -308,7 +308,7 @@ function RuleCard({ rule }: { rule: BatchRuleEntry }) {
         <span className="font-mono text-[12px] text-ink-1 w-[60px] flex-shrink-0">{rule.ruleId}</span>
         <DecisionBadge value={rule.decision} size="sm" />
         {isShortCircuit ? (
-          <Badge variant="warn">↯ {t("rc_short_circuited")}</Badge>
+          <Badge variant="warn">↯ {t("rc_yy_short_circuited")}</Badge>
         ) : null}
         <span className="text-[11.5px] text-ink-3 truncate flex-1 min-w-0">
           {isShortCircuit
@@ -321,7 +321,7 @@ function RuleCard({ rule }: { rule: BatchRuleEntry }) {
         <div className="border-t border-line p-3 flex flex-col gap-3 text-[12px]">
           <div>
             <div className="text-[10px] uppercase tracking-wide text-ink-3 mb-1">
-              {t("rc_rule_source_text")} · <span className="font-mono normal-case tracking-normal text-ink-4">{rule.ruleName}</span>
+              {t("rc_yy_rule_source_text")} · <span className="font-mono normal-case tracking-normal text-ink-4">{rule.ruleName}</span>
             </div>
             <pre className="m-0 font-sans whitespace-pre-wrap text-ink-2 leading-relaxed">
               {rule.sourceText || "(no source text)"}
@@ -330,7 +330,7 @@ function RuleCard({ rule }: { rule: BatchRuleEntry }) {
           {!isShortCircuit && (rule.dataObservationText || rule.contrastReasoningText || rule.conclusionText) && (
             <div>
               <div className="text-[10px] uppercase tracking-wide text-ink-3 mb-1">
-                {t("rc_judgment_basis")}
+                {t("rc_yy_judgment_basis")}
               </div>
               <dl className="grid grid-cols-[80px_1fr] gap-x-3 gap-y-1.5 text-[11.5px]">
                 {rule.dataObservationText && (
@@ -355,9 +355,9 @@ function RuleCard({ rule }: { rule: BatchRuleEntry }) {
             </div>
           )}
           <div>
-            <Link href={`/rule-check/runs/${rule.runId}`}>
+            <Link href={`/rule-check-yy/runs/${rule.runId}`}>
               <Btn variant="ghost" size="sm">
-                {t("rc_open_full_judgment")} ↗
+                {t("rc_yy_open_full_judgment")} ↗
               </Btn>
             </Link>
           </div>

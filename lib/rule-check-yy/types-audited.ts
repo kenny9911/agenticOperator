@@ -2,7 +2,7 @@
  * Audit-rich types for the full `rule-check` impl (SPEC §6.3).
  *
  * These extend the MVP shapes with provenance + receipts so the commercial
- * UI at `/rule-check/*` can navigate any decision back to its evidence,
+ * UI at `/rule-check-yy/*` can navigate any decision back to its evidence,
  * the prompt that was sent, the LLM's raw response, and every Ontology API
  * call that fed into the judgment.
  */

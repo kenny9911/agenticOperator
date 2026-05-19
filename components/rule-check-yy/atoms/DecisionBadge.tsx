@@ -11,7 +11,7 @@
  * (e.g. validation failure flipped LLM's `blocked` to `pending_human`).
  */
 import React from "react";
-import type { RuleDecision } from "@/lib/rule-check";
+import type { RuleDecision } from "@/lib/rule-check-yy";
 
 export interface DecisionBadgeProps {
   value: RuleDecision;

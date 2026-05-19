@@ -48,7 +48,7 @@ export interface LLMEvaluateInput {
    * Enable `logprobs: true` on the chat-completions request. Default is OFF
    * (some providers hang on it). Falls back to env `RULE_CHECK_LOGPROBS=1`.
    * composite confidence degrades gracefully when logprobs are absent — see
-   * `lib/rule-check/confidence/composite.ts`.
+   * `lib/rule-check-yy/confidence/composite.ts`.
    */
   enableLogprobs?: boolean;
   /**

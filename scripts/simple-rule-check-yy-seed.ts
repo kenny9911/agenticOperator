@@ -77,8 +77,8 @@ function parseArgs(): Args {
 async function main(): Promise<void> {
   const args = parseArgs();
   process.stdout.write(
-    `\n[simple-rule-check-seed] domain=${args.domain} apiBase=${args.apiBase}\n` +
-      `[simple-rule-check-seed] mode=${args.checkOnly ? "check-only" : "seed"}\n\n`,
+    `\n[simple-rule-check-yy-seed] domain=${args.domain} apiBase=${args.apiBase}\n` +
+      `[simple-rule-check-yy-seed] mode=${args.checkOnly ? "check-only" : "seed"}\n\n`,
   );
 
   // ── Step 1: schema check.
@@ -108,10 +108,10 @@ async function main(): Promise<void> {
       process.exit(4);
     }
   }
-  process.stdout.write(`\n[simple-rule-check-seed] all required schemas present.\n\n`);
+  process.stdout.write(`\n[simple-rule-check-yy-seed] all required schemas present.\n\n`);
 
   if (args.checkOnly) {
-    process.stdout.write(`[simple-rule-check-seed] --check-only: exiting after schema verification.\n`);
+    process.stdout.write(`[simple-rule-check-yy-seed] --check-only: exiting after schema verification.\n`);
     process.exit(0);
   }
 
@@ -139,7 +139,7 @@ async function main(): Promise<void> {
   await upsertBatch("Application",              buildApplications(),       "application_id", args);
 
   // ── Step 3: verification probe.
-  process.stdout.write(`\n[simple-rule-check-seed] verifying writes…\n`);
+  process.stdout.write(`\n[simple-rule-check-yy-seed] verifying writes…\n`);
   const verifications: Array<{ label: string; pk: string }> = [
     ...buildSourcingChannels().map((r) => ({ label: "Sourcing_Channel", pk: r.sourcing_channel_id })),
     ...buildEvaluationModels().map((r) => ({ label: "Evaluation_Model", pk: r.evaluation_model_id })),
@@ -172,7 +172,7 @@ async function main(): Promise<void> {
     }
   }
 
-  process.stdout.write(`\n[simple-rule-check-seed] done. ${verifications.length} instances confirmed.\n`);
+  process.stdout.write(`\n[simple-rule-check-yy-seed] done. ${verifications.length} instances confirmed.\n`);
 }
 
 // ─── upsert helper ───
@@ -957,7 +957,7 @@ function extractPk(schema: unknown): string {
 }
 
 main().catch((err) => {
-  process.stderr.write(`\n[simple-rule-check-seed] FATAL: ${(err as Error).message}\n`);
+  process.stderr.write(`\n[simple-rule-check-yy-seed] FATAL: ${(err as Error).message}\n`);
   if ((err as Error).stack) {
     process.stderr.write((err as Error).stack + "\n");
   }

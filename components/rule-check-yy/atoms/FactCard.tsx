@@ -29,7 +29,7 @@ import type {
   Instance,
   FetchedRule,
   OntologyApiTraceEntry,
-} from "@/lib/rule-check";
+} from "@/lib/rule-check-yy";
 
 export interface FactCardProps {
   evidence: EvidenceAudited;

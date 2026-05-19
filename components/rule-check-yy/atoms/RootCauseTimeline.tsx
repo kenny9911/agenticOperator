@@ -6,7 +6,7 @@
  * 对照推理 / 结论) as a vertical timeline with colored bands.
  */
 import React from "react";
-import type { RootCauseSections } from "@/lib/rule-check";
+import type { RootCauseSections } from "@/lib/rule-check-yy";
 
 export interface RootCauseTimelineProps {
   sections: RootCauseSections;

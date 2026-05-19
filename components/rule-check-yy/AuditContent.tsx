@@ -1,6 +1,6 @@
 "use client";
 /**
- * /rule-check/audit — compliance + analytics page.
+ * /rule-check-yy/audit — compliance + analytics page.
  *
  * Stub: report builder + recent-export list. Real export endpoint TBD.
  */
@@ -18,7 +18,7 @@ export function AuditContent() {
   return (
     <div className="flex flex-col gap-4 p-6">
       <header>
-        <h1 className="text-xl font-semibold text-ink-1">{t("rc_audit")}</h1>
+        <h1 className="text-xl font-semibold text-ink-1">{t("rc_yy_audit")}</h1>
         <p className="mt-1 text-xs text-ink-3">
           Compliance reports + cross-run analytics. Exports run against the
           out-of-Ontology audit store.
@@ -46,22 +46,22 @@ export function AuditContent() {
               className="input"
             />
           </Field>
-          <Field label={t("rc_client")}>
+          <Field label={t("rc_yy_client")}>
             <input
               value={client}
               onChange={(e) => setClient(e.target.value)}
               className="input"
             />
           </Field>
-          <Field label={t("rc_filter_status")}>
+          <Field label={t("rc_yy_filter_status")}>
             <select
               value={decision}
               onChange={(e) => setDecision(e.target.value as typeof decision)}
               className="input"
             >
               <option value="all">all</option>
-              <option value="blocked">{t("rc_blocked")}</option>
-              <option value="pending_human">{t("rc_pending_human")}</option>
+              <option value="blocked">{t("rc_yy_blocked")}</option>
+              <option value="pending_human">{t("rc_yy_pending_human")}</option>
             </select>
           </Field>
           <div className="col-span-2 flex items-center gap-2">

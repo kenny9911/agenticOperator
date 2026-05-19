@@ -2,13 +2,13 @@
 
 /**
  * Server action — invokes the Simple Rule Checker on behalf of
- * `/dev/simple-rule-check/`.
+ * `/dev/simple-rule-check-yy/`.
  *
  * Kept server-side so OpenAI / Ontology API tokens never reach the browser
  * bundle. Mirrors the shape of `app/dev/generate-prompt/actions.ts`.
  */
 
-import { checkRule, type RuleCheckRun } from "@/lib/simple-rule-check";
+import { checkRule, type RuleCheckRun } from "@/lib/simple-rule-check-yy";
 
 export interface RunCheckOptions {
   actionRef: string;

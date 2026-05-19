@@ -1,17 +1,17 @@
 "use client";
 
 /**
- * /dev/rule-check — engineering preview of the full Rule Checker.
+ * /dev/rule-check-yy — engineering preview of the full Rule Checker.
  *
  * Submits to a server action that calls `checkRules()` (batch). Renders the
  * aggregate decision + per-rule cards + audit metadata. Not the commercial
- * UI — that lives at `/rule-check/*`.
+ * UI — that lives at `/rule-check-yy/*`.
  */
 
 import { useEffect, useMemo, useState, useTransition } from "react";
 
 import { runCheckBatch, type RunCheckBatchResult } from "./actions";
-import { formatElapsed } from "@/components/rule-check/atoms/formatElapsed";
+import { formatElapsed } from "@/components/rule-check-yy/atoms/formatElapsed";
 
 const DEFAULTS = {
   actionRef: "matchResume",
@@ -83,11 +83,11 @@ export default function RuleCheckDevPage() {
         <h1 className="text-lg font-semibold text-ink-1">
           Rule Checker (full)
           <span className="ml-2 text-xs font-normal text-ink-3">
-            — engineering preview · batch · /dev/rule-check
+            — engineering preview · batch · /dev/rule-check-yy
           </span>
         </h1>
         <p className="mt-1 text-xs text-ink-3">
-          Calls <code className="font-mono">checkRules()</code>: one LLM call evaluates all action rules, returns a batch run with aggregate decision + per-rule judgments. Commercial UI lives at <code className="font-mono">/rule-check</code>.
+          Calls <code className="font-mono">checkRules()</code>: one LLM call evaluates all action rules, returns a batch run with aggregate decision + per-rule judgments. Commercial UI lives at <code className="font-mono">/rule-check-yy</code>.
         </p>
       </header>
 

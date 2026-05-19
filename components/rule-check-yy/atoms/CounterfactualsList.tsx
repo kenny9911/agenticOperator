@@ -12,7 +12,7 @@
 
 import { Badge } from "@/components/shared/atoms";
 import { DecisionBadge } from "./DecisionBadge";
-import type { CounterfactualEntry } from "@/lib/rule-check";
+import type { CounterfactualEntry } from "@/lib/rule-check-yy";
 
 export interface CounterfactualsListProps {
   counterfactuals: CounterfactualEntry[] | undefined;

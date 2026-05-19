@@ -12,7 +12,7 @@
  */
 import React, { useState } from "react";
 import { useApp } from "@/lib/i18n";
-import type { PromptProvenance } from "@/lib/rule-check";
+import type { PromptProvenance } from "@/lib/rule-check-yy";
 
 export interface PromptPanelProps {
   prompt: string;
@@ -36,13 +36,13 @@ export function PromptPanel({
     <div className="rounded-lg border border-line bg-surface shadow-sh-1 overflow-hidden">
       <div className="flex items-stretch border-b border-line bg-surface">
         <TabBtn active={tab === "resolved"} onClick={() => setTab("resolved")}>
-          {t("rc_tab_resolved")}
+          {t("rc_yy_tab_resolved")}
         </TabBtn>
         <TabBtn active={tab === "source"} onClick={() => setTab("source")}>
-          {t("rc_tab_source")}
+          {t("rc_yy_tab_source")}
         </TabBtn>
         <TabBtn active={tab === "raw"} onClick={() => setTab("raw")}>
-          {t("rc_tab_raw_response")}
+          {t("rc_yy_tab_raw_response")}
         </TabBtn>
         <div className="ml-auto px-3 py-2 text-[10px] text-ink-3 font-mono self-center">
           prompt sha: {provenance.promptSha256.slice(0, 12)}…

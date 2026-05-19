@@ -6,7 +6,7 @@
 import React from "react";
 import { useApp } from "@/lib/i18n";
 import { Badge } from "@/components/shared/atoms";
-import type { LLMRawResponse, RuleJudgmentAudited } from "@/lib/rule-check";
+import type { LLMRawResponse, RuleJudgmentAudited } from "@/lib/rule-check-yy";
 
 export interface ResponsePanelProps {
   llmRaw: LLMRawResponse;
@@ -18,8 +18,8 @@ export function ResponsePanel({ llmRaw, parsed }: ResponsePanelProps) {
   return (
     <div className="rounded-lg border border-line bg-surface shadow-sh-1 p-3 flex flex-col gap-3">
       <div className="grid grid-cols-3 gap-3">
-        <KV label={t("rc_model")} value={llmRaw.model} mono />
-        <KV label={t("rc_latency")} value={`${llmRaw.latencyMs}ms`} />
+        <KV label={t("rc_yy_model")} value={llmRaw.model} mono />
+        <KV label={t("rc_yy_latency")} value={`${llmRaw.latencyMs}ms`} />
         <KV
           label="tokens in/out"
           value={`${llmRaw.inputTokens.toLocaleString()}/${llmRaw.outputTokens.toLocaleString()}`}
@@ -34,7 +34,7 @@ export function ResponsePanel({ llmRaw, parsed }: ResponsePanelProps) {
       {parsed?.counterfactuals && parsed.counterfactuals.length > 0 && (
         <div className="flex flex-col gap-1">
           <div className="text-[10.5px] uppercase tracking-wide text-ink-3 flex items-center gap-2">
-            counterfactuals <Badge variant="warn">{t("rc_speculative")}</Badge>
+            counterfactuals <Badge variant="warn">{t("rc_yy_speculative")}</Badge>
           </div>
           {parsed.counterfactuals.map((cf, i) => (
             <div key={i} className="text-[12px] text-ink-2 border-l-2 border-line pl-2">

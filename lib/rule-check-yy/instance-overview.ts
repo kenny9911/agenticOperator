@@ -1,6 +1,6 @@
 /**
  * Pure-data helpers for projecting candidate / job instances into the
- * "main fields" cards used by `/rule-check` batch preview + `/rule-check/batches/[batchId]`.
+ * "main fields" cards used by `/rule-check-yy` batch preview + `/rule-check-yy/batches/[batchId]`.
  *
  * Server-side safe (no JSX, returns `{label, value: string}[]`). UI atoms
  * render the values via their own definition-list components. RunsPreview's

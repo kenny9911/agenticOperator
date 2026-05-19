@@ -28,8 +28,8 @@ export function LeftNav() {
     { type: "item", id: "permissions",icon: "key",      label: t("nav_permissions"), href: "#" },
     { type: "item", id: "audit",      icon: "book",     label: t("nav_audit"), href: "#" },
     { type: "item", id: "compliance", icon: "shield",   label: t("nav_compliance"), href: "#" },
-    { type: "group", title: t("nav_group_trust") },
-    { type: "item", id: "rule-check", icon: "shield",   label: t("nav_rule_check"), href: "/rule-check" },
+    { type: "group", title: t("nav_group_trust_yy") },
+    { type: "item", id: "rule-check-yy", icon: "shield",   label: t("nav_rule_check_yy"), href: "/rule-check-yy" },
   ];
 
   const isActive = (href: string) => {

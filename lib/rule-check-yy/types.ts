@@ -1,5 +1,5 @@
 /**
- * Public types for `lib/rule-check` (full impl).
+ * Public types for `lib/rule-check-yy` (full impl).
  *
  * Re-exports the primitive shapes from `lib/simple-rule-check/types` to avoid
  * duplication; the audit-rich extensions live in `./types-audited.ts`.
@@ -24,7 +24,7 @@ export type {
   FinalDecision,
   RuleCheckRun,
   RuleCheckBatchRun,
-} from "../simple-rule-check/types";
+} from "../simple-rule-check-yy/types";
 
 /**
  * Extends `FetchedRule` with optional classification metadata that the

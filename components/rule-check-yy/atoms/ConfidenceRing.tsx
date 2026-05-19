@@ -4,7 +4,7 @@
  * (composite_full or composite_degraded with per-factor contributions).
  */
 import React from "react";
-import type { CompositeConfidenceBreakdown } from "@/lib/rule-check";
+import type { CompositeConfidenceBreakdown } from "@/lib/rule-check-yy";
 
 export interface ConfidenceRingProps {
   value: number;

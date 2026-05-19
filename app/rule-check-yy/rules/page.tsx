@@ -1,5 +1,5 @@
-import { listActiveRules } from "@/lib/rule-check/server-actions";
-import { RuleLibraryPageView } from "@/components/rule-check/RuleLibraryPageView";
+import { listActiveRules } from "@/lib/rule-check-yy/server-actions";
+import { RuleLibraryPageView } from "@/components/rule-check-yy/RuleLibraryPageView";
 
 const DEFAULT_SCOPE = {
   actionRef: "matchResume",

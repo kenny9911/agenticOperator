@@ -24,9 +24,9 @@ import { Badge, Btn, Card } from "@/components/shared/atoms";
 import { DecisionBadge } from "./DecisionBadge";
 import { ConfidenceRing } from "./ConfidenceRing";
 import { ValidationLight } from "./ValidationLight";
-import { getRunPreview, type RunPreview } from "@/app/rule-check/actions";
+import { getRunPreview, type RunPreview } from "@/app/rule-check-yy/actions";
 import { useApp } from "@/lib/i18n";
-import type { Instance } from "@/lib/rule-check";
+import type { Instance } from "@/lib/rule-check-yy";
 
 export interface RunsPreviewProps {
   runId: string | undefined;
@@ -131,7 +131,7 @@ export function RunsPreview({ runId }: RunsPreviewProps) {
             <ConfidenceRing
               value={preview.confidence}
               size={56}
-              label={t("rc_confidence")}
+              label={t("rc_yy_confidence")}
             />
           )}
           <div className="flex-1 flex flex-col gap-0.5 text-[11.5px]">
@@ -205,7 +205,7 @@ export function RunsPreview({ runId }: RunsPreviewProps) {
         {candidateMain && (
           <div className="border-t border-line pt-3">
             <div className="text-[10px] uppercase tracking-wide text-ink-3 mb-1.5">
-              {t("rc_candidate_main_info")}
+              {t("rc_yy_candidate_main_info")}
               <span className="ml-2 font-mono text-ink-4 normal-case tracking-normal">
                 {candidateMain.objectType} · {candidateMain.objectId}
               </span>
@@ -217,7 +217,7 @@ export function RunsPreview({ runId }: RunsPreviewProps) {
         {otherInstances.length > 0 && (
           <div className="border-t border-line pt-3">
             <div className="text-[10px] uppercase tracking-wide text-ink-3 mb-1.5">
-              {t("rc_other_instances")}
+              {t("rc_yy_other_instances")}
               <span className="ml-2 text-ink-4 normal-case tracking-normal">
                 ({otherInstances.length})
               </span>
@@ -231,9 +231,9 @@ export function RunsPreview({ runId }: RunsPreviewProps) {
         )}
 
         <div className="pt-2 border-t border-line">
-          <Link href={`/rule-check/runs/${preview.runId}`} className="block">
+          <Link href={`/rule-check-yy/runs/${preview.runId}`} className="block">
             <Btn variant="primary" size="sm" className="w-full justify-center">
-              {t("rc_open_full_detail")} →
+              {t("rc_yy_open_full_detail")} →
             </Btn>
           </Link>
         </div>

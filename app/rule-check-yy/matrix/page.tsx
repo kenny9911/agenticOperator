@@ -1,8 +1,8 @@
 import {
   listMatrixCells,
   listActiveRules,
-} from "@/lib/rule-check/server-actions";
-import { MatrixPageView } from "@/components/rule-check/MatrixPageView";
+} from "@/lib/rule-check-yy/server-actions";
+import { MatrixPageView } from "@/components/rule-check-yy/MatrixPageView";
 
 const DEFAULT_SCOPE = {
   actionRef: "matchResume",

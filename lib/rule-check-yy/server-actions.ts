@@ -1,5 +1,5 @@
 /**
- * Server-action seam for the commercial `/rule-check/*` UI.
+ * Server-action seam for the commercial `/rule-check-yy/*` UI.
  *
  * This file is a thin UI-layer adapter — it does NOT modify the checker
  * itself. It composes existing public surface:
@@ -7,7 +7,7 @@
  *   - `filesystemRunStore` (from `./store`) for read paths
  *   - `fetchAllRules` (from `./fetch-rules`) for rule library lookups
  *
- * Both `app/dev/rule-check/actions.ts` and `app/rule-check/actions.ts` wrap
+ * Both `app/dev/rule-check-yy/actions.ts` and `app/rule-check-yy/actions.ts` wrap
  * each function below in a thin "use server" async passthrough.
  *
  * Why types are NOT exported from this module: Next.js 16 + Turbopack's
@@ -16,7 +16,7 @@
  * that have already been erased), causing server-side ReferenceErrors.
  * The route actions.ts files therefore re-declare the public surface
  * locally with `export interface` / `export type` (matching the working
- * pattern in `app/dev/simple-rule-check/actions.ts`). The shapes here are
+ * pattern in `app/dev/simple-rule-check-yy/actions.ts`). The shapes here are
  * the source of truth — keep them in sync manually.
  *
  * Per SPEC §9.3 (UI Derivations留痕): UI does not generate new result
@@ -226,7 +226,7 @@ interface ListAggregateBatchesInput {
 
 /**
  * Invoke a fresh rule-check batch. Original home of this function was
- * `app/dev/rule-check/actions.ts`; both routes now import it from here.
+ * `app/dev/rule-check-yy/actions.ts`; both routes now import it from here.
  */
 export async function runCheckBatch(
   opts: RunCheckBatchOptions,
@@ -477,7 +477,7 @@ export async function listAggregateBatches(
 }
 
 /**
- * Full batch summary for `/rule-check/batches/[batchId]` detail page.
+ * Full batch summary for `/rule-check-yy/batches/[batchId]` detail page.
  * Projects `batches/<id>.json` into a slim shape (drops `llmRaw.response`
  * raw body to keep payload manageable; keeps usage + latency + provenance).
  */

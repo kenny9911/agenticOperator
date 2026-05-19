@@ -12,7 +12,7 @@
  * Always writes audit-path notes to stderr.
  */
 
-import { checkRules } from "../lib/rule-check";
+import { checkRules } from "../lib/rule-check-yy";
 
 interface CliArgs {
   candidate: string;
@@ -91,7 +91,7 @@ async function main(): Promise<void> {
   }
 }
 
-function printPretty(batch: import("../lib/rule-check").RuleCheckBatchRunAudited): void {
+function printPretty(batch: import("../lib/rule-check-yy").RuleCheckBatchRunAudited): void {
   process.stdout.write(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
   process.stdout.write(`Rule check (full) — ${batch.input.actionRef}\n`);
   process.stdout.write(

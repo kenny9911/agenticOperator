@@ -8,7 +8,7 @@
 import { Shell } from "@/components/shared/Shell";
 import { useApp } from "@/lib/i18n";
 import { AggregateContent } from "./AggregateContent";
-import type { BatchRow, BatchAggregateMetrics } from "@/app/rule-check/actions";
+import type { BatchRow, BatchAggregateMetrics } from "@/app/rule-check-yy/actions";
 
 export interface AggregatePageViewProps {
   rows: BatchRow[];
@@ -20,8 +20,8 @@ export function AggregatePageView(props: AggregatePageViewProps) {
   const { t } = useApp();
   return (
     <Shell
-      crumbs={[t("nav_group_trust"), t("nav_rule_check")]}
-      directionTag={t("rc_aggregate_title")}
+      crumbs={[t("nav_group_trust_yy"), t("nav_rule_check_yy")]}
+      directionTag={t("rc_yy_aggregate_title")}
     >
       <AggregateContent {...props} />
     </Shell>

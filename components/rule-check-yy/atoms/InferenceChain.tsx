@@ -32,7 +32,7 @@ import { FactCard } from "./FactCard";
 import type {
   RuleCheckRunAudited,
   RuleDecision,
-} from "@/lib/rule-check";
+} from "@/lib/rule-check-yy";
 
 export interface InferenceChainProps {
   run: RuleCheckRunAudited;

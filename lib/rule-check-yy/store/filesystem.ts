@@ -2,7 +2,7 @@
  * Filesystem RunStore — zero-infra audit persistence.
  *
  * Layout:
- *   data/rule-check-runs/
+ *   data/rule-check-yy-runs/
  *   ├── <YYYYMMDD>/<runId>.json          (one per per-rule run)
  *   ├── batches/<batchId>.json           (one per checkRules call)
  *   └── index.jsonl                      (append-only, one line per run)
@@ -27,7 +27,7 @@ import type {
 
 import type { RunIndexEntry, RunQuery, RunStore } from "./index";
 
-const ROOT_DIR = resolve(process.cwd(), "data", "rule-check-runs");
+const ROOT_DIR = resolve(process.cwd(), "data", "rule-check-yy-runs");
 const BATCH_DIR = join(ROOT_DIR, "batches");
 const INDEX_PATH = join(ROOT_DIR, "index.jsonl");
 

@@ -11,12 +11,12 @@
     "start": "next start -p 3002",
     "lint": "next lint",
     "gen:v4-snapshot": "node --env-file=.env.local --import tsx scripts/gen-v4-snapshot.ts",
-    "simple-rule-check": "node --env-file=.env.local --import tsx scripts/simple-rule-check.ts",
-    "simple-rule-check:seed": "node --env-file=.env.local --import tsx scripts/simple-rule-check-seed.ts",
-    "simple-rule-check:seed:check": "node --env-file=.env.local --import tsx scripts/simple-rule-check-seed.ts --check-only",
-    "rule-check": "node --env-file=.env.local --import tsx scripts/rule-check.ts",
-    "rule-check:seed": "npm run simple-rule-check:seed",
-    "rule-check:seed:check": "npm run simple-rule-check:seed:check",
+    "simple-rule-check-yy": "node --env-file=.env.local --import tsx scripts/simple-rule-check-yy.ts",
+    "simple-rule-check-yy:seed": "node --env-file=.env.local --import tsx scripts/simple-rule-check-yy-seed.ts",
+    "simple-rule-check-yy:seed:check": "node --env-file=.env.local --import tsx scripts/simple-rule-check-yy-seed.ts --check-only",
+    "rule-check-yy": "node --env-file=.env.local --import tsx scripts/rule-check-yy.ts",
+    "rule-check-yy:seed": "npm run simple-rule-check-yy:seed",
+    "rule-check-yy:seed:check": "npm run simple-rule-check-yy:seed:check",
     "dev:dump-match-resume-prompt": "node --env-file=.env.local --import tsx scripts/dump-match-resume-prompt.ts"
   },
   "dependencies": {

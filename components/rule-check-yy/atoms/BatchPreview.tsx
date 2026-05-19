@@ -1,6 +1,6 @@
 "use client";
 /**
- * Right-hand preview panel for `/rule-check` aggregate page (v3 — row=batch).
+ * Right-hand preview panel for `/rule-check-yy` aggregate page (v3 — row=batch).
  *
  * Fetches `getBatchSummary(batchId)` and renders verdict + step calls + candidate
  * key fields + other instances. Strict subset of audit JSON (SPEC §9.3 D9).
@@ -10,9 +10,9 @@ import Link from "next/link";
 import { useEffect, useRef, useState, useTransition } from "react";
 import { Badge, Btn, Card } from "@/components/shared/atoms";
 import { DecisionBadge } from "./DecisionBadge";
-import { getBatchSummary, type BatchSummary } from "@/app/rule-check/actions";
+import { getBatchSummary, type BatchSummary } from "@/app/rule-check-yy/actions";
 import { useApp } from "@/lib/i18n";
-import type { Instance } from "@/lib/rule-check";
+import type { Instance } from "@/lib/rule-check-yy";
 
 export interface BatchPreviewProps {
   batchId: string | undefined;
@@ -61,7 +61,7 @@ export function BatchPreview({ batchId }: BatchPreviewProps) {
     return (
       <Card>
         <div className="p-6 text-center text-[12px] text-ink-3">
-          {t("rc_select_batch_hint")}
+          {t("rc_yy_select_batch_hint")}
         </div>
       </Card>
     );
@@ -99,7 +99,7 @@ export function BatchPreview({ batchId }: BatchPreviewProps) {
 
         {summary.aggregateDecision.terminal && (
           <div className="rounded border border-warn bg-warn-bg px-3 py-2 text-[11px] text-warn">
-            ↯ <strong>{t("rc_short_circuited")}</strong>
+            ↯ <strong>{t("rc_yy_short_circuited")}</strong>
             {summary.aggregateDecision.terminalAtStep !== undefined && (
               <> @ step {summary.aggregateDecision.terminalAtStep}</>
             )}
@@ -148,7 +148,7 @@ export function BatchPreview({ batchId }: BatchPreviewProps) {
 
         <div className="border-t border-line pt-3">
           <div className="text-[10px] uppercase tracking-wide text-ink-3 mb-1.5">
-            {t("rc_step_calls")}
+            {t("rc_yy_step_calls")}
           </div>
           <div className="flex flex-col gap-1">
             {summary.stepCalls.map((sc) => (
@@ -185,7 +185,7 @@ export function BatchPreview({ batchId }: BatchPreviewProps) {
         {summary.candidateOverview.mainFields.length > 0 && (
           <div className="border-t border-line pt-3">
             <div className="text-[10px] uppercase tracking-wide text-ink-3 mb-1.5">
-              {t("rc_candidate_overview")}
+              {t("rc_yy_candidate_overview")}
               {summary.candidateOverview.instance && (
                 <span className="ml-2 font-mono text-ink-4 normal-case tracking-normal">
                   {summary.candidateOverview.instance.objectType} ·{" "}
@@ -204,7 +204,7 @@ export function BatchPreview({ batchId }: BatchPreviewProps) {
         {summary.otherInstances.length > 0 && (
           <div className="border-t border-line pt-3">
             <div className="text-[10px] uppercase tracking-wide text-ink-3 mb-1.5">
-              {t("rc_other_instances")}
+              {t("rc_yy_other_instances")}
               <span className="ml-2 text-ink-4 normal-case tracking-normal">
                 ({summary.otherInstances.length})
               </span>
@@ -218,9 +218,9 @@ export function BatchPreview({ batchId }: BatchPreviewProps) {
         )}
 
         <div className="pt-2 border-t border-line">
-          <Link href={`/rule-check/batches/${summary.batchId}`} className="block">
+          <Link href={`/rule-check-yy/batches/${summary.batchId}`} className="block">
             <Btn variant="primary" size="sm" className="w-full justify-center">
-              {t("rc_open_run_detail")} →
+              {t("rc_yy_open_run_detail")} →
             </Btn>
           </Link>
         </div>

@@ -8,8 +8,8 @@
  */
 
 import { StatusDot } from "@/components/shared/atoms";
-import type { AggregateRow } from "@/app/rule-check/actions";
-import type { RuleDecision } from "@/lib/rule-check";
+import type { AggregateRow } from "@/app/rule-check-yy/actions";
+import type { RuleDecision } from "@/lib/rule-check-yy";
 
 export interface RunsListProps {
   rows: AggregateRow[];

@@ -2,7 +2,7 @@
  * Filesystem RunStore — simple-rule-check audit persistence.
  *
  * Writes one JSON file per run to:
- *   data/simple-rule-check-runs/<YYYYMMDD>/<runId>.json
+ *   data/simple-rule-check-yy-runs/<YYYYMMDD>/<runId>.json
  *
  * Directory tree is created on demand. Files are pretty-printed for easy
  * eyeballing. Path is gitignored.
@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import type { RunStore } from "./index";
 import type { RuleCheckRun } from "../types";
 
-const ROOT_DIR = resolve(process.cwd(), "data", "simple-rule-check-runs");
+const ROOT_DIR = resolve(process.cwd(), "data", "simple-rule-check-yy-runs");
 
 export const filesystemRunStore: RunStore = {
   name: "filesystem",

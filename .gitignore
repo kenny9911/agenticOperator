@@ -62,10 +62,10 @@ logs/
 package-lock.json.bak
 
 # simple-rule-check runtime data (audit traces)
-data/simple-rule-check-runs/
+data/simple-rule-check-yy-runs/
 
 # rule-check (full impl) runtime data (audit traces)
-data/rule-check-runs/
+data/rule-check-yy-runs/
 
 # dev-time artifacts (prompt dumps, section stats, etc.)
 data/dev/

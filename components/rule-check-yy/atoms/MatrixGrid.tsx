@@ -4,7 +4,7 @@
  *
  * Layout: CSS Grid with sticky first column (rule label) + sticky header
  * row (candidate id). Cells are 56×56 min, color-coded by decision. Click
- * a cell → navigate to /rule-check/runs/<runId>.
+ * a cell → navigate to /rule-check-yy/runs/<runId>.
  *
  * Rule rows are grouped by `step.order` with a sticky step header. Empty
  * cells (no run for that pair) render as dashed transparent borders.
@@ -14,11 +14,11 @@
  */
 
 import { useRouter } from "next/navigation";
-import type { MatrixCell } from "@/app/rule-check/actions";
+import type { MatrixCell } from "@/app/rule-check-yy/actions";
 import type {
   FetchedRuleClassified,
   RuleDecision,
-} from "@/lib/rule-check";
+} from "@/lib/rule-check-yy";
 
 export interface MatrixGridProps {
   cells: MatrixCell[];
@@ -133,7 +133,7 @@ export function MatrixGrid({ cells, rules, candidates }: MatrixGridProps) {
                           opacity: cell ? 0.85 : 1,
                         }}
                         onClick={() => {
-                          if (cell) router.push(`/rule-check/runs/${cell.runId}`);
+                          if (cell) router.push(`/rule-check-yy/runs/${cell.runId}`);
                         }}
                       />
                     );

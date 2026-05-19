@@ -13,7 +13,7 @@
 import { useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Badge, Btn } from "@/components/shared/atoms";
-import { replayRun } from "@/app/rule-check/actions";
+import { replayRun } from "@/app/rule-check-yy/actions";
 import { formatElapsed } from "./formatElapsed";
 import { useApp } from "@/lib/i18n";
 
@@ -53,7 +53,7 @@ export function ReplayButton({ runId }: ReplayButtonProps) {
       const res = await replayRun(runId);
       if (!mountedRef.current) return;
       if (res.ok) {
-        router.push(`/rule-check/runs/${res.newRunId}`);
+        router.push(`/rule-check-yy/runs/${res.newRunId}`);
       } else {
         setError(res.error);
       }
@@ -69,12 +69,12 @@ export function ReplayButton({ runId }: ReplayButtonProps) {
         disabled={isPending}
       >
         {isPending
-          ? `⟳ ${t("rc_replay_running")} ${formatElapsed(elapsedMs)}`
-          : `↻ ${t("rc_replay")}`}
+          ? `⟳ ${t("rc_yy_replay_running")} ${formatElapsed(elapsedMs)}`
+          : `↻ ${t("rc_yy_replay")}`}
       </Btn>
       {error && (
         <Badge variant="err">
-          {t("rc_replay_failed")}: {error}
+          {t("rc_yy_replay_failed")}: {error}
         </Badge>
       )}
     </div>

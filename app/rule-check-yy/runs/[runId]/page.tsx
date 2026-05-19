@@ -1,5 +1,5 @@
-import { getRunDetail } from "@/lib/rule-check/server-actions";
-import { RunDetailPageView } from "@/components/rule-check/RunDetailPageView";
+import { getRunDetail } from "@/lib/rule-check-yy/server-actions";
+import { RunDetailPageView } from "@/components/rule-check-yy/RunDetailPageView";
 
 export default async function RunDetailPage({
   params,
@@ -13,7 +13,7 @@ export default async function RunDetailPage({
   // Dev-only fallback: if the run isn't on disk but is one of the hardcoded
   // demo fixtures, surface it so the UI can be exercised without seeded data.
   if (!run && process.env.NODE_ENV === "development") {
-    const { MOCK_RUNS } = await import("@/components/rule-check/mock");
+    const { MOCK_RUNS } = await import("@/components/rule-check-yy/mock");
     run = MOCK_RUNS.find((r) => r.runId === runId) ?? null;
   }
 

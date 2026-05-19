@@ -8,7 +8,7 @@
  */
 import React, { useState } from "react";
 import { useApp } from "@/lib/i18n";
-import type { RuleCheckRunAudited } from "@/lib/rule-check";
+import type { RuleCheckRunAudited } from "@/lib/rule-check-yy";
 
 export interface AskWhyChatProps {
   run: RuleCheckRunAudited;
@@ -84,7 +84,7 @@ export function AskWhyChat({ run, onAsk }: AskWhyChatProps) {
           onKeyDown={(e) => {
             if (e.key === "Enter") ask(draft);
           }}
-          placeholder={t("rc_ask_placeholder")}
+          placeholder={t("rc_yy_ask_placeholder")}
           disabled={busy}
           className="flex-1 rounded border border-line bg-bg px-2 py-1.5 text-[12px] text-ink-1 disabled:opacity-50"
         />
