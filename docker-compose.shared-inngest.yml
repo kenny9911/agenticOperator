@@ -1,22 +1,20 @@
 # Overlay for SHARED-Inngest deployments: attaches AO containers to an
-# existing external Docker network (default: the RAAS stack's
-# raas-deploy-next_default) so AO reaches services that publish no host
-# port — on the Mac Studio that is the partner `postgres` container — by
-# container name. (The shared inngest-server publishes 127.0.0.1:8288, so
-# it is reached via host.docker.internal instead; see .env.deploy.example.)
+# existing external Docker network so AO reaches the shared Inngest and
+# partner services by unambiguous container names. There are deliberately no
+# network-name or callback-alias defaults: production must state the topology
+# it intends to join.
 #
-# Use together with the main file:
-#   docker compose --env-file .env.deploy \
-#     -f docker-compose.deploy.yml -f docker-compose.shared-inngest.yml up -d --wait
+# `scripts/deploy-compose.sh` includes this overlay automatically when the
+# authoritative env file contains DEPLOY_MODE=shared.
 #
 # Pair it with these .env.deploy settings:
+#   DEPLOY_MODE=shared
 #   COMPOSE_PROFILES=                                   # bundled inngest OFF
 #   INNGEST_BASE_URL=http://raas-inngest:8288           # shared instance
-#   INNGEST_SERVE_ORIGIN=http://ao-v2-app:3002          # our alias below
+#   AO_SHARED_NETWORK_ALIAS=ao-v2-app
+#   INNGEST_SERVE_ORIGIN=http://ao-v2-app:3002          # same alias
+#   RAAS_SHARED_NETWORK=raas-deploy-next_default
 #   RAAS_POSTGRES_URL=postgresql://user:pass@postgres:5432/raas
-#
-# Not needed when the shared services publish host ports — in that case the
-# main file alone works with host.docker.internal URLs instead.
 
 services:
   app:
@@ -24,8 +22,13 @@ services:
       default:
       raas-shared:
         # Distinctive alias: "app" would be ambiguous on a shared network.
-        aliases: [ao-v2-app]
+        aliases:
+          - "${AO_SHARED_NETWORK_ALIAS:?AO_SHARED_NETWORK_ALIAS is required in shared mode}"
   archiver:
+    networks:
+      default:
+      raas-shared: {}
+  monitor-sweeper:
     networks:
       default:
       raas-shared: {}
@@ -33,4 +36,4 @@ services:
 networks:
   raas-shared:
     external: true
-    name: ${RAAS_SHARED_NETWORK:-raas-deploy-next_default}
+    name: ${RAAS_SHARED_NETWORK:?RAAS_SHARED_NETWORK is required in shared mode}

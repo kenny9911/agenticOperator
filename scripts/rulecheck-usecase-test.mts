@@ -1,7 +1,8 @@
-// Rule-Check use-case 集成测试驱动(替代 RAAS:我们自己 emit RESUME_PROCESSED）。
+// Rule-Check use-case 集成测试驱动：分别触发正常岗位规则链和独立身份审计入口。
 //
 // 用真实 run 夹具(候选人「陈思」· 字节跳动行政文秘 · 岗位腾讯 CDG)串一遍 rule-check
-// 链路(ruleCheckAgent 10-1 + candidateIdentityAgent),验证:
+// 链路(RESUME_PROCESSED → ruleCheckAgent 10-1；另发
+// CANDIDATE_IDENTITY_REQUESTED → audit-only candidateIdentityAgent),验证:
 //   1. 调取的规则对:CDG 岗位应抓到 10-42(CDG 回流冷冻);身份检查应跑 IDENTITY-1/2/3。
 //   2. 规则验证对:陈思无腾讯经历 → 10-42 NOT_TRIGGERED(不 FAIL 她);身份无重复 → PASS。
 //
@@ -52,16 +53,22 @@ const DOMAIN = '招聘-v1';
 function log(...a: unknown[]) { console.log(...a); }
 
 async function emit(): Promise<string> {
-  const evt = realResumeProcessedEvent();
-  // 真实数据保持不变;Inngest 会给本次 emit 分配新 run_id,审计 caseId 取该 run_id。
-  const res = await fetch(`${INNGEST}/e/${KEY}`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(evt),
-  });
-  const body = await res.text();
-  log(`▶ emit RESUME_PROCESSED(替代 RAAS)· candidate=陈思 · status=${res.status}`);
-  if (!res.ok) throw new Error(`emit 失败:${res.status} ${body}`);
-  return (evt.data as { candidate_id: string }).candidate_id;
+  const processed = realResumeProcessedEvent();
+  const identityRequested = {
+    name: 'CANDIDATE_IDENTITY_REQUESTED',
+    data: { ...processed.data, invoked_by: 'rulecheck-usecase-test' },
+  };
+  // 两个事件共享同一脱敏业务数据，但分别证明两条互不依赖的运行路径。
+  for (const evt of [processed, identityRequested]) {
+    const res = await fetch(`${INNGEST}/e/${KEY}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(evt),
+    });
+    const body = await res.text();
+    log(`▶ emit ${evt.name} · candidate=陈思 · status=${res.status}`);
+    if (!res.ok) throw new Error(`emit ${evt.name} 失败:${res.status} ${body}`);
+  }
+  return (processed.data as { candidate_id: string }).candidate_id;
 }
 
 type AuditRow = { audit_id: string; agent_id: string; decision: string; case_id: string | null; created_at: string };
@@ -82,7 +89,7 @@ async function main() {
   log(`=== Rule-Check use-case 测试开始 ${startedAt} ===`);
   await emit();
 
-  // 轮询最多 ~40s,等 ruleCheckAgent + candidateIdentityAgent 落审计。
+  // 轮询最多 ~90s，等两条独立 Inngest run 分别落审计。
   let identity: AuditRow | undefined;
   let ruleCheck: AuditRow | undefined;
   for (let i = 0; i < 45; i++) {

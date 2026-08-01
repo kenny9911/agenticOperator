@@ -9,12 +9,8 @@ import { ruleCheckKey } from '@/lib/phone/normalize-e164';
 
 const s = (raw: string | null | undefined): string => (raw ?? '').trim();
 
-/** Canonical mobile key for the exact/fuzzy prefilter. Delegates to the shared
- *  phone normalizer (lib/phone/normalize-e164): libphonenumber's national number
- *  when the input parses to a valid number (correct for international numbers),
- *  else the legacy digit heuristic. For China numbers this is byte-identical to the
- *  old "digits, last 11" behavior; international numbers no longer keep a wrong
- *  country-code suffix. '' for fewer than 7 digits (not enough to identify). */
+/** Canonical identity key: one non-placeholder mainland-China 11-digit mobile.
+ *  International, malformed and ambiguous values return ''. */
 export function normalizePhone(raw: string | null | undefined): string {
   return ruleCheckKey(raw);
 }

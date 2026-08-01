@@ -70,10 +70,12 @@ const AGENT_MAP_RAAS_RAW: Omit<AgentMeta, 'domain'>[] = [
   { short: 'ResumeCollector',  wsId: '8',       stage: 'resume',      kind: 'hybrid', ownerTeam: '招聘运营', version: 'v3.0.1', triggersEvents: ['CHANNEL_PUBLISHED'],                              emitsEvents: ['RESUME_DOWNLOADED'],                                                        terminal: false },
   { short: 'ResumeParser',     wsId: '9-1',     stage: 'resume',      kind: 'auto',   ownerTeam: '招聘运营', version: 'v2.8.0', triggersEvents: ['RESUME_DOWNLOADED'],                              emitsEvents: ['RESUME_PROCESSED', 'RESUME_PARSE_ERROR'],                                   terminal: false, inngestName: 'Resume Parser Agent', inngestId: 'resume-parser-agent' },
   { short: 'ResumeFixer',      wsId: '9-2',     stage: 'resume',      kind: 'hitl',   ownerTeam: '招聘运营', version: 'v1.0.0', triggersEvents: ['RESUME_PARSE_ERROR'],                             emitsEvents: ['RESUME_PROCESSED'],                                                         terminal: false },
-  // Candidate identity (去重·是不是同一人) rule-check agent — an independent, AUDIT-ONLY
-  // agent at the intake seam (between ResumeParser and RuleCheck). It consumes
-  // RESUME_PROCESSED,调规则判断后写 OntologyRuleCheck 审计(/rule-check 面板),
-  // 不 emit 任何事件 → 永不拦截主链路。实现见 server/inngest/agents/candidate-identity-agent.ts。
+  // Candidate identity (去重·是不是同一人) rule-check agent — an independent,
+  // AUDIT-ONLY manual-review function. It consumes only the dedicated
+  // CANDIDATE_IDENTITY_REQUESTED event, writes OntologyRuleCheck evidence, and
+  // emits CANDIDATE_IDENTITY_CHECKED with no downstream subscriber. Normal
+  // RESUME_PROCESSED persistence neither invokes nor waits for this agent.
+  // 实现见 server/inngest/agents/candidate-identity-agent.ts。
   // 2026-06-11 改名 RuleCheckCandidateIdentity → CandidateDedup:舰队页对齐 Inngest
   // 注册名「候选人查重」(中文主标),短英文 CandidateDedup 做副标。short 改了之后
   // kebab 推导(candidate-dedup-agent)不再命中真函数 ID,所以必须显式 inngestId

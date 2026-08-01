@@ -14,6 +14,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Capture every SQL the writer runs inside withTx.
 const queries: Array<{ text: string; params: unknown[] }> = [];
 let existingCandidateRow: Record<string, unknown> | undefined;
+const updatedCandidateRow = {
+  name: '张三', mobile: '13800001111', mobile_normalized: '13800001111',
+  email: 'zhangsan@example.com', gender: null, birth_date: null,
+  current_location: null, highest_acquired_degree: null, work_years: null,
+  employee_id: 'EMP-LOCK-HOLDER',
+};
 
 vi.mock('./client', () => ({
   withTx: vi.fn(async (fn: (c: unknown) => Promise<unknown>) => {
@@ -22,6 +28,9 @@ vi.mock('./client', () => ({
         queries.push({ text, params });
         if (/SELECT candidate_id FROM candidate\b/i.test(text)) {
           return { rows: existingCandidateRow ? [existingCandidateRow] : [] };
+        }
+        if (/UPDATE candidate SET[\s\S]*RETURNING name, mobile/i.test(text)) {
+          return { rows: [updatedCandidateRow] };
         }
         return { rows: [] };
       }),

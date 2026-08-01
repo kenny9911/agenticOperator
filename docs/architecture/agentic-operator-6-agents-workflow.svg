@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1680" viewBox="0 0 1920 1680" role="img" aria-labelledby="title desc">
   <title id="title">Agentic Operator six production agents business workflow and event flow</title>
-  <desc id="desc">Visual map of Create JD, Resume Parser, Candidate Dedup, Rule Check, Match Resume, and Interview Inviter agents, including their trigger events, emitted events, external systems, persistence writes, and failure branches.</desc>
+  <desc id="desc">Visual map of Create JD, Resume Parser, audit-only Candidate Identity, Rule Check, Match Resume, and Interview Inviter agents, including their trigger events, emitted events, external systems, persistence writes, and failure branches.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -107,7 +107,7 @@
   <path class="edge" d="M1520 241 H1550"/>
 
   <rect class="lane" x="40" y="405" width="1840" height="275" rx="18"/>
-  <text class="lane-title" x="64" y="435">B. 简历入口 / 解析 / 候选人查重</text>
+  <text class="lane-title" x="64" y="435">B. 简历入口 / 手机号唯一去重 / 独立身份审计</text>
 
   <rect class="source" x="64" y="482" width="245" height="118" rx="12"/>
   <text class="node-title" x="84" y="510">RAAS + MinIO</text>
@@ -126,18 +126,19 @@
   <text class="tiny" x="664" y="517">server/inngest/agents/resume-parser-agent.ts</text>
   <text class="body" x="664" y="544">MinIO 下载; docx 转 PDF</text>
   <text class="body" x="664" y="566">RoboHire /parse-resume</text>
-  <text class="body" x="664" y="588">落 Partner PG Candidate/Resume</text>
+  <text class="body" x="664" y="588">仅按规范大陆手机号落 Candidate/Resume</text>
   <text class="body" x="664" y="610">写 Allmeta Candidate/Resume</text>
 
   <rect class="agent" x="992" y="438" width="320" height="150" rx="14"/>
-  <text class="node-title" x="1016" y="467">候选人查重</text>
+  <text class="node-title" x="1016" y="467">候选人身份审计</text>
   <text class="mono" x="1016" y="490">id: rule-check-candidate-identity-agent</text>
   <text class="tiny" x="1016" y="510">candidate-identity-agent.ts</text>
-  <text class="body" x="1016" y="536">step.invoke: 落库前同步判定</text>
-  <text class="body" x="1016" y="558">三级规则 + AI 字段等价</text>
+  <text class="body" x="1016" y="536">独立 CANDIDATE_IDENTITY_REQUESTED</text>
+  <text class="body" x="1016" y="558">手机号确定；其他信号只待人工复核</text>
 
   <rect class="store" x="992" y="610" width="320" height="52" rx="12"/>
-  <text class="body" x="1016" y="641">返回 sameAsCandidateId, 落 OntologyRuleCheck 审计</text>
+  <text class="body" x="1016" y="633">只落 OntologyRuleCheck，不修改 Candidate/Resume</text>
+  <text class="tiny" x="1016" y="651">完成后仅通知 CANDIDATE_IDENTITY_CHECKED</text>
 
   <rect class="event" x="1360" y="470" width="250" height="95" rx="14"/>
   <text class="node-title" x="1384" y="499">Emit</text>
@@ -150,13 +151,12 @@
 
   <rect class="event" x="1530" y="405" width="250" height="64" rx="12"/>
   <text class="mono" x="1550" y="431">CANDIDATE_IDENTITY_</text>
-  <text class="mono" x="1550" y="451">CHECKED</text>
+  <text class="mono" x="1550" y="451">REQUESTED（独立入口）</text>
 
   <path class="edge" d="M309 541 H350"/>
   <path class="edge-blue" d="M600 541 H640"/>
-  <path class="edge-blue" d="M945 513 H992"/>
-  <path class="edge-dash" d="M1128 438 C1128 400 1408 390 1530 431"/>
-  <path class="edge-blue" d="M1312 520 H1360"/>
+  <path class="edge-dash" d="M1530 431 C1450 390 1128 390 1128 438"/>
+  <path class="edge-blue" d="M945 478 C1080 370 1270 370 1360 500"/>
   <path class="edge-red" d="M945 610 C1060 696 1288 675 1360 627"/>
 
   <rect class="lane" x="40" y="715" width="1840" height="320" rx="18"/>

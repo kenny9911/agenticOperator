@@ -84,8 +84,10 @@ export const KNOWN_CONFIG_DEFINITIONS: RuntimeConfigDefinition[] = [
     key: "NEXT_PUBLIC_INNGEST_URL",
     label: "Browser Inngest URL",
     section: "inngest",
-    description: "Browser-side mirror for Inngest links.",
+    description: "Browser-side mirror for Inngest links. This value is embedded at build time and requires a rebuild.",
     placeholder: "http://localhost:8288",
+    editable: false,
+    restartRequired: true,
   },
   {
     key: "INNGEST_SERVE_ORIGIN",
@@ -288,9 +290,53 @@ function labelFromKey(key: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function isSecretKey(key: string): boolean {
-  return /(SECRET|PASSWORD|TOKEN|API_KEY|SIGNING_KEY|EVENT_KEY|DATABASE_URL|POSTGRES_URL|PG_URL)$/i.test(key) ||
-    /(SECRET|PASSWORD|TOKEN|API_KEY|DATABASE_URL|POSTGRES_URL|PG_URL)/i.test(key);
+export function isSecretConfigKey(key: string): boolean {
+  return (
+    /(?:^|_)(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|SIGNING_KEY|EVENT_KEY|CLIENT_SECRET|CREDENTIALS?)(?:_|$)/i.test(key) ||
+    /(?:^|_)(?:DATABASE_URL|POSTGRES_URL|PG_URL)(?:_|$)/i.test(key)
+  );
+}
+
+const DEPLOYMENT_OWNED_CONFIG_KEYS = new Set([
+  "AO_BIND_ADDRESS",
+  "AO_ENV_FILE",
+  "AO_EXISTING_POSTGRES_VOLUME",
+  "AO_IMAGE",
+  "AO_PORT",
+  "AO_POSTGRES_DB",
+  "AO_POSTGRES_PORT",
+  "AO_POSTGRES_USER",
+  "AO_POSTGRES_VOLUME_MODE",
+  "AO_PUBLIC_ORIGIN",
+  "AO_SHARED_NETWORK_ALIAS",
+  "DATABASE_SCHEMA_SYNC",
+  "DEPLOY_MODE",
+  "INNGEST_BIND_ADDRESS",
+  "INNGEST_CONNECT_PORT",
+  "INNGEST_IMAGE",
+  "INNGEST_PORT",
+  "INNGEST_PUBLIC_ORIGIN",
+  "NODE_VERSION",
+  "POSTGRES_BIND_ADDRESS",
+  "POSTGRES_DB",
+  "POSTGRES_IMAGE",
+  "POSTGRES_USER",
+  "RAAS_SHARED_NETWORK",
+]);
+
+export function isDeploymentOwnedConfigKey(key: string): boolean {
+  return key.startsWith("NEXT_PUBLIC_") || key.startsWith("COMPOSE_") || DEPLOYMENT_OWNED_CONFIG_KEYS.has(key);
+}
+
+function hardenDefinition(def: RuntimeConfigDefinition): RuntimeConfigDefinition {
+  const secret = Boolean(def.secret) || isSecretConfigKey(def.key);
+  const deploymentOwned = isDeploymentOwnedConfigKey(def.key);
+  return {
+    ...def,
+    secret,
+    editable: secret || deploymentOwned ? false : def.editable,
+    restartRequired: deploymentOwned ? true : def.restartRequired,
+  };
 }
 
 function knownSectionLabel(section: string): string {
@@ -327,7 +373,7 @@ export async function getRuntimeConfigDefinitions(): Promise<RuntimeConfigDefini
       fileValue: entry.file === ".env.example" ? (prev?.fileValue ?? null) : entry.value,
       sourceFiles: Array.from(new Set([...(prev?.sourceFiles ?? []), entry.file])),
       defaultValue: known?.defaultValue ?? prev?.defaultValue,
-      secret: known?.secret ?? prev?.secret ?? isSecretKey(entry.key),
+      secret: known?.secret ?? prev?.secret ?? isSecretConfigKey(entry.key),
       editable: known?.editable ?? prev?.editable ?? true,
       restartRequired: known?.restartRequired ?? prev?.restartRequired ?? !KNOWN_DEFINITIONS_BY_KEY.has(entry.key),
     });
@@ -344,7 +390,7 @@ export async function getRuntimeConfigDefinitions(): Promise<RuntimeConfigDefini
     }
   }
 
-  return Array.from(byKey.values()).sort((a, b) => {
+  return Array.from(byKey.values()).map(hardenDefinition).sort((a, b) => {
     const section = (a.sectionLabel ?? a.section).localeCompare(b.sectionLabel ?? b.section);
     return section !== 0 ? section : a.key.localeCompare(b.key);
   });
@@ -374,6 +420,11 @@ async function readRows(keys?: string[]): Promise<Map<string, string>> {
 }
 
 export async function applyRuntimeConfigToEnv(): Promise<void> {
+  // Production processes must all use their boot-time environment. Applying a
+  // database override here would update only the web process, leaving the
+  // archiver and sweeper on different configuration.
+  if (process.env.NODE_ENV === "production") return;
+
   const defs = await getRuntimeConfigDefinitions();
   const overrides = await readRows(defs.map((d) => d.key));
   const currentKeys = new Set(defs.map((d) => d.key));
@@ -411,7 +462,10 @@ export async function applyRuntimeConfigToEnv(): Promise<void> {
 
 export async function getRuntimeConfigState(): Promise<RuntimeConfigState> {
   const defs = await getRuntimeConfigDefinitions();
-  const overrides = await readRows(defs.map((d) => d.key));
+  const production = process.env.NODE_ENV === "production";
+  const overrides = production
+    ? new Map<string, string>()
+    : await readRows(defs.map((d) => d.key));
   const fields = defs.map((def) => {
     const original = ORIGINAL_ENV.has(def.key) ? ORIGINAL_ENV.get(def.key) : null;
     const processValue = process.env[def.key] ?? null;
@@ -420,9 +474,11 @@ export async function getRuntimeConfigState(): Promise<RuntimeConfigState> {
       processValue == null ||
       processValue === def.fileValue ||
       (LAST_FILE_ENV.has(def.key) && processValue === previousFileValue);
-    const base = processLooksFileBacked
-      ? (def.fileValue ?? processValue ?? original ?? null)
-      : (processValue ?? def.fileValue ?? original ?? null);
+    const base = production
+      ? processValue
+      : processLooksFileBacked
+        ? (def.fileValue ?? processValue ?? original ?? null)
+        : (processValue ?? def.fileValue ?? original ?? null);
     const override = overrides.get(def.key) ?? null;
     const envValue = override == null ? (process.env[def.key] ?? base) : base;
     const effective = override ?? base ?? process.env[def.key] ?? def.defaultValue ?? null;
@@ -437,7 +493,9 @@ export async function getRuntimeConfigState(): Promise<RuntimeConfigState> {
     const secret = Boolean(def.secret);
     return {
       ...def,
-      fileValue: secret ? null : def.fileValue ?? null,
+      fileValue: secret || production ? null : def.fileValue ?? null,
+      placeholder: secret ? undefined : def.placeholder,
+      defaultValue: secret ? undefined : def.defaultValue,
       sectionLabel: def.sectionLabel ?? knownSectionLabel(def.section),
       editable: def.editable !== false,
       restartRequired: Boolean(def.restartRequired),
@@ -547,6 +605,10 @@ export async function saveRuntimeConfig(
   values: Record<string, unknown>,
   options: { target?: RuntimeConfigSaveTarget } = {},
 ): Promise<RuntimeConfigSaveResult> {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("SYSTEM_CONFIG_WRITE_DISABLED");
+  }
+
   const target = normalizeSaveTarget(options.target);
   const delegate = runtimeDelegate();
   if (target === "runtime" && !delegate) throw new Error("RUNTIME_CONFIG_STORE_UNAVAILABLE");

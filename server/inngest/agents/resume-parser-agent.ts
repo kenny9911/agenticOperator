@@ -47,9 +47,6 @@ import { createAgentLogger, runWithLogger } from '@/lib/agent-logger';
 import { prisma } from '@/server/db';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
 import { runLockCheck } from '@/lib/candidate-lock/run-lock-check';
-// 查重(invoke 模式):落库前同步调用独立的「候选人查重」函数,拿结论驱动挂老档/新建。
-import { candidateIdentityAgent } from '@/server/inngest/agents/candidate-identity-agent';
-import { isRuleAuditPersistenceFailure } from '@/lib/rule-check/ontology-audit-writer';
 
 // Local alias mirroring the RoboHire parse-resume `data` shape that we
 // historically imported from raas-api-client.ts. After the 2026-05-20
@@ -347,53 +344,6 @@ export const resumeParserAgent = inngest.createFunction(
     const finalEtag =
       typeof eventEtag === 'string' && eventEtag.trim() ? eventEtag.trim() : computedEtag;
 
-    // ── 查重(invoke 模式,2026-06-11):同步调用独立的「候选人查重」函数并等待结论。
-    // 该函数只判定 + 落审计、不做任何存储操作(职责:查重=判定,解析=操作);它有
-    // 自己的 run(舰队可管理/可下线)。落库前拿到 sameAsCandidateId 驱动挂老档/新建:
-    //    强命中(auto-merged)→ same_as_candidate_id=老人 ID → 复用老行 UPDATE、新简历挂
-    //    老 Candidate(1:N);弱信号/无命中 → null → 走正常 dedup/新建。
-    // soft-fail:函数下线/超时/出错 → catch 后按「新候选人」降级,主流程零阻塞。
-    interface IdentityVerdict {
-      sameAsCandidateId?: string | null;
-      dedupAction?: string;
-      matchedCandidateId?: string | null;
-      error?: string;
-    }
-    let identityVerdict: IdentityVerdict | null = null;
-    if (process.env.CANDIDATE_IDENTITY_ENABLED !== '0') {
-      try {
-        identityVerdict = (await step.invoke('invoke-candidate-dedup', {
-          function: candidateIdentityAgent,
-          data: {
-            upload_id: String(upload_id),
-            resume_id: raw.resume_id ?? null,
-            trace_id: null,
-            invoked_by: 'resume-parser',
-            // 候选人尚未建库 → candidate_id 用 upload_id 占位(self 排除无影响)。
-            candidate_id: String(upload_id),
-            parsed: { data: parsed },
-          },
-          timeout: '90s',
-        })) as unknown as IdentityVerdict | null;
-        fileLogger.event('candidate-identity.verdict', {
-          upload_id,
-          dedup_action: identityVerdict?.dedupAction ?? null,
-          same_as_candidate_id: identityVerdict?.sameAsCandidateId ?? null,
-          matched_candidate_id: identityVerdict?.matchedCandidateId ?? null,
-          error: identityVerdict?.error ?? null,
-        });
-      } catch (e) {
-        // A business lookup can degrade, but an authoritative rule decision may
-        // never advance without its durable audit row. Propagate this tagged
-        // failure so the parent Inngest run retries before candidate storage.
-        if (isRuleAuditPersistenceFailure(e)) throw e;
-        // 查重函数被下线/超时 → 按新候选人降级,绝不阻塞入库。
-        fileLogger.event('candidate-identity.invoke_failed', { upload_id, error: (e as Error).message });
-        identityVerdict = null;
-      }
-    }
-    const sameAsCandidateId = identityVerdict?.sameAsCandidateId ?? null;
-
     // ── 直写 Partner Postgres (2026-05-20: 不再走 RAAS API) ──
     const saveResult = await step.run('save-candidate', async () => {
       const input: SaveCandidateInput = {
@@ -409,8 +359,6 @@ export const resumeParserAgent = inngest.createFunction(
         job_requisition_id: job_requisition_id ?? undefined,
         sourcing_channel_id: sourcing_channel_id ?? undefined,
         expectation_payload: expectationPayload,
-        // 同一人 → 复用老 candidate_id(UPDATE 挂新简历到老 Candidate,1:N);null → 走兜底 dedup。
-        same_as_candidate_id: sameAsCandidateId ?? undefined,
         parsed: { data: parsed as Record<string, unknown> },
       };
 
@@ -456,12 +404,25 @@ export const resumeParserAgent = inngest.createFunction(
     // ── 5b. 写 Neo4j Candidate + Candidate_Expectation + Resume via Allmeta ──
     const stepKeyForNeo4j = sanitize(String(upload_id));
     await step.run(`write-candidate-neo4j-${stepKeyForNeo4j}`, async () => {
+      if (saveResult.idempotent_replay) {
+        logger.info(
+          `[resume-persist] idempotent replay: preserved Allmeta Candidate identity ${saveResult.candidate_id}`,
+        );
+        return { ok: true as const, skipped: 'idempotent-replay' as const };
+      }
       const r = await writeCandidateInstance({
         candidate_id: saveResult.candidate_id,
         // 归属语义 — 锁持有人优先 (c200efd)。resume.uploaded_by / writeResumeInstance
         // 仍记上传者; 仅 Candidate 归属随 RMHR 锁权威。
         employee_id: ownerEmployeeId,
         parsed: parsed as unknown as Record<string, unknown>,
+        // Candidate contact mirrors the exact 11-digit value committed to partner PG;
+        // raw RoboHire phone remains only in Resume.raw_parse_result.
+        normalized_phone: saveResult.mobile_normalized,
+        // A phone hit may intentionally preserve an established Candidate name
+        // and other identity fields. Mirror the UPDATE RETURNING snapshot so
+        // Allmeta cannot overwrite that candidate with conflicting parser data.
+        persisted_candidate: saveResult.candidate_snapshot,
       });
       if (r.ok) {
         logger.info(`[resume-persist] ✓ allmeta wrote Candidate ${saveResult.candidate_id}`);
@@ -490,7 +451,7 @@ export const resumeParserAgent = inngest.createFunction(
       }
       return r;
     });
-    if (expectationPayload) {
+    if (expectationPayload && !saveResult.idempotent_replay) {
       const candidateExpectationId = saveResult.candidate_expectation_id;
       if (!candidateExpectationId) {
         throw new Error(

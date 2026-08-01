@@ -64,6 +64,8 @@
 <h1>招聘智能体全景报告</h1>
 <div class="sub">6 个在运行 agent 的完整说明:每个智能体、每个事件、每个 Schema、每个接口 · 2026-06-11 · 候选人查重已上线(审计型),锁定/归属已下线</div>
 
+<div class="lead fail"><b>历史快照，禁止作为当前部署依据。</b>本页正文记录的是 2026-06-11 旧实现，仍包含同步 <code>invoke-candidate-dedup</code>、<code>same_as_candidate_id</code> 和姓名/邮箱兜底等已退役语义。当前 main 的生产合同是：Candidate 入库只按唯一规范中国大陆 11 位手机号去重；无效、国际、多号、占位号进入人工复核；Candidate Identity 仅由独立 <code>CANDIDATE_IDENTITY_REQUESTED</code> 触发并只写审计，不参与或驱动入库。迁移与切换以 <code>docs/deploy/deployment.md</code> 为准。</div>
+
 <div class="card">
 <b>目录</b> —
 <a href="#s0">〇 改名记录</a> ·

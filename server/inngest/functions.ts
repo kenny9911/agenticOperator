@@ -7,7 +7,8 @@
 // RAAS-v1 main app (real production agents 6 个):
 //   REQUIREMENT_LOGGED       → createJdAgent       → JD_GENERATED
 //   RESUME_DOWNLOADED        → resumeParserAgent   → RESUME_PROCESSED
-//   RESUME_PROCESSED         → candidateIdentityAgent (invoke + audit)
+//   CANDIDATE_IDENTITY_REQUESTED → candidateIdentityAgent (manual audit-only)
+//                                                   → CANDIDATE_IDENTITY_CHECKED
 //   RESUME_PROCESSED         → ruleCheckAgent (10-1, per-JR fan-out)
 //                                                  → MATCH_RULE_CHECK_PASSED / MATCH_RULE_CHECK_FAILED
 //   MATCH_RULE_CHECK_PASSED  → matchResumeAgent (10-2)
@@ -100,7 +101,8 @@ export const raasV1Functions = [
   // Candidate identity (去重) rule-check agent. Registered UNCONDITIONALLY so it
   // appears in the Inngest dashboard + Fleet (/api/agents surfaces live functions
   // even when not in AGENT_MAP). AUDIT-ONLY — writes OntologyRuleCheck rows for
-  // /rule-check and emits NO events, so it never gates the recruitment pipeline.
+  // /rule-check and emits only CANDIDATE_IDENTITY_CHECKED, so it never gates the
+  // recruitment pipeline and is not synchronously invoked by resume parsing.
   // Enabled by default; CANDIDATE_IDENTITY_ENABLED=0 no-ops it without unregistering.
   // (The 归属/ownership rule-check agent was withdrawn 2026-06-11 — see import note.)
   candidateIdentityAgent,

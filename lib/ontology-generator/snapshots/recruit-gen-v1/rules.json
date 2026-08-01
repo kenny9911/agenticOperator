@@ -671,13 +671,13 @@
       "businessLogicRuleName": "同一候选人判定规则",
       "applicableClient": "通用",
       "applicableDepartment": "N/A",
-      "submissionCriteria": "简历完成解析，需判断其是否与系统中已有候选人为同一人。",
-      "standardizedLogicRule": "简历解析后，系统按以下优先级判断该候选人是否与系统中已有候选人为同一人，命中即停：\n1. 手机号一致：只要手机号相同，直接判定为同一人；\n2. 姓名 + 邮箱一致：手机号未命中时，姓名与邮箱同时相同，判定为同一人；\n3. 姓名 + 性别 + 学校 + 专业 + 学历 + 毕业时间一致：前两条均未命中时，这 6 个字段全部相同，判定为同一人。\n三条规则均未命中的，视为新候选人。判定为同一人的，关联到已有候选人档案，不重复建档。",
+      "submissionCriteria": "收到独立 CANDIDATE_IDENTITY_REQUESTED 身份审计请求，且待审计候选人与解析简历可读取；正常简历入库链路不自动触发或等待本审计。",
+      "standardizedLogicRule": "本规则只生成身份审计与人工复核证据，不执行候选人档案关联、合并、复用或建档决策：\n1. 规范中国大陆手机号一致：作为唯一确定身份信号，审计结论可标记为同一人；\n2. 姓名 + 邮箱一致：仅标记疑似重复并进入人工复核，不得自动判定为同一人；\n3. 姓名 + 性别 + 学校 + 专业 + 学历 + 毕业时间一致：仅标记疑似重复并进入人工复核，不得自动判定为同一人。\n未命中规范中国大陆手机号时，系统不得自动判定为同一人。所有结论只写入 OntologyRuleCheck 并发送 CANDIDATE_IDENTITY_CHECKED 审计通知，不改写 Candidate 或 Resume。",
       "relatedEntities": [
         "候选人 (Candidate)",
         "候选人简历 (Resume)"
       ],
-      "businessBackgroundReason": "避免同一候选人在系统内重复建档，保障候选人唯一性，使后续匹配、归属、锁定等都基于同一主体。",
+      "businessBackgroundReason": "为人工核验候选人身份提供可追溯证据，同时避免弱身份信号导致错误合并；候选人存储去重由规范中国大陆手机号的确定性写入流程独立负责。",
       "ruleSource": "业务规则与规范",
       "executor": "Agent",
       "enforcementLevel": "mandatory",

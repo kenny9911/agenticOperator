@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Zero-dependency (bash + curl) reachability self-check for the TARGET machine.
+# Minimal-dependency (bash + curl + Docker CLI) reachability self-check for the
+# TARGET machine.
 # Run BEFORE `docker compose up`: verifies every external dependency named in
 # .env.deploy is reachable from this host, so network problems surface before
 # containers start failing in confusing ways. Read-only; sends no credentials.
@@ -53,8 +54,8 @@ ALLMETA_BASE_URL=$(get ALLMETA_BASE_URL)
 if [ -n "$ALLMETA_BASE_URL" ]; then
   # Containers reach the host as host.docker.internal; from this shell the
   # same service is localhost.
-  host_view=${ALLMETA_BASE_URL//host.docker.internal/localhost}
-  check_http "Allmeta 网关    " "$host_view"
+  allmeta_host_view=${ALLMETA_BASE_URL//host.docker.internal/localhost}
+  check_http "Allmeta 网关    " "$allmeta_host_view"
 else
   skip "Allmeta 网关"
 fi
@@ -73,13 +74,43 @@ is_container_name() {
 # From the host shell, the host bridge name is just localhost.
 host_view() { printf '%s' "$1" | sed 's/host\.docker\.internal/localhost/'; }
 
+DEPLOY_MODE=$(get DEPLOY_MODE)
+if [ "$DEPLOY_MODE" = "shared" ]; then
+  SHARED_NETWORK=$(get RAAS_SHARED_NETWORK)
+  if [ -z "$SHARED_NETWORK" ]; then
+    echo "  ✗ Shared Docker 网络未配置 (RAAS_SHARED_NETWORK)"; FAIL=$((FAIL+1))
+  elif docker network inspect "$SHARED_NETWORK" >/dev/null 2>&1; then
+    echo "  ✓ Shared Docker 网络存在 ($SHARED_NETWORK)"; PASS=$((PASS+1))
+  else
+    echo "  ✗ Shared Docker 网络不存在 ($SHARED_NETWORK)"; FAIL=$((FAIL+1))
+  fi
+
+  INNGEST_URL=$(get INNGEST_BASE_URL)
+  if [ -z "$INNGEST_URL" ]; then
+    echo "  ✗ Shared Inngest URL 未配置"; FAIL=$((FAIL+1))
+  else
+    inngest_host=$(printf '%s' "$INNGEST_URL" | sed -E 's#^https?://([^@]*@)?([^:/?]+).*#\2#')
+    if is_container_name "$inngest_host"; then
+      echo "  - Shared Inngest    容器名 '$inngest_host'——宿主侧无法探测；共享网存在性已检查，起容器后再验证 ${INNGEST_URL%/}/health"
+      SKIP=$((SKIP+1))
+    else
+      check_http "Shared Inngest   " "$(host_view "${INNGEST_URL%/}/health")"
+    fi
+  fi
+elif [ "$DEPLOY_MODE" = "bundled" ]; then
+  echo "  - Inngest           bundled 模式由本 compose 启动，部署前无外部端点可探测"
+  SKIP=$((SKIP+1))
+else
+  echo "  ✗ DEPLOY_MODE 必须是 shared 或 bundled"; FAIL=$((FAIL+1))
+fi
+
 RAAS_URL=$(get RAAS_POSTGRES_URL)
 if [ -n "$RAAS_URL" ]; then
   raas_host=$(printf '%s' "$RAAS_URL" | sed -E 's#^[a-z+]+://([^@]*@)?([^:/?]+).*#\2#')
   raas_port=$(printf '%s' "$RAAS_URL" | sed -nE 's#^[a-z+]+://([^@]*@)?[^:/?]+:([0-9]+).*#\2#p')
   if is_container_name "$raas_host"; then
     echo "  - RAAS Postgres    容器名 '$raas_host'——宿主侧无法探测，起容器后在共享网络内解析；可用:"
-    echo "      docker run --rm --network \${RAAS_SHARED_NETWORK:-raas-deploy-next_default} ${POSTGRES_IMAGE:-postgres:17.10-alpine} pg_isready -h $raas_host -p ${raas_port:-5432}"
+    echo "      docker run --rm --network \${RAAS_SHARED_NETWORK} ${POSTGRES_IMAGE:-postgres:17.10-alpine} pg_isready -h $raas_host -p ${raas_port:-5432}"
     SKIP=$((SKIP+1))
   else
     check_tcp "RAAS Postgres   " "$(host_view "$raas_host")" "${raas_port:-5432}"

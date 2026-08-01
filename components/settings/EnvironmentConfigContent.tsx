@@ -32,6 +32,7 @@ export function EnvironmentConfigContent() {
   const busyActionRef = React.useRef<string | null>(null);
 
   const fields = data?.runtimeConfig.fields ?? [];
+  const writeEnabled = data?.writePolicy.enabled ?? false;
 
   const load = React.useCallback(async (options: LoadOptions = {}) => {
     if (!options.silent) setLoading(true);
@@ -88,7 +89,7 @@ export function EnvironmentConfigContent() {
   }, [load]);
 
   const save = async () => {
-    if (!data || dirtyKeys.length === 0) return;
+    if (!data || !writeEnabled || dirtyKeys.length === 0) return;
     setSaving(true);
     setMessage(null);
     try {
@@ -184,9 +185,11 @@ export function EnvironmentConfigContent() {
             <Btn onClick={runInfraCheck} disabled={busyAction !== null} title={t("config_run_infra_check")}>
               <Ic.gauge />{busyAction === "check" ? "…" : t("config_run_infra_check")}
             </Btn>
-            <Btn onClick={save} disabled={saving || dirtyKeys.length === 0} variant="accent" title={t("config_save")}>
-              <Ic.check />{saving ? "…" : dirtyKeys.length > 0 ? t("settings_env_save_dirty").replace("{n}", String(dirtyKeys.length)) : t("config_save")}
-            </Btn>
+            {writeEnabled && (
+              <Btn onClick={save} disabled={saving || dirtyKeys.length === 0} variant="accent" title={t("config_save")}>
+                <Ic.check />{saving ? "…" : dirtyKeys.length > 0 ? t("settings_env_save_dirty").replace("{n}", String(dirtyKeys.length)) : t("config_save")}
+              </Btn>
+            )}
           </div>
         </div>
         {message && (
@@ -194,35 +197,42 @@ export function EnvironmentConfigContent() {
             {message.text}
           </div>
         )}
-        <div className="mt-4 flex min-w-0 flex-wrap items-center gap-3 rounded-md border border-line bg-surface px-3 py-2.5">
-          <div className="min-w-[220px] flex-1">
-            <div className="text-[12px] font-medium text-ink-1">{t("settings_env_save_target")}</div>
-            <div className="mt-0.5 text-[11.5px] leading-5 text-ink-4">
-              {saveTarget === "env_local"
-                ? t("settings_env_target_env_local_hint").replace("{file}", data?.runtimeConfig.writableEnvFile ?? ".env.local")
-                : t("settings_env_target_runtime_hint")}
+        {writeEnabled ? (
+          <div className="mt-4 flex min-w-0 flex-wrap items-center gap-3 rounded-md border border-line bg-surface px-3 py-2.5">
+            <div className="min-w-[220px] flex-1">
+              <div className="text-[12px] font-medium text-ink-1">{t("settings_env_save_target")}</div>
+              <div className="mt-0.5 text-[11.5px] leading-5 text-ink-4">
+                {saveTarget === "env_local"
+                  ? t("settings_env_target_env_local_hint").replace("{file}", data?.runtimeConfig.writableEnvFile ?? ".env.local")
+                  : t("settings_env_target_runtime_hint")}
+              </div>
             </div>
+            <div className="inline-flex rounded-md border border-line bg-bg p-0.5">
+              <button
+                type="button"
+                aria-pressed={saveTarget === "env_local"}
+                onClick={() => setSaveTarget("env_local")}
+                className={segmentClass(saveTarget === "env_local")}
+              >
+                {t("settings_env_target_env_local")}
+              </button>
+              <button
+                type="button"
+                aria-pressed={saveTarget === "runtime"}
+                onClick={() => setSaveTarget("runtime")}
+                className={segmentClass(saveTarget === "runtime")}
+              >
+                {t("settings_env_target_runtime")}
+              </button>
+            </div>
+            <Badge variant="ok" dot>{t("settings_env_autosync")}</Badge>
           </div>
-          <div className="inline-flex rounded-md border border-line bg-bg p-0.5">
-            <button
-              type="button"
-              aria-pressed={saveTarget === "env_local"}
-              onClick={() => setSaveTarget("env_local")}
-              className={segmentClass(saveTarget === "env_local")}
-            >
-              {t("settings_env_target_env_local")}
-            </button>
-            <button
-              type="button"
-              aria-pressed={saveTarget === "runtime"}
-              onClick={() => setSaveTarget("runtime")}
-              className={segmentClass(saveTarget === "runtime")}
-            >
-              {t("settings_env_target_runtime")}
-            </button>
+        ) : (
+          <div className="mt-4 flex min-w-0 items-start gap-3 rounded-md border border-line bg-surface px-3 py-2.5">
+            <Badge variant="warn">{t("settings_env_readonly")}</Badge>
+            <div className="text-[11.5px] leading-5 text-ink-3">{t("settings_env_write_disabled_hint")}</div>
           </div>
-          <Badge variant="ok" dot>{t("settings_env_autosync")}</Badge>
-        </div>
+        )}
       </header>
 
       <main className="px-8 py-6 space-y-8">
@@ -312,6 +322,7 @@ export function EnvironmentConfigContent() {
                         field={field}
                         value={draft[field.key] ?? ""}
                         dirty={dirtyKeys.includes(field.key)}
+                        readOnly={!writeEnabled}
                         onChange={(value) => setDraft((prev) => ({ ...prev, [field.key]: value }))}
                       />
                     ))}
@@ -437,11 +448,13 @@ function EnvFieldCard({
   field,
   value,
   dirty,
+  readOnly,
   onChange,
 }: {
   field: RuntimeConfigFieldState;
   value: string;
   dirty: boolean;
+  readOnly: boolean;
   onChange: (value: string) => void;
 }) {
   const { t } = useApp();
@@ -463,7 +476,7 @@ function EnvFieldCard({
       <input
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        disabled={!field.editable}
+        disabled={readOnly || !field.editable}
         type={field.secret ? "password" : "text"}
         placeholder={field.secret && field.hasEffectiveValue ? t("config_secret_keep") : (field.placeholder ?? field.displayValue)}
         title={field.displayValue}
@@ -484,7 +497,7 @@ function EnvFieldCard({
         ) : (
           <span className="text-[10.5px] text-ink-4">{t("settings_env_source_runtime_only")}</span>
         )}
-        {!field.editable && <span className="text-[10.5px] text-ink-4">{t("settings_env_readonly")}</span>}
+        {(readOnly || !field.editable) && <span className="text-[10.5px] text-ink-4">{t("settings_env_readonly")}</span>}
       </div>
     </label>
   );

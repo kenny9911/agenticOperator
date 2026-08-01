@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockListFunctions = vi.fn();
 const mockListApps = vi.fn();
@@ -31,6 +31,10 @@ describe('GET /api/system/config', () => {
     delete process.env.AO_LAN_IP;
     delete process.env.AO_PORT;
     vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it('returns inngest.url + sourceEnv + counts', async () => {
@@ -140,5 +144,64 @@ describe('GET /api/system/config', () => {
         error: 'internal_server_error',
       },
     ]);
+  });
+
+  it('never returns MINIO_ACCESS_KEY and marks it secret + read-only', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('MINIO_ACCESS_KEY', 'minio-access-must-not-leak');
+    vi.stubEnv('INNGEST_BASE_URL', 'http://x:8288');
+    mockListFunctions.mockResolvedValue([]);
+    mockListApps.mockResolvedValue([]);
+    mockEmFindUnique.mockResolvedValue(null);
+    mockEventDefCount.mockResolvedValue(0);
+    mockAgentActivityCount.mockResolvedValue(0);
+
+    const { GET } = await import('./route');
+    const r = await GET();
+    const j = await r.json();
+    const field = j.runtimeConfig.fields.find((item: { key: string }) => item.key === 'MINIO_ACCESS_KEY');
+
+    expect(field).toMatchObject({
+      secret: true,
+      editable: false,
+      envValue: null,
+      overrideValue: null,
+      effectiveValue: null,
+      displayValue: '••••••••',
+    });
+    expect(JSON.stringify(j)).not.toContain('minio-access-must-not-leak');
+  });
+});
+
+describe('PATCH /api/system/config', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('returns 403 before parsing the request body in production', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    const { PATCH } = await import('./route');
+    const r = await PATCH(new Request('http://localhost/api/system/config', {
+      method: 'PATCH',
+      body: '{',
+    }));
+
+    expect(r.status).toBe(403);
+    await expect(r.json()).resolves.toEqual({ ok: false, error: 'SYSTEM_CONFIG_WRITE_DISABLED' });
+  });
+
+  it('stays disabled when only the production feature flag is enabled', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('AO_SYSTEM_CONFIG_WRITE_ENABLED', '1');
+    const { PATCH } = await import('./route');
+    const r = await PATCH(new Request('http://localhost/api/system/config', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: { AI_MODEL: 'gpt-test' } }),
+    }));
+
+    expect(r.status).toBe(403);
+    await expect(r.json()).resolves.toEqual({ ok: false, error: 'SYSTEM_CONFIG_WRITE_DISABLED' });
   });
 });

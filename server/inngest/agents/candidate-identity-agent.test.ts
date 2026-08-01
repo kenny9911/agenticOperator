@@ -8,6 +8,22 @@ vi.mock('@/server/inngest/client', () => ({
 import { candidateIdentityHandler } from './candidate-identity-agent';
 import type { CandidateRecord } from '@/lib/rule-check/candidate-match/types';
 import type { AiFieldJudge } from '@/lib/rule-check/candidate-match/field-equivalence';
+import type { PersistCandidateCheckArgs } from '@/lib/rule-check/candidate-match/persist';
+
+type HandlerResult = Awaited<ReturnType<typeof candidateIdentityHandler>>;
+
+function successResult(result: HandlerResult) {
+  if (!('samePerson' in result)) {
+    throw new Error(`expected successful identity audit result, received ${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
+function firstPersistArg(calls: unknown): PersistCandidateCheckArgs {
+  const arg = (calls as unknown[][])[0]?.[0];
+  if (!arg || typeof arg !== 'object') throw new Error('expected one persist call');
+  return arg as PersistCandidateCheckArgs;
+}
 
 const mkStep = () => {
   const ran: string[] = [];
@@ -39,15 +55,15 @@ describe('candidateIdentityHandler', () => {
     const persist = vi.fn(async () => ({ id: 'orc_x' }));
     const existing: CandidateRecord = { candidate_id: 'cand_old', name: '不同', phone: '13800138000', email: 'x@y.com' };
     const repo = { findComparisonCandidates: vi.fn(async () => [existing]) };
-    const r = await candidateIdentityHandler(
+    const r = successResult(await candidateIdentityHandler(
       { event: { data: newCand }, step: mkStep(), runId: 'run_1' },
       { enabled: true, persist, repo, judge: judgeYes },
-    );
+    ));
     expect(r.skipped).toBe(false);
     expect(r.samePerson).toBe(true);
     expect(r.matchedRule).toBe('IDENTITY-1');
     expect(persist).toHaveBeenCalledOnce();
-    const args = persist.mock.calls[0][0];
+    const args = firstPersistArg(persist.mock.calls);
     expect(args.agentSlug).toBe('rule-check-candidate-identity');
     expect(args.stage).toBe('候选人入库');
     expect(args.check.decision).toBe('VALIDATED');
@@ -56,13 +72,13 @@ describe('candidateIdentityHandler', () => {
   it('empty comparison pool → persists a clean "no duplicate" audit', async () => {
     const persist = vi.fn(async () => ({ id: 'orc_y' }));
     const repo = { findComparisonCandidates: vi.fn(async () => []) };
-    const r = await candidateIdentityHandler(
+    const r = successResult(await candidateIdentityHandler(
       { event: { data: newCand }, step: mkStep() },
       { enabled: true, persist, repo, judge: judgeYes },
-    );
+    ));
     expect(r.samePerson).toBe(false);
     expect(persist).toHaveBeenCalledOnce();
-    expect(persist.mock.calls[0][0].check.decision).toBe('VALIDATED');
+    expect(firstPersistArg(persist.mock.calls).check.decision).toBe('VALIDATED');
   });
 
   it('weak rule-3 duplicate → needsHumanReview, audit decision VIOLATED', async () => {
@@ -73,31 +89,31 @@ describe('candidateIdentityHandler', () => {
       gender: '男', school: '清华', major: '计算机', degree: '学士', graduationYear: '2020',
     };
     const repo = { findComparisonCandidates: vi.fn(async () => [existing]) };
-    const r = await candidateIdentityHandler(
+    const r = successResult(await candidateIdentityHandler(
       { event: { data: newCand }, step: mkStep() },
       { enabled: true, persist, repo, judge: judgeYes },
-    );
+    ));
     expect(r.matchedRule).toBe('IDENTITY-3');
     expect(r.needsHumanReview).toBe(true);
-    expect(persist.mock.calls[0][0].check.decision).toBe('VIOLATED');
+    expect(firstPersistArg(persist.mock.calls).check.decision).toBe('VIOLATED');
   });
 
-  it('strong dup → captures matchedCandidateId + dedupAction=auto-merged (return + audit)', async () => {
+  it('phone dup → captures matchedCandidateId as audit evidence, never a storage instruction', async () => {
     const persist = vi.fn(async () => ({ id: 'orc_m' }));
     const existing: CandidateRecord = { candidate_id: 'cand_old', name: '不同', phone: '13800138000', email: 'x@y.com' };
     const repo = { findComparisonCandidates: vi.fn(async () => [existing]) };
-    const r = await candidateIdentityHandler(
+    const r = successResult(await candidateIdentityHandler(
       { event: { data: newCand }, step: mkStep(), runId: 'run_m' },
       { enabled: true, persist, repo, judge: judgeYes },
-    );
-    // return surfaces the matched candidate — the SOURCE of same_as_candidate_id for storage.
+    ));
+    // Return surfaces evidence only; resume persistence no longer consumes it.
     expect(r.matchedCandidateId).toBe('cand_old');
-    expect(r.dedupAction).toBe('auto-merged');
-    expect(r.sameAsCandidateId).toBe('cand_old');
+    expect(r.dedupAction).toBe('phone-match');
+    expect(r).not.toHaveProperty('sameAsCandidateId');
     // audit selectionNote carries it for /rule-check display.
-    const note = persist.mock.calls[0][0].selectionNote as Record<string, unknown>;
+    const note = firstPersistArg(persist.mock.calls).selectionNote as Record<string, unknown>;
     expect(note.matchedCandidateId).toBe('cand_old');
-    expect(note.dedupAction).toBe('auto-merged');
+    expect(note.dedupAction).toBe('phone-match');
   });
 
   it('weak rule-3 dup → dedupAction=pending-review, knows who but does NOT auto-merge', async () => {
@@ -107,25 +123,26 @@ describe('candidateIdentityHandler', () => {
       gender: '男', school: '清华', major: '计算机', degree: '学士', graduationYear: '2020',
     };
     const repo = { findComparisonCandidates: vi.fn(async () => [existing]) };
-    const r = await candidateIdentityHandler(
+    const r = successResult(await candidateIdentityHandler(
       { event: { data: newCand }, step: mkStep() },
       { enabled: true, persist, repo, judge: judgeYes },
-    );
+    ));
     expect(r.matchedCandidateId).toBe('cand_old'); // we DO know the suspected dup
     expect(r.dedupAction).toBe('pending-review');
-    expect(r.sameAsCandidateId).toBeNull();         // but never auto-merge a weak signal
+    expect(r.samePerson).toBe(false);
+    expect(r).not.toHaveProperty('sameAsCandidateId');
   });
 
-  it('no dup → dedupAction=new-candidate, matchedCandidateId null', async () => {
+  it('no dup → dedupAction=no-match, matchedCandidateId null', async () => {
     const persist = vi.fn(async () => ({ id: 'orc_n' }));
     const repo = { findComparisonCandidates: vi.fn(async () => []) };
-    const r = await candidateIdentityHandler(
+    const r = successResult(await candidateIdentityHandler(
       { event: { data: newCand }, step: mkStep() },
       { enabled: true, persist, repo, judge: judgeYes },
-    );
+    ));
     expect(r.matchedCandidateId).toBeNull();
-    expect(r.dedupAction).toBe('new-candidate');
-    expect(r.sameAsCandidateId).toBeNull();
+    expect(r.dedupAction).toBe('no-match');
+    expect(r).not.toHaveProperty('sameAsCandidateId');
   });
 
   it('retries instead of returning a decision when its audit cannot persist', async () => {

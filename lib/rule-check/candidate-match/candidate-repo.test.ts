@@ -79,6 +79,26 @@ describe('candidateFromResumeProcessed', () => {
     });
   });
 
+  it('canonicalizes all phone aliases together and rejects conflicting contact data', () => {
+    const same = candidateFromResumeProcessed({
+      candidate_id: 'same',
+      parsed: { data: { phone: '+86 138-0013-8000', mobile: '13800138000' } },
+    });
+    expect(same.phone).toBe('13800138000');
+
+    const conflicting = candidateFromResumeProcessed({
+      candidate_id: 'conflicting',
+      parsed: { data: { phone: '13800138000', mobile: '13900139000' } },
+    });
+    expect(conflicting.phone).toBeNull();
+
+    const validPlusInternational = candidateFromResumeProcessed({
+      candidate_id: 'mixed',
+      parsed: { data: { phone: '13800138000', mobile: '+65 9123 4567' } },
+    });
+    expect(validPlusInternational.phone).toBeNull();
+  });
+
   it('never throws on an empty event', () => {
     const rec = candidateFromResumeProcessed({});
     expect(rec.candidate_id).toBe('unknown');

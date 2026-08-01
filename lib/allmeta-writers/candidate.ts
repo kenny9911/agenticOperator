@@ -18,12 +18,30 @@ import {
   asIsoDateOrNull,
   type WriteResult,
 } from './_helpers';
+import { resolveCandidateMobile } from '@/lib/phone/normalize-e164';
 
 export type WriteCandidateInput = {
   candidate_id: string;
   employee_id?: string | null;
   /** RoboHire parse-resume `data` object (or partner pre-parsed JSON). */
   parsed: Record<string, unknown>;
+  /** Canonical phone returned by partner-pg save; null means no strong mobile. */
+  normalized_phone?: string | null;
+  /** Final values returned by a partner-PG phone-hit UPDATE. When present they
+   * override RoboHire fields, preventing the graph identity from diverging
+   * from the authoritative Candidate row. */
+  persisted_candidate?: {
+    name: string;
+    mobile: string | null;
+    mobile_normalized: string | null;
+    email: string | null;
+    gender: string | null;
+    birth_date: Date | string | null;
+    current_location: string | null;
+    highest_acquired_degree: string | null;
+    work_years: number | null;
+    employee_id: string | null;
+  } | null;
   // Candidate-lock mirror (2026-06-08, P4). Written ONLY when provided — existing
   // callers pass none, so compact() drops them and behavior is unchanged. When the
   // lock owner differs from the uploader, pass employee_id = the lock OWNER (工号).
@@ -45,12 +63,25 @@ export type WriteCandidateResult = WriteResult & {
 export async function writeCandidateInstance(
   input: WriteCandidateInput,
 ): Promise<WriteCandidateResult> {
-  const p = input.parsed;
+  const stored = input.persisted_candidate;
+  const p: Record<string, unknown> = stored
+    ? {
+        name: stored.name,
+        phone: stored.mobile_normalized ?? stored.mobile,
+        email: stored.email,
+        gender: stored.gender,
+        birth_date: stored.birth_date,
+        currentLocation: stored.current_location,
+        highestDegree: stored.highest_acquired_degree,
+        workYears: stored.work_years,
+      }
+    : input.parsed;
   const parsedName = nonEmptyString(p.name);
-  const phone =
-    nonEmptyString(p.phone) ??
-    nonEmptyString(p.mobile) ??
-    nonEmptyString((p as Record<string, unknown>).phoneNumber);
+  const phone = resolveCandidateMobile(
+    input.normalized_phone !== undefined
+      ? input.normalized_phone
+      : [p.phone, p.mobile, (p as Record<string, unknown>).phoneNumber],
+  ).mobile;
   const address =
     nonEmptyString(p.address) ??
     nonEmptyString(p.currentLocation) ??
@@ -58,7 +89,7 @@ export async function writeCandidateInstance(
   const workYears = asNumberOrNull(p.workYears ?? p.experienceYears ?? p.work_years);
   const payload = compact({
     candidate_id: input.candidate_id,
-    employee_id: nonEmptyString(input.employee_id),
+    employee_id: nonEmptyString(stored?.employee_id ?? input.employee_id),
     name: parsedName ?? '未命名候选人',
     phone,
     email: nonEmptyString(p.email),
@@ -87,6 +118,6 @@ export async function writeCandidateInstance(
   return {
     ...result,
     nameWasPlaceholder: !parsedName,
-    parsedNameRaw: typeof p.name === 'string' ? p.name : null,
+    parsedNameRaw: typeof input.parsed.name === 'string' ? input.parsed.name : null,
   };
 }

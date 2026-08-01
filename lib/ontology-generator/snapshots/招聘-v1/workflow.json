@@ -11,13 +11,13 @@
     {
       "id": "DD-1",
       "name": "deduplicateCandidate",
-      "description": "候选人查重 Agent。简历下载后第一道闸:三级去重(手机号/证件号/弱标识)+ 归属锁定。employee_id 无条件覆盖;locked_by 与当前 employee_id 不一致则仅 lock-only 并发归属冲突。",
+      "description": "候选人查重 Agent。简历下载后第一道闸:仅按归一化后唯一规范中国大陆 11 位手机号做确定性去重;不确定手机号一律新建待人工复核且不得自动合并。归属锁只消费独立 RMHR 结论,不由去重或 employee_id 推断/覆盖。",
       "actor": ["Agent"],
       "trigger": ["RESUME_DOWNLOADED"],
       "actions": [
-        { "order": "1", "name": "extractIdentityKeys", "description": "从简历原件抽取手机号/证件号/姓名+生日等去重标识,缺失从 rawText 兜底。", "type": "logic", "condition": "已收到 RESUME_DOWNLOADED" },
-        { "order": "2", "name": "tierMatch", "description": "Tier1 手机号→Tier2 证件号→Tier3 弱标识 逐级匹配既有候选人,命中复用否则新建。", "type": "logic", "condition": "已抽取标识" },
-        { "order": "3", "name": "resolveOwnershipLock", "description": "归属判定与锁定:通过→CANDIDATE_DEDUP_PASSED;归属冲突→RESUME_LOCKED_CONFLICT。", "type": "logic", "condition": "已确定 candidate_id" }
+        { "order": "1", "name": "extractIdentityKeys", "description": "提取并归一化全部手机号候选,判断是否唯一得到规范中国大陆 11 位手机号,并识别缺失/无效/国际/多号/占位号。", "type": "logic", "condition": "已收到 RESUME_DOWNLOADED" },
+        { "order": "2", "name": "tierMatch", "description": "唯一规范大陆手机号精确命中才复用;未命中则新建。不确定手机号直接新建待人工复核,不得以其他字段兜底自动合并。", "type": "logic", "condition": "已完成手机号规范化判断" },
+        { "order": "3", "name": "resolveOwnershipLock", "description": "独立消费 RMHR 归属结论:允许继续→CANDIDATE_DEDUP_PASSED;归属冲突→RESUME_LOCKED_CONFLICT,不得由去重结果覆盖。", "type": "logic", "condition": "已确定 candidate_id 并取得 RMHR 结论" }
       ],
       "triggered_event": ["CANDIDATE_DEDUP_PASSED", "RESUME_LOCKED_CONFLICT"]
     },

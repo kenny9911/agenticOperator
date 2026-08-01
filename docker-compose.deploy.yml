@@ -13,6 +13,15 @@ x-ao-service: &ao-service
   env_file:
     - ${AO_ENV_FILE:-.env.deploy}
   environment: &ao-environment
+    DEPLOY_MODE: ${DEPLOY_MODE:?DEPLOY_MODE must be shared or bundled}
+    AO_POSTGRES_VOLUME_MODE: ${AO_POSTGRES_VOLUME_MODE:?AO_POSTGRES_VOLUME_MODE must be new or external}
+    AO_EXISTING_POSTGRES_VOLUME: ${AO_EXISTING_POSTGRES_VOLUME:-}
+    DATABASE_SCHEMA_SYNC: ${DATABASE_SCHEMA_SYNC:?DATABASE_SCHEMA_SYNC must be 0 or 1}
+    # Forward the interpolation-time values explicitly. Otherwise bundled/external
+    # shell overrides affect Compose topology and preflight, while the container
+    # still sees stale shared/new values from env_file.
+    RAAS_SHARED_NETWORK: ${RAAS_SHARED_NETWORK:-}
+    AO_SHARED_NETWORK_ALIAS: ${AO_SHARED_NETWORK_ALIAS:-}
     NODE_ENV: production
     PORT: 3002
     HOSTNAME: 0.0.0.0
@@ -20,12 +29,12 @@ x-ao-service: &ao-service
     AO_LOG_DIR: /app/persist/logs
     AO_BASE_URL: http://app:3002
     INNGEST_DEV: "1"
-    # Defaults target the bundled inngest service. For a SHARED Inngest
-    # (e.g. reusing an existing raas-inngest container on the same host),
-    # override both in .env.deploy and disable the bundled service by
-    # clearing COMPOSE_PROFILES. See docs/deploy/deployment.md.
-    INNGEST_BASE_URL: ${INNGEST_BASE_URL:-http://inngest:8288}
-    INNGEST_SERVE_ORIGIN: ${INNGEST_SERVE_ORIGIN:-http://app:3002}
+    # No fallback is intentional. Production defaults to a shared Inngest;
+    # both directions must be explicit so a typo cannot silently create an
+    # isolated event plane. Bundled mode must declare its own
+    # http://inngest:8288 / http://app:3002 values in .env.deploy.
+    INNGEST_BASE_URL: ${INNGEST_BASE_URL:?INNGEST_BASE_URL is required}
+    INNGEST_SERVE_ORIGIN: ${INNGEST_SERVE_ORIGIN:?INNGEST_SERVE_ORIGIN is required}
     INNGEST_SERVE_PATH: /api/inngest
     NEXT_PUBLIC_BASE_URL: ${AO_PUBLIC_ORIGIN:-http://localhost:3002}
     NEXT_PUBLIC_INNGEST_URL: ${INNGEST_PUBLIC_ORIGIN:-http://localhost:8288}
@@ -98,9 +107,9 @@ services:
       start_period: 60s
 
   inngest:
-    # Bundled event engine — only started when COMPOSE_PROFILES includes
-    # "bundled-inngest". Deployments that join an existing shared Inngest
-    # (AO + RAAS on one instance) leave the profile unset.
+    # Explicit opt-in only. deploy-compose.sh clears host overrides, reads the
+    # authoritative profile from .env.deploy, and includes the shared overlay
+    # unless that file explicitly selects bundled mode.
     profiles: ["bundled-inngest"]
     image: ${INNGEST_IMAGE:-inngest/inngest:v1.19.2}
     working_dir: /var/lib/inngest
