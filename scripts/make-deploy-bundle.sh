@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the AO image and pack everything an OFFLINE target machine needs into
-# one tarball: app + postgres images (plus Inngest only for explicit bundled
-# mode), compose files, a pre-filled .env.deploy draft, and the preflight /
+# one tarball: app + postgres + Gotenberg images (plus Inngest only for explicit
+# bundled mode), compose files, a pre-filled .env.deploy draft, and the preflight /
 # connectivity / survey scripts.
 #
 # Run on a machine WITH internet + Docker (the build machine):
@@ -36,6 +36,7 @@ SHARED_INNGEST_URL=""
 CALLBACK_ALIAS=""
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:17.10-alpine}"
 INNGEST_IMAGE="${INNGEST_IMAGE:-inngest/inngest:v1.19.2}"
+GOTENBERG_IMAGE="${GOTENBERG_IMAGE:-gotenberg/gotenberg:8.34.0-libreoffice}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -86,7 +87,8 @@ docker build --platform "$PLATFORM" \
 
 echo "==> [2/5] pulling required runtime images for ${PLATFORM} (mode=${MODE})"
 docker pull --platform "$PLATFORM" "$POSTGRES_IMAGE"
-IMAGES=("$AO_IMAGE" "$POSTGRES_IMAGE")
+docker pull --platform "$PLATFORM" "$GOTENBERG_IMAGE"
+IMAGES=("$AO_IMAGE" "$POSTGRES_IMAGE" "$GOTENBERG_IMAGE")
 if [ "$MODE" = "bundled" ]; then
   docker pull --platform "$PLATFORM" "$INNGEST_IMAGE"
   IMAGES+=("$INNGEST_IMAGE")
@@ -121,6 +123,7 @@ sed -E \
   -e "s#^AO_IMAGE=.*#AO_IMAGE=${AO_IMAGE}#" \
   -e "s#^POSTGRES_IMAGE=.*#POSTGRES_IMAGE=${POSTGRES_IMAGE}#" \
   -e "s#^INNGEST_IMAGE=.*#INNGEST_IMAGE=${INNGEST_IMAGE}#" \
+  -e "s#^GOTENBERG_IMAGE=.*#GOTENBERG_IMAGE=${GOTENBERG_IMAGE}#" \
   -e "s#^AO_PUBLIC_ORIGIN=.*#AO_PUBLIC_ORIGIN=${PUBLIC_ORIGIN}#" \
   -e "s#^INNGEST_PUBLIC_ORIGIN=.*#INNGEST_PUBLIC_ORIGIN=${INNGEST_ORIGIN}#" \
   -e "s#^DEPLOY_MODE=.*#DEPLOY_MODE=${MODE}#" \
@@ -136,6 +139,7 @@ sed -E \
   echo "DEPLOY_MODE=${MODE}"
   echo "AO_IMAGE=${AO_IMAGE}"
   echo "POSTGRES_IMAGE=${POSTGRES_IMAGE}"
+  echo "GOTENBERG_IMAGE=${GOTENBERG_IMAGE}"
   if [ "$MODE" = "bundled" ]; then echo "INNGEST_IMAGE=${INNGEST_IMAGE}"; fi
   echo "AO_PUBLIC_ORIGIN=${PUBLIC_ORIGIN}"
   echo "INNGEST_PUBLIC_ORIGIN=${INNGEST_ORIGIN}"
@@ -147,7 +151,7 @@ cat > "$STAGE/README-TARGET.md" <<'EOF'
 完整说明见同目录 `deployment-full-guide.md`。在解压后的目录里依次执行：
 
 ```bash
-# 1. 导入镜像（shared 包含 AO+Postgres；bundled 额外包含 Inngest）
+# 1. 导入镜像（shared 包含 AO+Postgres+Gotenberg；bundled 额外包含 Inngest）
 docker load -i images.tar.gz
 
 # 2. 生成并编辑环境文件：镜像 tag 和公开地址已预填，

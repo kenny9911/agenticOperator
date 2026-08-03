@@ -87,6 +87,17 @@ for (const [name, reason] of [
   ["ALLMETA_BASE_URL", "Allmeta/Neo4j gateway is required for full functionality"],
   ["ALLMETA_API_KEY", "Allmeta bearer token is required"],
   ["ROBOHIRE_API_KEY", "RoboHire parse/match key is required"],
+  ["DOCUMENT_CONVERTER_URL", "private Gotenberg/LibreOffice origin is required"],
+  ["DOCUMENT_CONVERTER_TIMEOUT_MS", "converter client timeout is required"],
+  ["DOCUMENT_CONVERTER_MAX_INPUT_BYTES", "converter input limit is required"],
+  ["DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES", "converter output limit is required"],
+  ["GOTENBERG_IMAGE", "a pinned LibreOffice converter image is required"],
+  ["GOTENBERG_API_TIMEOUT", "converter server timeout is required"],
+  ["GOTENBERG_API_BODY_LIMIT", "converter multipart body limit is required"],
+  ["GOTENBERG_MAX_QUEUE_SIZE", "bounded LibreOffice queue size is required"],
+  ["GOTENBERG_CPUS", "converter CPU limit is required"],
+  ["GOTENBERG_MEMORY_LIMIT", "converter memory limit is required"],
+  ["GOTENBERG_PIDS_LIMIT", "converter PID limit is required"],
   ["RAAS_POSTGRES_URL", "partner Postgres dual-write URL is required"],
   ["MINIO_ENDPOINT", "resume object-store host is required"],
   ["MINIO_ACCESS_KEY", "MinIO access key is required"],
@@ -125,6 +136,7 @@ requireUrl("INNGEST_SERVE_ORIGIN", ["http:", "https:"]);
 requireUrl("RAAS_POSTGRES_URL", ["postgres:", "postgresql:"]);
 requireUrl("ALLMETA_BASE_URL", ["http:", "https:"]);
 requireUrl("ROBOHIRE_API_BASE_URL", ["http:", "https:"]);
+requireUrl("DOCUMENT_CONVERTER_URL", ["http:", "https:"]);
 if (validValue("AI_BASE_URL")) requireUrl("AI_BASE_URL", ["http:", "https:"]);
 
 // Deployment mode is an explicit two-state contract. Shared is the production
@@ -170,8 +182,104 @@ function requireOriginOnly(name, parsed) {
 
 const inngestBase = parsedUrl("INNGEST_BASE_URL");
 const inngestServe = parsedUrl("INNGEST_SERVE_ORIGIN");
+const documentConverter = parsedUrl("DOCUMENT_CONVERTER_URL");
 requireOriginOnly("INNGEST_BASE_URL", inngestBase);
 requireOriginOnly("INNGEST_SERVE_ORIGIN", inngestServe);
+requireOriginOnly("DOCUMENT_CONVERTER_URL", documentConverter);
+
+if (documentConverter?.origin !== "http://gotenberg:3000") {
+  errors.push(
+    "DOCUMENT_CONVERTER_URL must be exactly http://gotenberg:3000 so resume documents stay on the private Compose network",
+  );
+}
+
+const gotenbergImage = env.GOTENBERG_IMAGE?.trim() ?? "";
+if (
+  hasValue("GOTENBERG_IMAGE") &&
+  gotenbergImage !== "gotenberg/gotenberg:8.34.0-libreoffice"
+) {
+  errors.push(
+    "GOTENBERG_IMAGE must be exactly the approved official image gotenberg/gotenberg:8.34.0-libreoffice",
+  );
+}
+
+for (const name of [
+  "DOCUMENT_CONVERTER_TIMEOUT_MS",
+  "DOCUMENT_CONVERTER_MAX_INPUT_BYTES",
+  "DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES",
+]) {
+  if (!validValue(name)) continue;
+  const value = Number(env[name]);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    errors.push(`${name} must be a positive integer`);
+  }
+}
+
+function parseDurationMs(value) {
+  const match = /^([1-9]\d*)(ms|s|m)$/.exec(value);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const multiplier = match[2] === "ms" ? 1 : match[2] === "s" ? 1_000 : 60_000;
+  const milliseconds = amount * multiplier;
+  return Number.isSafeInteger(milliseconds) ? milliseconds : null;
+}
+
+function parseByteSize(value) {
+  const match = /^([1-9]\d*)(KB|MB|GB)$/i.exec(value);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const unit = match[2].toUpperCase();
+  const multiplier = unit === "KB" ? 1_000 : unit === "MB" ? 1_000_000 : 1_000_000_000;
+  const bytes = amount * multiplier;
+  return Number.isSafeInteger(bytes) ? bytes : null;
+}
+
+const serverTimeoutMs = validValue("GOTENBERG_API_TIMEOUT")
+  ? parseDurationMs(env.GOTENBERG_API_TIMEOUT.trim())
+  : null;
+if (validValue("GOTENBERG_API_TIMEOUT") && serverTimeoutMs === null) {
+  errors.push("GOTENBERG_API_TIMEOUT must be a positive duration such as 120s");
+}
+const clientTimeoutMs = Number(env.DOCUMENT_CONVERTER_TIMEOUT_MS);
+if (
+  serverTimeoutMs !== null &&
+  Number.isSafeInteger(clientTimeoutMs) &&
+  clientTimeoutMs <= serverTimeoutMs
+) {
+  errors.push("DOCUMENT_CONVERTER_TIMEOUT_MS must be greater than GOTENBERG_API_TIMEOUT");
+}
+
+const bodyLimitBytes = validValue("GOTENBERG_API_BODY_LIMIT")
+  ? parseByteSize(env.GOTENBERG_API_BODY_LIMIT.trim())
+  : null;
+if (validValue("GOTENBERG_API_BODY_LIMIT") && bodyLimitBytes === null) {
+  errors.push("GOTENBERG_API_BODY_LIMIT must be a positive size such as 12MB");
+}
+const maxInputBytes = Number(env.DOCUMENT_CONVERTER_MAX_INPUT_BYTES);
+if (
+  bodyLimitBytes !== null &&
+  Number.isSafeInteger(maxInputBytes) &&
+  bodyLimitBytes <= maxInputBytes
+) {
+  errors.push("GOTENBERG_API_BODY_LIMIT must be greater than DOCUMENT_CONVERTER_MAX_INPUT_BYTES for multipart overhead");
+}
+
+for (const name of ["GOTENBERG_MAX_QUEUE_SIZE", "GOTENBERG_PIDS_LIMIT"]) {
+  if (!validValue(name)) continue;
+  const value = Number(env[name]);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    errors.push(`${name} must be a positive integer; zero/unlimited is rejected`);
+  }
+}
+if (validValue("GOTENBERG_CPUS")) {
+  const cpus = Number(env.GOTENBERG_CPUS);
+  if (!Number.isFinite(cpus) || cpus <= 0) {
+    errors.push("GOTENBERG_CPUS must be a positive number");
+  }
+}
+if (validValue("GOTENBERG_MEMORY_LIMIT") && !/^[1-9]\d*(?:\.\d+)?[KMG]$/i.test(env.GOTENBERG_MEMORY_LIMIT.trim())) {
+  errors.push("GOTENBERG_MEMORY_LIMIT must be a positive Docker size such as 1G");
+}
 
 if (deployMode === "shared") {
   if (composeProfiles.length > 0) {

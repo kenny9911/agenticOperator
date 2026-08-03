@@ -30,6 +30,17 @@ const validSharedEnv: Record<string, string> = {
   ALLMETA_API_KEY: "allmeta-test-key",
   ROBOHIRE_API_BASE_URL: "https://api.gohire.top",
   ROBOHIRE_API_KEY: "robohire-test-key",
+  DOCUMENT_CONVERTER_URL: "http://gotenberg:3000",
+  DOCUMENT_CONVERTER_TIMEOUT_MS: "130000",
+  DOCUMENT_CONVERTER_MAX_INPUT_BYTES: "10485760",
+  DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES: "10485760",
+  GOTENBERG_IMAGE: "gotenberg/gotenberg:8.34.0-libreoffice",
+  GOTENBERG_API_TIMEOUT: "120s",
+  GOTENBERG_API_BODY_LIMIT: "12MB",
+  GOTENBERG_MAX_QUEUE_SIZE: "8",
+  GOTENBERG_CPUS: "1.0",
+  GOTENBERG_MEMORY_LIMIT: "1G",
+  GOTENBERG_PIDS_LIMIT: "256",
   RAAS_POSTGRES_URL: "postgresql://raas:pw@raas-postgres:5432/raas",
   MINIO_ENDPOINT: "minio.internal",
   MINIO_ACCESS_KEY: "minio-test-key",
@@ -98,6 +109,68 @@ describe("deploy-preflight explicit deployment modes", () => {
     const result = runPreflight({ COMPOSE_PROFILES: "bundled-inngest" });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("shared mode requires COMPOSE_PROFILES to be empty");
+  });
+
+  it("rejects a converter URL outside the private Compose service", () => {
+    const publicUrl = runPreflight({
+      DOCUMENT_CONVERTER_URL: "https://converter.example.test",
+    });
+    expect(publicUrl.status).toBe(1);
+    expect(publicUrl.stderr).toContain("must be exactly http://gotenberg:3000");
+
+    const pathUrl = runPreflight({
+      DOCUMENT_CONVERTER_URL: "http://gotenberg:3000/forms/libreoffice/convert",
+    });
+    expect(pathUrl.status).toBe(1);
+    expect(pathUrl.stderr).toContain("must be an origin only");
+  });
+
+  it("rejects floating or non-LibreOffice Gotenberg images", () => {
+    const floating = runPreflight({ GOTENBERG_IMAGE: "gotenberg/gotenberg:8" });
+    expect(floating.status).toBe(1);
+    expect(floating.stderr).toContain("8.34.0-libreoffice");
+
+    const chromiumOnly = runPreflight({ GOTENBERG_IMAGE: "gotenberg/gotenberg:8.34.0" });
+    expect(chromiumOnly.status).toBe(1);
+    expect(chromiumOnly.stderr).toContain("8.34.0-libreoffice");
+
+    const lookalike = runPreflight({
+      GOTENBERG_IMAGE: "evil.example/anything:8.34.0-libreoffice",
+    });
+    expect(lookalike.status).toBe(1);
+    expect(lookalike.stderr).toContain("approved official image");
+  });
+
+  it("rejects invalid converter size and timeout limits", () => {
+    const result = runPreflight({
+      DOCUMENT_CONVERTER_TIMEOUT_MS: "0",
+      DOCUMENT_CONVERTER_MAX_INPUT_BYTES: "ten-megabytes",
+      DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES: "-1",
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("DOCUMENT_CONVERTER_TIMEOUT_MS must be a positive integer");
+    expect(result.stderr).toContain("DOCUMENT_CONVERTER_MAX_INPUT_BYTES must be a positive integer");
+    expect(result.stderr).toContain("DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES must be a positive integer");
+  });
+
+  it("rejects unbounded or internally inconsistent Gotenberg resource limits", () => {
+    const result = runPreflight({
+      DOCUMENT_CONVERTER_TIMEOUT_MS: "120000",
+      DOCUMENT_CONVERTER_MAX_INPUT_BYTES: "12000000",
+      GOTENBERG_API_TIMEOUT: "120s",
+      GOTENBERG_API_BODY_LIMIT: "12MB",
+      GOTENBERG_MAX_QUEUE_SIZE: "0",
+      GOTENBERG_CPUS: "0",
+      GOTENBERG_MEMORY_LIMIT: "0G",
+      GOTENBERG_PIDS_LIMIT: "-1",
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("must be greater than GOTENBERG_API_TIMEOUT");
+    expect(result.stderr).toContain("multipart overhead");
+    expect(result.stderr).toContain("GOTENBERG_MAX_QUEUE_SIZE must be a positive integer");
+    expect(result.stderr).toContain("GOTENBERG_CPUS must be a positive number");
+    expect(result.stderr).toContain("GOTENBERG_MEMORY_LIMIT must be a positive Docker size");
+    expect(result.stderr).toContain("GOTENBERG_PIDS_LIMIT must be a positive integer");
   });
 
   it("rejects a file whose mode differs from the command contract", () => {

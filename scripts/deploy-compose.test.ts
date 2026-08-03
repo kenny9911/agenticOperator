@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -152,5 +152,33 @@ describe("deploy-compose authoritative env routing", () => {
     }).result;
     expect(external.status).toBe(1);
     expect(external.stderr).toContain("requires DATABASE_SCHEMA_SYNC=0");
+  });
+});
+
+describe("deploy-compose document converter contract", () => {
+  it("keeps Gotenberg internal-only and makes app wait for converter health", () => {
+    const compose = readFileSync(join(repoRoot, "docker-compose.deploy.yml"), "utf8");
+    const serviceBlock = /\n  gotenberg:\n([\s\S]*?)\n  app:\n/.exec(compose)?.[1];
+
+    expect(serviceBlock).toBeDefined();
+    expect(serviceBlock).toContain("gotenberg/gotenberg:8.34.0-libreoffice");
+    expect(serviceBlock).toContain("LIBREOFFICE_DENY_PRIVATE_IPS");
+    expect(serviceBlock).toContain("LIBREOFFICE_DENY_PUBLIC_IPS");
+    expect(serviceBlock).toContain("- converter-internal");
+    expect(serviceBlock).not.toMatch(/^    ports:/m);
+    expect(serviceBlock).not.toMatch(/^    volumes:/m);
+
+    expect(compose).toMatch(/gotenberg:\n\s+condition: service_healthy/);
+    expect(compose).toMatch(/converter-internal:\n\s+internal: true/);
+  });
+
+  it("does not add Gotenberg to the shared RAAS network or alter durable volumes", () => {
+    const base = readFileSync(join(repoRoot, "docker-compose.deploy.yml"), "utf8");
+    const shared = readFileSync(join(repoRoot, "docker-compose.shared-inngest.yml"), "utf8");
+
+    expect(shared).not.toMatch(/^  gotenberg:/m);
+    expect(base).toContain("- ao-postgres-data:/var/lib/postgresql/data");
+    expect(base).toContain("- ao-inngest-data:/var/lib/inngest/.inngest");
+    expect(base).toContain("- ao-logs:/app/persist");
   });
 });

@@ -17,14 +17,16 @@
 
 ## 1. 部署形态与边界
 
-生产默认编排四个 AO 服务；只有隔离环境显式启用 bundled profile 时才出现
-第五个 `inngest` 服务。数据全部落在 named volume 里，重建容器不丢监控、
+生产默认编排五个服务；只有隔离环境显式启用 bundled profile 时才出现
+第六个 `inngest` 服务。Gotenberg 是无状态、仅内部网络可达的 DOC/DOCX→PDF
+转换器，其余需要持久化的数据全部落在 named volume 里；重建容器不丢监控、
 事件、日志和运行记录：
 
 | 服务 | 作用 | 持久化 volume |
 | --- | --- | --- |
 | `app` | Next.js UI、API、Agent/Inngest 回调（端口 3002） | `<项目名>-logs`（完整 JSONL agent 日志） |
 | `ao-postgres` | AO 运营数据、LogEvent、通知、事件/run/step 归档 | `<项目名>-postgres-data` |
+| `gotenberg` | LibreOffice 转换 DOC/DOCX；无宿主端口、无持久卷 | 无（单次请求临时文件） |
 | `inngest`（可选） | 事件调度与实时运行（端口 8288/8289，显式 `--persist`） | `<项目名>-inngest-data` |
 | `archiver` | Inngest events/runs/steps 补偿归档到 Postgres | 写 `ao-postgres` |
 | `monitor-sweeper` | SLA、健康、错误率、成本和保留策略扫描 | 写 `ao-postgres` |
@@ -61,7 +63,12 @@ RESUME_DOWNLOADED 等事件直接进这个实例触发 AO 函数）。因此：
 | Allmeta（`ALLMETA_BASE_URL`） | Neo4j 唯一 HTTP 入口：实体写入 + 规则拉取 | 实体写入步骤报错；规则回退内置快照 |
 | RoboHire（`ROBOHIRE_API_BASE_URL`，**公网**） | 简历解析 + 匹配评分 | resumeParser/matchResume 失败，下游全停 |
 | RAAS partner Postgres（`RAAS_POSTGRES_URL`） | 候选人/岗位/匹配结果业务双写（七张表由 RAAS 方建） | 双写步骤失败 |
-| MinIO（`MINIO_ENDPOINT`） | 简历 PDF 二进制存取 | RESUME_DOWNLOADED 卡在 parser |
+| MinIO（`MINIO_ENDPOINT`） | PDF/DOC/DOCX 简历二进制存取 | RESUME_DOWNLOADED 卡在 parser |
+
+`gotenberg` 不属于外部系统：它由本 Compose 固定部署在 `converter-internal`
+网络，只有 `app` 能访问。PDF 原字节直通；DOC/DOCX 必须先转换并再次校验 PDF
+魔数后才会调用 RoboHire。文档本身不合法会结束该文件；转换器超时、宕机或
+配置错误会让 Inngest 重试/停放，绝不会把 Office 原字节伪装成 PDF 发出去。
 
 ## 2. 第 0 步：勘察目标机现状（一次性）
 
@@ -140,7 +147,7 @@ IP 换了必须重新打包，改 env 重启不生效。
 产物：`ao-deploy-bundle-<tag>-<arch>.tar`（约 2–4 GB），内含：
 
 ```
-images.tar.gz        # shared 默认两个镜像：agentic-operator + postgres
+images.tar.gz        # shared 默认三个镜像：agentic-operator + postgres + Gotenberg
 docker-compose.deploy.yml
 docker-compose.shared-inngest.yml
 docker-compose.reuse-postgres-volume.yml  # 高风险旧卷直挂，仅显式 opt-in
@@ -153,8 +160,9 @@ scripts/             # deploy-compose.sh · deploy-preflight.mjs · connectivity
 参考数字（2026-07-16 在 Apple Silicon 构建机实测）：AO 镜像约 **2.1 GB**；
 冷缓存构建 30–40 分钟（npm 全量拉包，网络抖动会自动重试），热缓存约
 10 分钟。交叉构建（`--arch` 与构建机不同）走 QEMU 模拟，预期慢 3–5 倍。
-shared 默认不携带 Inngest 镜像；只有 `--mode bundled` 才额外拉取并打包它。
-镜像构建成功不等于生产验收；目标机仍须逐项完成第 6 节的四容器健康、数据库、
+shared 包始终携带固定版本的 Gotenberg LibreOffice 镜像，但默认不携带 Inngest
+镜像；只有 `--mode bundled` 才额外拉取并打包 Inngest。镜像构建成功不等于
+生产验收；目标机仍须逐项完成第 6 节的五容器健康、数据库、转换器、
 唯一 callback、6/6 函数和端到端事件证据。
 
 两个常见构建失败及自救：`next build` 阶段报 TS 错误 = 工作区有改到一半
@@ -220,7 +228,15 @@ Allmeta。共享 Inngest 是切换窗口承接在途/新事件的唯一事件平
 
 ```bash
 docker load -i images.tar.gz
-docker images | grep -E 'agentic-operator|postgres|inngest'   # shared 包至少看到 AO + Postgres
+# 按打包清单逐个证明镜像已导入；shared 清单必须含 AO、Postgres、Gotenberg。
+while IFS='=' read -r key image; do
+  case "$key" in
+    AO_IMAGE|POSTGRES_IMAGE|GOTENBERG_IMAGE|INNGEST_IMAGE)
+      docker image inspect "$image" >/dev/null || exit 1
+      echo "OK $key=$image"
+      ;;
+  esac
+done < IMAGES.env
 ```
 
 ### 5.3 填写 .env.deploy
@@ -257,6 +273,9 @@ vi .env.deploy        # 或 open -e .env.deploy 用文本编辑打开
 | `ROBOHIRE_API_BASE_URL` | `https://api.gohire.top` | **不带 /v1**（client 自己拼 `/api/v1`） |
 | `ROBOHIRE_API_KEY` | 沿用老 env §4 的 `rh_*` | |
 | `ROBOHIRE_TIMEOUT_MS` | `300000` | ⚠ 老 env 是 120000——那是坑：match 实测 ~195s 会被杀，必须用 300000 |
+| `DOCUMENT_CONVERTER_URL` | `http://gotenberg:3000` | 必须是无 path 的内部服务 origin；预检拒绝公网/宿主地址 |
+| `GOTENBERG_IMAGE` | `gotenberg/gotenberg:8.34.0-libreoffice` | 固定 LibreOffice 变体；预检拒绝 `latest`、`:8` 或无 LibreOffice 的镜像 |
+| `DOCUMENT_CONVERTER_*` / `GOTENBERG_*` 限额 | 保持模板默认 | 客户端 130s、服务端 120s、输入/输出各 10 MiB；除非有实测证据不要放宽 |
 | `RAAS_POSTGRES_URL` | 沿用老 env §5a：`postgresql://postgres:<密码URL编码>@postgres:5432/raas` | `postgres` 容器**未发布宿主端口**，必须靠 shared overlay 按容器名访问（网络名见上行 `RAAS_SHARED_NETWORK`）；库名 `raas`；密码含 `@` 写成 `%40` |
 | `RAAS_DEFAULT_EMPLOYEE_ID` | `0000199059`（老 env §5b） | 匹配结果归属兜底 |
 | `MINIO_ENDPOINT` / `MINIO_PORT` | `host.docker.internal` / `9000` | 共享 MinIO 在目标机本机；endpoint 不带 scheme |
@@ -504,7 +523,7 @@ grep -q '"conflict_groups": 0' backups/candidate-mobile-backfill-post-apply.txt
 grep -q '"manual_review_rows": 0' backups/candidate-mobile-backfill-post-apply.txt
 grep -q '"rows_requiring_change": 0' backups/candidate-mobile-backfill-post-apply.txt
 
-# 5. 上述 partner 手机闸门通过后，才启动 shared 默认四服务；这里绝不出现 bundled inngest。
+# 5. 上述 partner 手机闸门通过后，才启动 shared 默认五服务；这里绝不出现 bundled inngest。
 bash scripts/deploy-compose.sh --env-file .env.deploy -- \
   up -d --wait
 ```
@@ -610,10 +629,10 @@ apply 事务还会取得 `candidate` 表的 `SHARE ROW EXCLUSIVE` 锁；任何�
 逐层验证，每层通过再看下一层：
 
 ```bash
-# ① shared 默认四个 AO 容器 running/healthy，且服务列表没有 inngest
+# ① shared 默认五个容器 running/healthy，且服务列表没有 inngest
 bash scripts/deploy-compose.sh --env-file .env.deploy -- ps
 bash scripts/deploy-compose.sh --env-file .env.deploy -- config --services
-# 期望恰为：ao-postgres / app / archiver / monitor-sweeper
+# 期望恰为：ao-postgres / gotenberg / app / archiver / monitor-sweeper
 
 # ② AO 自身健康
 curl -fsS "http://localhost:3002/api/health?check=live"
@@ -621,9 +640,14 @@ curl -fsS "http://localhost:3002/api/health?check=ready"   # 应含 ruleAuditSch
 
 # ③ Inngest 健康
 curl -fsS "http://localhost:8288/health"
+
+# ④ 转换器只做容器内验证（宿主机无 3000 映射）
+bash scripts/deploy-compose.sh --env-file .env.deploy -- \
+  exec -T app node -e \
+  "fetch('http://gotenberg:3000/health').then(async r=>{console.log(r.status,await r.text());if(!r.ok)process.exit(1)}).catch(e=>{console.error(e);process.exit(1)})"
 ```
 
-**④ 六函数注册**：在目标机本机浏览器打开 `http://localhost:8288`
+**⑤ 六函数注册**：在目标机本机浏览器打开 `http://localhost:8288`
 （Mac Studio 的共享 `inngest-server` 只绑 loopback，须在本机/ToDesk 里开）
 → Apps → 应看到 `agentic-operator-main` 同步无错误，函数列表包含六个核心
 agent（createJd / resumeParser / candidateIdentity / ruleCheck /
@@ -632,7 +656,10 @@ matchResume / interviewInviter）。
 unreachable——确认新 callback 已按 5.6 显式注册后，再删除指向旧容器的条目。
 函数缺失或 app unreachable，见第 10 节排查表首条。
 
-**⑤ 端到端测试事件**：测试路由在生产默认关闭，验收时临时开一个窗口：
+**⑥ 端到端测试事件**：测试路由在生产默认关闭，验收时临时开一个窗口。
+除岗位事件外，至少投递一份合成 DOCX 和一份合成旧 DOC，确认 Gotenberg 日志
+各有一次 200、RoboHire 收到的是 PDF，并且 parser run 成功；不得使用真实候选人
+简历做部署探针：
 
 ```bash
 # 临时打开测试路由并重启 app（只影响 app 容器）
@@ -650,7 +677,7 @@ sed -i '' 's/^AO_ENABLE_UNSAFE_DEV_ROUTES=1/AO_ENABLE_UNSAFE_DEV_ROUTES=0/' .env
 bash scripts/deploy-compose.sh --env-file .env.deploy -- up -d app
 ```
 
-**⑥ 持久化**：`docker compose ... restart` 后，第⑤步产生的监控/审计记录
+**⑦ 持久化**：`docker compose ... restart` 后，第⑥步产生的监控/审计记录
 仍能在页面查到。
 
 `/api/health?check=ready` 只验证 Web + AO Postgres（避免 app 与 Inngest
@@ -667,7 +694,7 @@ bash scripts/deploy-compose.sh --env-file .env.deploy -- up -d app
 aoc() { bash scripts/deploy-compose.sh --env-file .env.deploy -- "$@"; }
 aoc ps                      # 状态
 aoc logs -f --tail=200      # 全部日志
-aoc logs -f app             # 单服务日志（app / archiver / monitor-sweeper / ao-postgres）
+aoc logs -f app             # 单服务日志（app / gotenberg / archiver / monitor-sweeper / ao-postgres）
 aoc restart app             # 重启单服务
 aoc down                    # 停止并删容器，named volume 全保留
 ```
@@ -778,6 +805,8 @@ aoc up -d --wait
   compose 内带持久化的单机事件服务；公网生产应使用受保护的生产级事件服务
   并轮换真实 key。
 - 3002/8288/8289 只对操作员和受信 partner 开放；公网入口前放 TLS 反代。
+- Gotenberg 只加入内部网络，不发布宿主端口、不挂持久卷；不要把 3000 暴露到
+  LAN/公网，也不要解除 Office 外链的 private/public IP 双重拒绝。
 - `.env.deploy` 已被 `.gitignore` 排除，禁止提交真实凭证。
 - `STUB_AGENTS`、`RULE_CHECK_BYPASS`、`AO_ENABLE_UNSAFE_DEV_ROUTES` 生产
   必须保持关闭（验收窗口临时开启后要关回去）。
@@ -794,7 +823,7 @@ bash scripts/deploy-compose.sh --env-file .env.deploy -- config --quiet
 # 先构建 AO 镜像；随后按 5.5 恢复新卷、执行批准 SQL并验证空差异。
 bash scripts/deploy-compose.sh --env-file .env.deploy -- build app
 
-# 5.5 完成后才启动 shared 四服务。
+# 5.5 完成后才启动 shared 五服务。
 bash scripts/deploy-compose.sh --env-file .env.deploy -- \
   up -d --wait
 ```
@@ -841,7 +870,7 @@ bash scripts/deploy-compose.sh --env-file .env.deploy \
 ```
 
 4. 只有核对通过后，才按 5.5 生成/审查 SQL、用 `psql -1` 执行那一份批准文件
-   并验证空差异，再启动 shared 四服务并按 5.6 注册 callback。任何 major 不
+   并验证空差异，再启动 shared 五服务并按 5.6 注册 callback。任何 major 不
    兼容、volume ownership 异常或 destructive drift 都立即停止，回到逻辑
    dump → 新卷 restore 主线。
 

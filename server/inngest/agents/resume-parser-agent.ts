@@ -1,10 +1,10 @@
-// Function ① — 订阅 RESUME_DOWNLOADED → download PDF → parse → 持久化 → 发 RESUME_PROCESSED
+// Function ① — 订阅 RESUME_DOWNLOADED → download resume → parse → 持久化 → 发 RESUME_PROCESSED
 //
 // 流程 (per agentic-operator-onboarding v7 §4.8 + ADR-0011 边界):
 //   1. RESUME_DOWNLOADED 带 transport 元数据和可选 expectation_payload。
 //      raas **不**预先 parse — parse 是 agent 的职责；candidate expectation
 //      则由 RAAS 上传入口直接提供，AO 不需要另改事件名等待补齐。
-//   2. agent → GET /api/v1/resumes/uploads/<upload_id>/raw  (PDF bytes, RAAS MinIO)
+//   2. agent → GET /api/v1/resumes/uploads/<upload_id>/raw  (PDF/DOC/DOCX bytes, RAAS MinIO)
 //   3. agent → POST {RoboHire}/api/v1/parse-resume   (multipart — 直连 RoboHire, 不走 RAAS proxy)
 //   4. agent → partner Postgres (Candidate + CandidateExpectation + Resume)
 //      并同步 AllmetaOntology (Neo4j)。
@@ -15,7 +15,7 @@
 // 跳过 step 2-3.
 //
 // etag 兜底: 事件里的 etag 可能是 null (RAAS 手动上传链路目前没填),
-// agent 在拿到 PDF 字节后用 MD5 算一个本地 etag 作为 saveCandidate
+// agent 在拿到原始简历字节后用 MD5 算一个本地 etag 作为 saveCandidate
 // 的 dedup key.
 
 import { createHash } from 'node:crypto';
@@ -33,11 +33,12 @@ import {
   writeResumeInstance,
 } from '@/lib/allmeta-writers';
 import { parseResumeDirect, RobohireApiError } from '@/lib/robohire-client';
+import { DocumentConversionError } from '@/lib/resume-convert/prepare-resume-pdf';
+import { routeDocumentConversionFailure } from '@/lib/resume-convert/route-conversion-failure';
 import { extractCandidateExpectation } from '@/lib/mappers/candidate-preferences';
 import {
   normalizeCandidateExpectationPayload,
 } from '@/lib/raas-v1/candidate-expectation';
-import { detectResumeFormat, convertDocxBufferToPdf } from '@/lib/resume-convert/docx-to-pdf';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
 import { reportDependencyDegraded } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
@@ -219,10 +220,10 @@ export const resumeParserAgent = inngest.createFunction(
       const stepKey = sanitize(String(upload_id));
       const downloadAndParse = await step.run(`download-and-parse-${stepKey}`, async () => {
         // 1) 直连 MinIO 下载 PDF 字节 (2026-05-20: 不再走 RAAS proxy)
-        let pdfBuffer: Buffer;
+        let resumeBuffer: Buffer;
         let minioContentType: string | null = null;
         try {
-          pdfBuffer = await getResumeBuffer(String(bucket), String(object_key));
+          resumeBuffer = await getResumeBuffer(String(bucket), String(object_key));
           try {
             const stat = await statResume(String(bucket), String(object_key));
             minioContentType = stat.contentType;
@@ -240,54 +241,42 @@ export const resumeParserAgent = inngest.createFunction(
           throw e;
         }
         logger.info(
-          `[resume-persist] downloaded PDF from MinIO · upload_id=${upload_id} ` +
-            `bytes=${pdfBuffer.length} content-type=${minioContentType ?? '—'} ` +
+          `[resume-persist] downloaded resume from MinIO · upload_id=${upload_id} ` +
+            `bytes=${resumeBuffer.length} content-type=${minioContentType ?? '—'} ` +
             `filename="${filename ?? '—'}"`,
         );
 
-        // 1b) 格式护栏(2026-06-12):RoboHire 只支持 PDF,按 magic bytes 识别真实
-        //     格式(扩展名/事件 mime 不可信)。docx → mammoth+系统 Chrome 转成 PDF
-        //     再发;转换失败/老 .doc/unknown → 原样发,由 UNPARSEABLE 路径兜底。
-        //     注意:saveCandidate 的 MD5 etag 仍用**原始字节**算(dedup 语义 = 同一
-        //     上传文件),只有发给 RoboHire 的 buffer 换成转换后的 PDF。
-        const rawFormat = detectResumeFormat(pdfBuffer);
-        let parseBuffer = pdfBuffer;
-        let parseFilename = (filename as string | undefined) ?? 'resume.pdf';
-        if (rawFormat === 'docx') {
-          try {
-            parseBuffer = await convertDocxBufferToPdf(pdfBuffer);
-            parseFilename = parseFilename.replace(/\.docx?$/i, '') + '.pdf';
-            fileLogger.event('docx-converted', {
-              upload_id,
-              original_bytes: pdfBuffer.length,
-              pdf_bytes: parseBuffer.length,
-            });
-            logger.info(
-              `[resume-persist] docx → pdf converted · upload_id=${upload_id} ` +
-                `${pdfBuffer.length}B → ${parseBuffer.length}B`,
-            );
-          } catch (e) {
-            // 转换失败:原样发碰运气(RoboHire 拒了会走 UNPARSEABLE 终止),不在这里断链。
-            fileLogger.event('docx-convert-failed', { upload_id, error: (e as Error).message });
-            logger.warn(
-              `[resume-persist] docx→pdf 转换失败,原样发 RoboHire 兜底 · ${(e as Error).message}`,
-            );
-          }
-        } else if (rawFormat === 'doc' || rawFormat === 'unknown') {
-          fileLogger.event('non-pdf-format', { upload_id, detected: rawFormat });
-          logger.warn(
-            `[resume-persist] 检测到非 PDF 格式 (${rawFormat}) · 原样发 RoboHire(老 .doc 不支持转换,建议上传方转 docx/pdf)`,
-          );
-        }
-
         // 2) POST /api/v1/parse-resume (multipart) — 直连 RoboHire
-        const pdfFilename = parseFilename;
+        // parseResumeDirect is the single format boundary: PDF passes through;
+        // DOC/DOCX first go through internal Gotenberg; unsupported or failed
+        // conversion never reaches RoboHire. The MD5 below still uses original
+        // MinIO bytes so upload dedup semantics do not change.
+        const documentFilename = (filename as string | undefined) ?? 'resume.pdf';
         let parseRes: Awaited<ReturnType<typeof parseResumeDirect>>;
         try {
           // 显式传 fileLogger → RoboHire parse-resume 完整 in/out 进 per-run 审计
           // (Inngest step.run 内 ALS 不可靠,必须显式传闭包 logger).
-          parseRes = await parseResumeDirect(parseBuffer, pdfFilename, { traceId, logger: fileLogger });
+          parseRes = await parseResumeDirect(resumeBuffer, documentFilename, { traceId, logger: fileLogger });
         } catch (e) {
+          if (e instanceof DocumentConversionError) {
+            fileLogger.event('document-conversion.failed', {
+              upload_id,
+              code: e.code,
+              category: e.category,
+              source_format: e.sourceFormat,
+              retryable: e.retryable,
+              error: e.message,
+            });
+
+            await routeDocumentConversionFailure(e, String(upload_id), {
+              markUploadFailed: markResumeUploadFailed,
+              onMarkFailure: (markErr) => {
+                logger.warn(
+                  `[resume-persist] markResumeUploadFailed failed: ${(markErr as Error).message}`,
+                );
+              },
+            });
+          }
           // Document-content failure (image-only / scanned / corrupt PDF — RoboHire
           // truthfully reports "no extractable text"). This is NOT a vendor
           // degradation: do not pollute RoboHire health and do not park-and-retry a
@@ -301,6 +290,7 @@ export const resumeParserAgent = inngest.createFunction(
               logger.warn(
                 `[resume-persist] markResumeUploadFailed failed: ${(markErr as Error).message}`,
               );
+              throw markErr;
             }
             fileLogger.event('parse.unparseable', { upload_id, error: e.message });
             throw new NonRetriableError(
@@ -323,7 +313,7 @@ export const resumeParserAgent = inngest.createFunction(
 
         // 3) 算 MD5 etag 作为 saveCandidate dedup 兜底.
         //    返回 primitive 给下个 step (Buffer 不能跨 step.run 序列化).
-        const md5 = createHash('md5').update(pdfBuffer).digest('hex');
+        const md5 = createHash('md5').update(resumeBuffer).digest('hex');
 
         return {
           // RobohireParseResumeData 与 RaasParseResumeData 形状 1:1 (RAAS 是

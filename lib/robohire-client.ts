@@ -24,6 +24,7 @@
 
 import { currentLogger, type AgentLogger } from './agent-logger';
 import { logApiCall } from './external-api-log';
+import { prepareResumePdf } from './resume-convert/prepare-resume-pdf';
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 
@@ -214,13 +215,26 @@ export type RobohireParseResumeResponse = {
 };
 
 export async function parseResumeDirect(
-  pdf: Buffer,
+  document: Buffer,
   filename: string,
   opts: CommonOpts = {},
 ): Promise<RobohireParseResumeResponse> {
   const { baseUrl, apiKey, timeoutMs } = config();
+  const prepared = await prepareResumePdf(document, filename, {
+    traceId: opts.traceId,
+    logger: opts.logger,
+  });
+  opts.logger?.event(prepared.converted ? 'document.converted' : 'document.pdf-verified', {
+    source_format: prepared.sourceFormat,
+    original_bytes: prepared.originalBytes,
+    pdf_bytes: prepared.pdfBytes,
+  });
   const form = new FormData();
-  form.append('file', new Blob([new Uint8Array(pdf)], { type: 'application/pdf' }), filename);
+  form.append(
+    'file',
+    new Blob([new Uint8Array(prepared.pdf)], { type: 'application/pdf' }),
+    prepared.filename,
+  );
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${apiKey}`,
@@ -230,7 +244,14 @@ export async function parseResumeDirect(
   const url = `${baseUrl}/api/v1/parse-resume`;
   // Logged request body is a metadata-only summary (we can't serialize the
   // multipart form bytes meaningfully; PDF blob would dump base64 noise).
-  const requestSummary = { filename, pdf_bytes: pdf.length, trace_id: opts.traceId ?? null };
+  const requestSummary = {
+    filename: prepared.filename,
+    source_format: prepared.sourceFormat,
+    converted: prepared.converted,
+    original_bytes: prepared.originalBytes,
+    pdf_bytes: prepared.pdfBytes,
+    trace_id: opts.traceId ?? null,
+  };
   return instrumentedFetch(
     'RoboHire.parseResume',
     url,

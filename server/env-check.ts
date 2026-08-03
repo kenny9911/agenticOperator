@@ -79,6 +79,10 @@ const PRODUCTION_REQUIRED: readonly EnvRequirement[] = [
     reason: "RoboHire parse/match/invite calls fail without it.",
   },
   {
+    name: "DOCUMENT_CONVERTER_URL",
+    reason: "DOC/DOCX resumes must be converted to a validated PDF before RoboHire parsing.",
+  },
+  {
     name: "ALLMETA_BASE_URL",
     reason: "Rule-check and entity enrichment need Allmeta/Neo4j HTTP access.",
   },
@@ -122,6 +126,10 @@ const RECOMMENDED: readonly EnvRequirement[] = [
   {
     name: "ROBOHIRE_API_KEY",
     reason: "RoboHire resume parser. /parse-resume + /match-resume fail without it.",
+  },
+  {
+    name: "DOCUMENT_CONVERTER_URL",
+    reason: "Gotenberg/LibreOffice origin. DOC/DOCX parsing fails closed without it.",
   },
 ] as const;
 

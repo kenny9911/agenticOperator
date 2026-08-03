@@ -1,4 +1,8 @@
+// @vitest-environment node
+
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   parseResumeDirect,
   matchResumeDirect,
@@ -12,9 +16,14 @@ const env = {
   ROBOHIRE_API_KEY: 'rh_test_key',
   ROBOHIRE_TIMEOUT_MS: '120000',
 };
+const VALID_PDF = Buffer.from('%PDF-1.7\n1 0 obj\n<<>>\nendobj\nstartxref\n0\n%%EOF\n');
+const REAL_DOCX = readFileSync(
+  join(process.cwd(), 'lib', 'resume-convert', 'fixtures', 'synthetic-resume.docx'),
+);
 
 beforeEach(() => {
   Object.assign(process.env, env);
+  delete process.env.DOCUMENT_CONVERTER_URL;
   vi.restoreAllMocks();
 });
 
@@ -31,7 +40,7 @@ describe('parseResumeDirect', () => {
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    const r = await parseResumeDirect(Buffer.from('%PDF-1.4'), 'r.pdf');
+    const r = await parseResumeDirect(VALID_PDF, 'r.pdf');
     expect(r.data.name).toBe('John');
     expect(r.requestId).toBe('req_abc');
     expect(r.cached).toBe(false);
@@ -44,7 +53,7 @@ describe('parseResumeDirect', () => {
         { status: 400, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from(''), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       httpStatus: 400,
       code: 'CLIENT',
       requestId: 'req_xyz',
@@ -55,7 +64,7 @@ describe('parseResumeDirect', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ success: false, error: 'rate limited' }), { status: 429 }),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       httpStatus: 429,
       code: 'RATE_LIMITED',
     });
@@ -65,7 +74,7 @@ describe('parseResumeDirect', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ success: false, error: 'quota exhausted' }), { status: 402 }),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       code: 'QUOTA_EXHAUSTED',
     });
   });
@@ -74,7 +83,7 @@ describe('parseResumeDirect', () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(JSON.stringify({ success: true, data: {}, cached: true, requestId: 'r' })));
-    await parseResumeDirect(Buffer.from('%PDF'), 'r.pdf', { traceId: 'trace-123' });
+    await parseResumeDirect(VALID_PDF, 'r.pdf', { traceId: 'trace-123' });
     const init = (fetchSpy.mock.calls[0][1] ?? {}) as RequestInit;
     expect((init.headers as Record<string, string>)['X-Trace-Id']).toBe('trace-123');
   });
@@ -94,7 +103,7 @@ describe('parseResumeDirect', () => {
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'scan.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'scan.pdf')).rejects.toMatchObject({
       code: 'UNPARSEABLE',
       requestId: 'req_np',
     });
@@ -107,7 +116,7 @@ describe('parseResumeDirect', () => {
         { status: 500, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       code: 'UNPARSEABLE',
     });
   });
@@ -119,9 +128,57 @@ describe('parseResumeDirect', () => {
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       code: 'SERVER',
     });
+  });
+
+  it('converts DOCX first and sends only the verified PDF bytes to RoboHire', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const convertedPdf = VALID_PDF;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(convertedPdf, {
+        status: 200,
+        headers: { 'content-type': 'application/pdf' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        data: { name: 'Converted Candidate' },
+        cached: false,
+        requestId: 'req_converted',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const result = await parseResumeDirect(REAL_DOCX, 'candidate.docx');
+
+    expect(result.requestId).toBe('req_converted');
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy.mock.calls[0][0]).toBe('http://gotenberg:3000/forms/libreoffice/convert');
+    const robohireBody = fetchSpy.mock.calls[1][1]?.body as FormData;
+    const uploadedPdf = robohireBody.get('file') as File;
+    expect(uploadedPdf.name).toBe('candidate.pdf');
+    expect(Buffer.from(await uploadedPdf.arrayBuffer())).toEqual(convertedPdf);
+  });
+
+  it('never calls RoboHire when Office conversion fails', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('converter unavailable', { status: 503 }),
+    );
+
+    await expect(parseResumeDirect(REAL_DOCX, 'candidate.docx')).rejects.toMatchObject({
+      code: 'CONVERTER_UNAVAILABLE',
+      category: 'dependency',
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects non-PDF/non-Office bytes before any external request', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    await expect(parseResumeDirect(Buffer.from('not a document'), 'candidate.pdf')).rejects.toMatchObject({
+      code: 'UNSUPPORTED_FORMAT',
+      category: 'document',
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 

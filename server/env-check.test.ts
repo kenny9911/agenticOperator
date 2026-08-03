@@ -18,6 +18,7 @@ describe("env-check production preflight", () => {
     vi.stubEnv("MINIO_ACCESS_KEY", "minio-access");
     vi.stubEnv("MINIO_SECRET_KEY", "minio-secret");
     vi.stubEnv("ROBOHIRE_API_KEY", "rh_live");
+    vi.stubEnv("DOCUMENT_CONVERTER_URL", "http://gotenberg:3000");
     vi.stubEnv("ALLMETA_BASE_URL", "http://allmeta:3500");
     vi.stubEnv("ALLMETA_API_KEY", "allmeta-token");
     vi.stubEnv("AI_API_KEY", "ai-token");
@@ -40,6 +41,7 @@ describe("env-check production preflight", () => {
     vi.stubEnv("MINIO_ACCESS_KEY", "minio-access");
     vi.stubEnv("MINIO_SECRET_KEY", "minio-secret");
     vi.stubEnv("ROBOHIRE_API_KEY", "rh_live");
+    vi.stubEnv("DOCUMENT_CONVERTER_URL", "http://gotenberg:3000");
     vi.stubEnv("ALLMETA_BASE_URL", "http://allmeta:3500");
     vi.stubEnv("ALLMETA_API_KEY", "allmeta-token");
     vi.stubEnv("OPENAI_API_KEY", "sk-live");
@@ -48,5 +50,27 @@ describe("env-check production preflight", () => {
 
     expect(result.ok).toBe(true);
     expect(() => assertProductionRuntimeEnv(result)).not.toThrow();
+  });
+
+  it("fails production when the DOC/DOCX converter is not configured", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("DATABASE_URL", "postgresql://ao:pw@localhost:5433/ao");
+    vi.stubEnv("INNGEST_BASE_URL", "http://inngest:8288");
+    vi.stubEnv("INNGEST_EVENT_KEY", "evt_live");
+    vi.stubEnv("INNGEST_SIGNING_KEY", "sign_live");
+    vi.stubEnv("INNGEST_SERVE_ORIGIN", "http://ao:3002");
+    vi.stubEnv("RAAS_PG_URL", "postgresql://raas:pw@raas-db:5432/raas");
+    vi.stubEnv("MINIO_ENDPOINT", "minio");
+    vi.stubEnv("MINIO_ACCESS_KEY", "minio-access");
+    vi.stubEnv("MINIO_SECRET_KEY", "minio-secret");
+    vi.stubEnv("ROBOHIRE_API_KEY", "rh_live");
+    vi.stubEnv("DOCUMENT_CONVERTER_URL", "");
+    vi.stubEnv("ALLMETA_BASE_URL", "http://allmeta:3500");
+    vi.stubEnv("ALLMETA_API_KEY", "allmeta-token");
+    vi.stubEnv("OPENAI_API_KEY", "sk-live");
+
+    const result = checkEnv();
+    expect(result.ok).toBe(false);
+    expect(() => assertProductionRuntimeEnv(result)).toThrow(/DOCUMENT_CONVERTER_URL/);
   });
 });
