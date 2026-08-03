@@ -252,47 +252,37 @@ describe('generateJdDirect', () => {
     await expect(generateJdDirect({ prompt: 'x' })).rejects.toMatchObject({ httpStatus: 400, code: 'CLIENT' });
   });
 
-  it('does NOT throw when meta.stages.generate="failed" — stages are non-fatal; the transport client returns the response and the caller (classifyRobohire) judges content', async () => {
-    // Gohire contract: generate-jd always returns 200 / success:true; a failed
-    // generate stage still returns the response (with meta.stages). The transport
-    // client must NOT throw on stage status — emptiness/usability is judged downstream
-    // by classifyRobohire (single source of truth), which fails the run on empty content.
+  it.each([
+    ['parse failed', { stages: { parse: 'failed', generate: 'success' } }, 'parse=failed generate=success'],
+    ['generate failed', { stages: { parse: 'success', generate: 'failed' } }, 'parse=success generate=failed'],
+    ['stage skipped/unknown', { stages: { parse: 'skipped', generate: 'unknown' } }, 'parse=skipped generate=unknown'],
+    ['wrong casing', { stages: { parse: 'SUCCESS', generate: 'success' } }, 'parse=SUCCESS generate=success'],
+    ['missing generate', { stages: { parse: 'success' } }, 'parse=success generate=missing'],
+    ['missing stages', undefined, 'parse=missing generate=missing'],
+  ])('rejects a 200 response when %s', async (_label, meta, expectedDetail) => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
           success: true,
-          data: { title: 'Untitled', qualifications: '', hardRequirements: '', description: '', evaluationRules: '' },
-          meta: { stages: { parse: 'success', generate: 'failed' } },
-          requestId: 'req_jd_degraded',
+          data: { title: 'Looks usable', description: 'real body from a partial pipeline' },
+          ...(meta === undefined ? {} : { meta }),
+          requestId: 'req_jd_stage_gate',
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    const r = await generateJdDirect({ prompt: 'a valid prompt long enough to pass' });
-    expect(r.requestId).toBe('req_jd_degraded');
-    expect(r.meta?.stages?.generate).toBe('failed');
+
+    await expect(
+      generateJdDirect({ prompt: 'a valid prompt long enough to pass' }),
+    ).rejects.toMatchObject({
+      httpStatus: 502,
+      code: 'SERVER',
+      requestId: 'req_jd_stage_gate',
+      message: expect.stringContaining(expectedDetail),
+    });
   });
 
-  it('does NOT throw when meta.stages.parse="failed" but generate produced usable content — returns the salvageable JD (this used to be discarded)', async () => {
-    // The headline bug: parse-fail + generate-ok is a fully usable JD. The client
-    // must return it (raw-prompt title and all) so the agent can salvage it.
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          success: true,
-          data: { title: 'raw prompt echoed as title', description: 'real body from generate', qualifications: 'real quals' },
-          meta: { stages: { parse: 'failed', generate: 'success' } },
-          requestId: 'req_jd_parsefail',
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    );
-    const r = await generateJdDirect({ prompt: 'a valid prompt long enough to pass' });
-    expect(r.data.description).toBe('real body from generate');
-    expect(r.meta?.stages?.parse).toBe('failed');
-  });
-
-  it('does NOT throw on a fully-successful generate-jd (both stages success)', async () => {
+  it('accepts a fully-successful generate-jd (both stages strictly equal success)', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -308,23 +298,17 @@ describe('generateJdDirect', () => {
     expect(r.requestId).toBe('req_ok');
   });
 
-  it('does NOT throw when meta is absent (older response shape)', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({ success: true, data: { description: 'body' }, requestId: 'req_nometa' }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    );
-    const r = await generateJdDirect({ prompt: 'a valid prompt long enough to pass' });
-    expect(r.requestId).toBe('req_nometa');
-  });
-
   it('passes X-Trace-Id header', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(
         new Response(
-          JSON.stringify({ success: true, data: {}, requestId: 'r' }),
+          JSON.stringify({
+            success: true,
+            data: {},
+            meta: { stages: { parse: 'success', generate: 'success' } },
+            requestId: 'r',
+          }),
         ),
       );
     await generateJdDirect({ prompt: 'test prompt that is long enough to be valid' }, { traceId: 'trace-jd' });

@@ -18,7 +18,6 @@ import {
   proseToSkillArray,
   isAoSideBadRequest,
   resolveJdTitle,
-  jdStageDegradation,
 } from './create-jd-agent';
 import { RobohireApiError } from '@/lib/robohire-client';
 
@@ -87,40 +86,12 @@ describe('isAoSideBadRequest — AO 自己的 4xx 不该记成 RoboHire 健康�
   });
 });
 
-describe('resolveJdTitle — parse-stage failure echoes the raw prompt as title (Gohire contract)', () => {
-  it('parse failed → falls back to the requisition job title (raw-prompt title is unusable as a heading)', () => {
-    expect(
-      resolveJdTitle('岗位: 我们在招…… (4000 字原始 prompt 全文)', { parse: 'failed', generate: 'success' }, '高级前端工程师'),
-    ).toBe('高级前端工程师');
-  });
-  it('parse succeeded → keeps RoboHire 解析出来的 title', () => {
-    expect(resolveJdTitle('高级前端工程师', { parse: 'success', generate: 'success' }, '需求侧标题')).toBe('高级前端工程师');
-  });
-  it('parse failed + no requisition title → uses the "未命名岗位" placeholder, NEVER the raw-prompt blob', () => {
-    // On parse failure RoboHire echoes the whole ~4000-char prompt as `title`. With
-    // no requisition fallback, the helper must NOT keep that blob as the JD heading —
-    // it substitutes the same placeholder assembleJdContent uses (未命名岗位). Using a
-    // realistic long fixture so the test can't be read as "keeping the raw title is ok".
-    const rawPromptBlob = '岗位: 高级后端工程师\n' + 'x'.repeat(4000);
-    expect(resolveJdTitle(rawPromptBlob, { parse: 'failed', generate: 'success' }, undefined)).toBe('未命名岗位');
-  });
-  it('no stage info (older response shape) → keeps RoboHire title', () => {
-    expect(resolveJdTitle('Some Title', undefined, 'fallback')).toBe('Some Title');
+describe('resolveJdTitle', () => {
+  it('keeps RoboHire title after the strict stage gate has passed', () => {
+    expect(resolveJdTitle('高级前端工程师', '需求侧标题')).toBe('高级前端工程师');
   });
   it('non-string or blank title → uses fallback', () => {
-    expect(resolveJdTitle(undefined, { parse: 'success' }, 'fallback')).toBe('fallback');
-    expect(resolveJdTitle('   ', { parse: 'success' }, 'fallback')).toBe('fallback');
-  });
-});
-
-describe('jdStageDegradation — non-fatal degradation signal for the monitor', () => {
-  it('reports which stage(s) failed', () => {
-    expect(jdStageDegradation({ parse: 'failed', generate: 'success' })).toBe('parse');
-    expect(jdStageDegradation({ parse: 'success', generate: 'failed' })).toBe('generate');
-    expect(jdStageDegradation({ parse: 'failed', generate: 'failed' })).toBe('parse,generate');
-  });
-  it('null when nothing failed or no stage info (nothing to surface)', () => {
-    expect(jdStageDegradation({ parse: 'success', generate: 'success' })).toBeNull();
-    expect(jdStageDegradation(undefined)).toBeNull();
+    expect(resolveJdTitle(undefined, 'fallback')).toBe('fallback');
+    expect(resolveJdTitle('   ', 'fallback')).toBe('fallback');
   });
 });

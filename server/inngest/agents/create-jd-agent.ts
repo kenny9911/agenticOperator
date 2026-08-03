@@ -46,10 +46,7 @@ import {
   type RobohireGenerateJdData,
 } from '@/lib/robohire-client';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
-import {
-  reportDependencyDegraded,
-  recordDependencySignal,
-} from '@/lib/dependency-health/report';
+import { reportDependencyDegraded } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import {
   writeJobPostingInstance,
@@ -323,16 +320,21 @@ export const createJdAgent = inngest.createFunction(
       return r;
     });
 
-    const jdData = generated.data;
-    const stages = generated.meta?.stages;
+    // Replay-safe fail-closed boundary: Inngest may return a memoized output for a
+    // generate step completed by an older deployment without executing the callback
+    // above. Re-check outside step.run so a historical partial-stage response can
+    // never cross into the first write or JD_GENERATED emission after an upgrade.
+    const generatedOutcome = classifyRobohire('generateJd', generated);
+    if (!generatedOutcome.ok) {
+      await reportDependencyDegraded(generatedOutcome, depCtx);
+    }
 
-    // ── 4a. 处理 generate-jd 的非致命 stage 退化(Gohire 契约)──
-    // 契约:parse/generate 两个 stage 非致命。parse 失败时 RoboHire 会把「原始
-    // prompt」当 title 回传(整段 4000 字需求文本),直接拿来当 JD 标题不可用 —
-    // generate 仍用原始 prompt 产出了正文。把 title 兜底回需求侧已知岗位名。
+    const jdData = generated.data;
+
+    // generateJdDirect + classifyRobohire 已通过严格 stage 门禁；到这里可知
+    // parse/generate 均严格等于 success。标题缺失时才回退需求侧岗位名。
     jdData.title = resolveJdTitle(
       jdData.title,
-      stages,
       pickStringField(requirement, ['client_job_title', 'sd_org_name']),
     );
 
@@ -372,29 +374,6 @@ export const createJdAgent = inngest.createFunction(
       }
     }
 
-    // 到这里说明内容可用(空内容已在 generate step 里被 classifyRobohire →
-    // reportDependencyDegraded 拦截失败)。若某个 stage 退化但我们抢救出了可用 JD,
-    // 给监控发一条「非致命退化」信号(不失败 run — 契约说 stage 非致命)。
-    const degradedStages = jdStageDegradation(stages);
-    if (degradedStages) {
-      await step.run(`record-jd-stage-degrade-${sanitize(requisitionId)}`, async () => {
-        await recordDependencySignal(
-          {
-            ok: false,
-            provider: 'robohire',
-            op: 'generateJd',
-            reason: 'server',
-            detail: `generate-jd stage 退化(${degradedStages})但已从可用内容抢救出 JD — 未失败 run`,
-          },
-          depCtx,
-        );
-        return { degradedStages, salvaged: true };
-      });
-      logger.warn(
-        `[${AGENT_NAME}] generate-jd stage 退化(${degradedStages})— 已抢救可用 JD 并入库,发退化信号(非致命)`,
-      );
-    }
-
     // ── 4b. 从 RoboHire 自由文本派生结构化技能数组 ──
     // RoboHire generate-jd 不返回 must_have_skills / nice_to_have_skills 数组,
     // 只给散文 hardRequirements / niceToHave。把它们拆成 List<String> 存进
@@ -419,6 +398,7 @@ export const createJdAgent = inngest.createFunction(
     // 让 Rule Check Audit "实时读 Neo4j" 的 :Job_Requisition anchor 能查到.
     // partner 数据库是真相源,Neo4j 镜像 idempotent upsert.
     // (放在 RoboHire 之后:镜像才能带上派生的 must/nice_to_have_skills。)
+    // 这是本流程第一个写操作；只有严格 stage 门禁和内容检查均通过后才可触达。
     await step.run(`write-jr-neo4j-${sanitize(requisitionId)}`, async () => {
       const r = await writeJobRequisitionInstance({ requirement: enrichedRequirement });
       if (r.ok) logger.info(`[${AGENT_NAME}] ✓ allmeta wrote Job_Requisition ${requisitionId}`);
@@ -819,42 +799,12 @@ export function proseToSkillArray(s: unknown): string[] {
     .filter((line) => line.length > 0);
 }
 
-/**
- * Gohire generate-jd contract: when the PARSE stage fails, the response comes back
- * with `title` set to the raw prompt (the whole ~4000-char requirement blob) —
- * unusable as a JD heading — while the GENERATE stage still produced real body
- * content. Fall back to the requisition's known job title in that case. When parse
- * succeeded (or there's no stage info), keep RoboHire's parsed title; if RoboHire
- * gave us nothing usable, fall back regardless.
- */
+/** Keep RoboHire's non-blank title; otherwise use the requisition title. */
 export function resolveJdTitle(
   rawTitle: unknown,
-  stages: { parse?: string; generate?: string } | undefined,
   fallbackTitle: string | undefined,
 ): string | undefined {
-  // Parse stage failed → RoboHire echoes the raw prompt (a ~4000-char requirement
-  // blob) as `title`, which is unusable as a heading. NEVER keep it: use the
-  // requisition's known job title, else the same placeholder assembleJdContent
-  // falls back to (未命名岗位) — never the blob.
-  if (stages?.parse === 'failed') return fallbackTitle ?? UNTITLED_JD;
   return typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle : fallbackTitle;
-}
-
-/**
- * Which generate-jd stages degraded, as a comma-joined string ('parse',
- * 'generate', or 'parse,generate') — or null when no stage failed / no stage info.
- * Used to emit a NON-fatal dependency-health signal when we salvage a usable-but-
- * degraded JD, so the monitor still sees the vendor degradation even though the run
- * succeeds. Stage status is a health signal here, never a run-failing gate.
- */
-export function jdStageDegradation(
-  stages: { parse?: string; generate?: string } | undefined,
-): string | null {
-  if (!stages) return null;
-  const failed: string[] = [];
-  if (stages.parse === 'failed') failed.push('parse');
-  if (stages.generate === 'failed') failed.push('generate');
-  return failed.length ? failed.join(',') : null;
 }
 
 /**

@@ -377,11 +377,28 @@ export type RobohireGenerateJdData = {
   [k: string]: unknown;
 };
 
+export type RobohireGenerateJdStages = {
+  parse?: string;
+  generate?: string;
+};
+
 export type RobohireGenerateJdResponse = {
   data: RobohireGenerateJdData;
-  meta?: { stages?: { parse?: string; generate?: string } };
+  meta?: { stages?: RobohireGenerateJdStages };
   requestId: string;
 };
+
+/**
+ * Fail-closed generate-jd completion gate. Both vendor stages must be present
+ * and strictly equal to the lowercase literal `success` before AO may use the
+ * response. Missing, differently-cased, unknown, skipped, or failed values all
+ * fail the gate.
+ */
+export function generateJdStagesSucceeded(
+  stages: RobohireGenerateJdStages | undefined,
+): stages is { parse: 'success'; generate: 'success' } {
+  return stages?.parse === 'success' && stages?.generate === 'success';
+}
 
 export async function generateJdDirect(
   input: RobohireGenerateJdInput,
@@ -413,17 +430,19 @@ export async function generateJdDirect(
     opts.traceId,
     opts.logger,
   );
-  // Contract-faithful: generate-jd's two internal stages (parse, generate) are
-  // NON-FATAL. A degraded stage still returns a usable response — parse-fail →
-  // generate ran off the raw prompt (real body, raw-prompt title); generate-fail →
-  // parse's structured fields are still returned. The docs say to read
-  // `meta.stages` to see which succeeded, NOT to treat a failed stage as a failed
-  // call. So the transport client returns the response verbatim (stages and all);
-  // whether the *content* is usable is the caller's decision, owned by
-  // classifyRobohire (the single source of truth for "is this payload usable").
-  // Throwing on stage status here would discard a parse-fail-but-generate-ok JD
-  // that is fully usable. handleJsonResponse still rejects transport faults +
-  // envelope `success: false`.
+  // A 200/success envelope is not enough: AO may persist or publish a JD only
+  // after BOTH internal stages report the exact lowercase literal `success`.
+  // Enforce this at the shared client boundary so every caller, including dynamic
+  // tools, fails closed before it can consume a partial/degraded response.
+  if (!generateJdStagesSucceeded(resp.meta?.stages)) {
+    const stages = resp.meta?.stages;
+    throw new RobohireApiError(
+      502,
+      'SERVER',
+      `jobs/generate-jd stage gate failed: parse=${stages?.parse ?? 'missing'} generate=${stages?.generate ?? 'missing'}; both must equal success`,
+      resp.requestId,
+    );
+  }
   return resp;
 }
 
