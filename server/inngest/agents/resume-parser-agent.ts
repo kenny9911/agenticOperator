@@ -48,6 +48,7 @@ import { createAgentLogger, runWithLogger } from '@/lib/agent-logger';
 import { prisma } from '@/server/db';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
 import { runLockCheck } from '@/lib/candidate-lock/run-lock-check';
+import { readResumeDownloadedLockEvidence } from '@/lib/rmhr/resume-downloaded-lock';
 
 // Local alias mirroring the RoboHire parse-resume `data` shape that we
 // historically imported from raas-api-client.ts. After the 2026-05-20
@@ -147,20 +148,14 @@ export const resumeParserAgent = inngest.createFunction(
         : typeof raw.sourcingChannelId === 'string' && raw.sourcingChannelId.trim()
           ? raw.sourcingChannelId.trim()
           : null;
-    // RMHR 锁定归属透传 (raas 2026-05-27 起在 RESUME_DOWNLOADED 上发
-    // locked_by_employee_id / locked_by_name / locked_at, c200efd)。锁持有人是
-    // 候选人归属权威 — 被他人锁定时 AO 把候选人归属校正为锁持有人而非上传者
-    // (per raas ADR-0041 "锁在他人则同步真实归属")。snake/camel 双形态兼容。
-    const locked_by_employee_id =
-      typeof raw.locked_by_employee_id === 'string' && raw.locked_by_employee_id.trim()
-        ? raw.locked_by_employee_id.trim()
-        : typeof raw.lockedByEmployeeId === 'string' && raw.lockedByEmployeeId.trim()
-          ? raw.lockedByEmployeeId.trim()
-          : null;
-    // 归属生效值: 锁持有人优先, 无锁信息回落上传者。仅用于"归属"语义的写入
-    // (candidate.employee_id / Neo4j Candidate.employee_id); resume.uploaded_by
-    // 与 RESUME_PROCESSED.employee_id (matcher 按上传者扫名下岗位) 保持上传者。
-    const ownerEmployeeId = locked_by_employee_id ?? employeeId;
+    // RMHR 锁定事实必须完整贯穿：holder 是锁定正证据，locked_at 是防旧写时间。
+    // received_at 仅在 RMHR 旧响应漏时间时提供可重放的观测时间。holder 缺失不等于
+    // unlock，也不能再回落上传者伪造 Candidate.employee_id。
+    const {
+      locked_by_employee_id,
+      locked_at,
+      lock_observed_at,
+    } = readResumeDownloadedLockEvidence(raw);
     const traceId = getTraceId(event.data);
 
     // External-dependency-health context — passed to reportDependencyDegraded
@@ -345,6 +340,8 @@ export const resumeParserAgent = inngest.createFunction(
         filename: filename ?? undefined,
         employee_id: employeeId ?? undefined,
         locked_by_employee_id: locked_by_employee_id ?? undefined,
+        locked_at: locked_at ?? undefined,
+        lock_observed_at: lock_observed_at ?? undefined,
         client_id: client_id ?? undefined,
         job_requisition_id: job_requisition_id ?? undefined,
         sourcing_channel_id: sourcing_channel_id ?? undefined,
@@ -400,11 +397,19 @@ export const resumeParserAgent = inngest.createFunction(
         );
         return { ok: true as const, skipped: 'idempotent-replay' as const };
       }
+      const lockSnapshot = saveResult.candidate_lock_snapshot;
+      if (!lockSnapshot) {
+        throw new Error(
+          `[resume-persist] partner-pg returned no Candidate lock snapshot for ${saveResult.candidate_id}`,
+        );
+      }
       const r = await writeCandidateInstance({
         candidate_id: saveResult.candidate_id,
-        // 归属语义 — 锁持有人优先 (c200efd)。resume.uploaded_by / writeResumeInstance
-        // 仍记上传者; 仅 Candidate 归属随 RMHR 锁权威。
-        employee_id: ownerEmployeeId,
+        // Mirror the exact tuple committed by Partner PG. Re-deriving from the
+        // raw event here would let stale-event protection diverge across stores.
+        employee_id: lockSnapshot.employee_id,
+        is_locked: lockSnapshot.is_locked,
+        lock_start_time: lockSnapshot.lock_start_time,
         parsed: parsed as unknown as Record<string, unknown>,
         // Candidate contact mirrors the exact 11-digit value committed to partner PG;
         // raw RoboHire phone remains only in Resume.raw_parse_result.

@@ -68,6 +68,8 @@ describe('saveCandidateToPartnerPg — transport idempotency is not identity ded
 
     const result = await saveCandidateToPartnerPg({
       ...base,
+      locked_by_employee_id: 'STALE-LOCK-HOLDER',
+      locked_at: '2026-01-01 08:00:00',
       parsed: {
         data: {
           name: '重放时的不同姓名',
@@ -86,6 +88,7 @@ describe('saveCandidateToPartnerPg — transport idempotency is not identity ded
       mobile_normalized: '13800138000',
       mobile_review_status: 'valid',
       idempotent_replay: true,
+      candidate_lock_snapshot: null,
     });
     expect(queries[0]).toMatchObject({ params: [`upload:${base.upload_id}`] });
     expect(queries[1].text).toMatch(/FROM resume_upload_runtime[\s\S]*FOR UPDATE/i);

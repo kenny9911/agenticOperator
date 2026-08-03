@@ -33,6 +33,7 @@ import {
   normalizeCandidateExpectationPayload,
   type CandidateExpectationPatch,
 } from '@/lib/raas-v1/candidate-expectation';
+import { parseRmhrLockTime } from '@/lib/rmhr/lock-time';
 
 // ──────────────────────────────────────────────────────────────────────
 // Input mirrors lib/raas-api-client.ts SaveCandidateInput so callers
@@ -51,10 +52,14 @@ export type SaveCandidateInput = {
    * RMHR 锁持有人工号 — RESUME_DOWNLOADED 的 locked_by_employee_id 透传
    * (raas 2026-05-27 起发送)。非空时是归属权威 (per raas ADR-0041
    * "锁在他人则同步真实归属"): INSERT 直接用它做 candidate.employee_id,
-   * dedup 命中走 UPDATE 时无条件覆盖既有归属。为空时回落 employee_id
-   * (上传者) 走原 COALESCE 仅填空语义。
+   * dedup 命中时按锁时间防旧写。为空表示没有锁的正证据，不能回落上传者
+   * 伪造 Candidate 归属，也不能解释为解锁命令。
    */
   locked_by_employee_id?: string | null;
+  /** RMHR lockTime. Beijing wall-clock strings are normalized explicitly. */
+  locked_at?: string | number | null;
+  /** Event receive time used only when a positive lock omitted locked_at. */
+  lock_observed_at?: string | number | null;
   hr_folder?: string | null;
   job_requisition_id?: string | null;
   client_id?: string | null;
@@ -96,6 +101,14 @@ export type SaveCandidateResult = {
    * candidates return null because their parsed payload is the just-written
    * source. */
   candidate_snapshot: PersistedCandidateSnapshot | null;
+  /** Exact lock tuple committed to partner PG. Null only for an idempotent replay. */
+  candidate_lock_snapshot: CandidateLockSnapshot | null;
+};
+
+export type CandidateLockSnapshot = {
+  employee_id: string | null;
+  is_locked: boolean;
+  lock_start_time: Date | string | null;
 };
 
 export type PersistedCandidateSnapshot = {
@@ -109,6 +122,8 @@ export type PersistedCandidateSnapshot = {
   highest_acquired_degree: string | null;
   work_years: number | null;
   employee_id: string | null;
+  is_locked: boolean;
+  lock_start_time: Date | string | null;
 };
 
 /** Historical duplicate rows must be reconciled explicitly, never resolved by
@@ -295,16 +310,18 @@ export async function saveCandidateToPartnerPg(
   const sourcingChannelId =
     nonEmpty(input.sourcing_channel_id) ?? DEFAULT_SOURCING_CHANNEL_ID;
   const uploadedBy = nonEmpty(input.employee_id);
-  // 2026-06-11 (c200efd) — RMHR 锁持有人是候选人归属权威 (锁权威覆盖)。被他人
-  // 锁定时 raas 仍发 RESUME_DOWNLOADED 并透传 locked_by_*, 候选人应归锁持有人而
-  // 非上传者。lockedBy 非空 → employee_id 写锁持有人且 UPDATE 无条件覆盖; 为空
-  // → 沿用上传者 + COALESCE 仅填空 (公共池) 的历史语义。resume.uploaded_by 不受
-  // 影响 — 那是"谁上传了文件", 始终记上传者。
-  // ⚠️ 运维红线: 勿从 Inngest dashboard 直接 replay 旧 RESUME_DOWNLOADED — 陈旧
-  // locked_by 会无条件覆盖较新归属 (这里不做 locked_at 新旧比较, 跨系统时区口径
-  // 不可靠)。
+  // Candidate 的三个 RMHR 锁字段是一个原子事实。只有持锁人非空才是锁定正证据；
+  // 上传者属于 resume.uploaded_by 的文件级语义，不能拿来填 Candidate.employee_id。
+  // locked_at 优先；RMHR 旧响应缺时间时用事件 received_at，最后才以本次处理时刻
+  // 为新 Candidate 建立非空锁时间。dedup UPDATE 对有效时间做防旧写。
   const lockedBy = nonEmpty(input.locked_by_employee_id);
-  const ownerEmployeeId = lockedBy ?? uploadedBy;
+  const hasIncomingLock = lockedBy !== null;
+  const incomingLockStartTime = hasIncomingLock
+    ? parseRmhrLockTime(input.locked_at) ?? parseRmhrLockTime(input.lock_observed_at)
+    : null;
+  const newCandidateLockStartTime = hasIncomingLock
+    ? incomingLockStartTime ?? new Date()
+    : null;
 
   const parsed = input.parsed?.data ?? {};
   const name = nonEmpty(parsed.name) ?? '未命名候选人';
@@ -433,6 +450,7 @@ export async function saveCandidateToPartnerPg(
     const idempotentReplay = candidate_id !== null;
     let savedMobileResolution = mobileResolution;
     let candidateSnapshot: PersistedCandidateSnapshot | null = null;
+    let candidateLockSnapshot: CandidateLockSnapshot | null = null;
 
     if (candidate_id) {
       const target = await c.query<{
@@ -488,14 +506,14 @@ export async function saveCandidateToPartnerPg(
             current_location, current_company, current_title,
             skills, languages,
             sourcing_channel_id, employee_id, data_source, status,
-            needs_mobile_review,
+            needs_mobile_review, is_locked, lock_start_time,
             created_at, updated_at
           ) VALUES (
             $1, $2, $3, $4, $5, $6,
             $7, $8, $9,
             $10::text[], $11::text[],
             $12, $13, $14, $15,
-            $16,
+            $16, $17, ($18::timestamptz AT TIME ZONE 'UTC'),
             NOW(), NOW()
           )`,
         [
@@ -511,21 +529,28 @@ export async function saveCandidateToPartnerPg(
           skillsExtracted,
           languagesList,
           sourcingChannelId,
-          ownerEmployeeId,
+          lockedBy,
           'agentic_operator',
           DEFAULT_CANDIDATE_STATUS,
           needsMobileReview,
+          hasIncomingLock,
+          newCandidateLockStartTime,
         ],
       );
+      candidateLockSnapshot = {
+        employee_id: lockedBy,
+        is_locked: hasIncomingLock,
+        lock_start_time: newCandidateLockStartTime,
+      };
     } else if (!idempotentReplay) {
       // This branch is reachable only through a valid canonical-phone hit. Write
       // both phone columns directly so historical formatting drift cannot survive.
       // Phone-only dedup must not let a parser variation overwrite an established
       // real name. Only fill an empty / placeholder name automatically.
       //
-      // employee_id (归属): $13 标记"事件带 RMHR 锁持有人"。带锁 → 无条件覆盖为
-      // $11 (= 锁持有人, 锁权威校正归属); 不带锁 → 原 COALESCE 仅填空语义
-      // ($11 = 上传者)。status: COALESCE 仅填空, 不覆盖招聘手动维护的状态。
+      // $13 标记"事件带 RMHR 锁持有人"，$15 是规范化的锁时间。三字段共用同一
+      // freshness gate，避免旧锁覆盖较新的现役锁；无持锁人只代表无正证据，保持
+      // Candidate 既有锁三元组。status 仍只填空，不覆盖招聘手工状态。
       const incomingNameForUpdate = name === '未命名候选人' ? null : name;
       const updated = await c.query<PersistedCandidateSnapshot>(
         `UPDATE candidate SET
@@ -541,8 +566,39 @@ export async function saveCandidateToPartnerPg(
             languages = CASE WHEN COALESCE(array_length(languages, 1), 0) = 0
                              THEN $9::text[] ELSE languages END,
             sourcing_channel_id = COALESCE(sourcing_channel_id, $10),
-            employee_id = CASE WHEN $13::boolean THEN $11
-                               ELSE COALESCE(employee_id, $11) END,
+            employee_id = CASE
+              WHEN $13::boolean AND (
+                (($15::timestamptz AT TIME ZONE 'UTC') IS NOT NULL AND (
+                  lock_start_time IS NULL OR
+                  lock_start_time <= ($15::timestamptz AT TIME ZONE 'UTC')
+                )) OR
+                ($15::timestamptz IS NULL AND is_locked IS DISTINCT FROM true)
+              ) THEN $11
+              ELSE employee_id
+            END,
+            is_locked = CASE
+              WHEN $13::boolean AND (
+                (($15::timestamptz AT TIME ZONE 'UTC') IS NOT NULL AND (
+                  lock_start_time IS NULL OR
+                  lock_start_time <= ($15::timestamptz AT TIME ZONE 'UTC')
+                )) OR
+                ($15::timestamptz IS NULL AND is_locked IS DISTINCT FROM true)
+              ) THEN true
+              ELSE is_locked
+            END,
+            lock_start_time = CASE
+              WHEN $13::boolean AND (
+                (($15::timestamptz AT TIME ZONE 'UTC') IS NOT NULL AND (
+                  lock_start_time IS NULL OR
+                  lock_start_time <= ($15::timestamptz AT TIME ZONE 'UTC')
+                )) OR
+                ($15::timestamptz IS NULL AND is_locked IS DISTINCT FROM true)
+              ) THEN COALESCE(
+                ($15::timestamptz AT TIME ZONE 'UTC'),
+                NOW()
+              )
+              ELSE lock_start_time
+            END,
             data_source = COALESCE(data_source, 'agentic_operator'),
             name = CASE WHEN name = '未命名候选人' OR name IS NULL
                         THEN COALESCE($12, name) ELSE name END,
@@ -551,7 +607,8 @@ export async function saveCandidateToPartnerPg(
          WHERE candidate_id = $1
          RETURNING name, mobile, mobile_normalized, email, gender, birth_date,
                    current_location, highest_acquired_degree, work_years,
-                   employee_id`,
+                   employee_id, is_locked,
+                   lock_start_time AT TIME ZONE 'UTC' AS lock_start_time`,
         [
           candidate_id,
           mobile,
@@ -563,10 +620,11 @@ export async function saveCandidateToPartnerPg(
           skillsExtracted,
           languagesList,
           sourcingChannelId,
-          ownerEmployeeId,
+          lockedBy,
           incomingNameForUpdate,
-          lockedBy !== null,
+          hasIncomingLock,
           DEFAULT_CANDIDATE_STATUS,
+          incomingLockStartTime,
         ],
       );
       if (updated.rows.length !== 1) {
@@ -575,6 +633,11 @@ export async function saveCandidateToPartnerPg(
         );
       }
       candidateSnapshot = updated.rows[0];
+      candidateLockSnapshot = {
+        employee_id: candidateSnapshot.employee_id,
+        is_locked: candidateSnapshot.is_locked,
+        lock_start_time: candidateSnapshot.lock_start_time,
+      };
     }
 
     // ── Step 2: UPSERT candidate_expectation from RAAS upload payload ──
@@ -814,6 +877,7 @@ export async function saveCandidateToPartnerPg(
       mobile_review_status: savedMobileResolution.status,
       idempotent_replay: idempotentReplay,
       candidate_snapshot: candidateSnapshot,
+      candidate_lock_snapshot: candidateLockSnapshot,
     };
   });
 }

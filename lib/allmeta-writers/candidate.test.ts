@@ -9,7 +9,12 @@ vi.mock('./_helpers', () => ({
   compact: (x: unknown) => x,
   nonEmptyString: (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null),
   asNumberOrNull: (v: unknown) => (typeof v === 'number' ? v : null),
-  asIsoDateOrNull: () => null,
+  asIsoDateOrNull: (v: unknown) => {
+    if (v instanceof Date) return v.toISOString();
+    if (typeof v !== 'string' || !v.trim()) return null;
+    const parsed = new Date(v);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  },
 }));
 
 import { writeCandidateInstance } from './candidate';
@@ -94,6 +99,44 @@ describe('writeCandidateInstance', () => {
         address: '上海',
         highest_acquired_degree: '本科',
         work_years: 8,
+      }),
+    );
+  });
+
+  it('mirrors the exact Partner PG lock tuple', async () => {
+    await writeCandidateInstance({
+      candidate_id: 'C7',
+      employee_id: 'EMP-LOCK-HOLDER',
+      is_locked: true,
+      lock_start_time: new Date('2026-07-14T10:05:33.000Z'),
+      parsed: { name: '测试候选人', phone: '13800138000' },
+    });
+
+    expect(safeWriteInstance).toHaveBeenCalledWith(
+      'Candidate',
+      expect.objectContaining({
+        employee_id: 'EMP-LOCK-HOLDER',
+        is_locked: true,
+        lock_start_time: '2026-07-14T10:05:33.000Z',
+      }),
+    );
+  });
+
+  it('mirrors an unlocked public-pool tuple without falling back to uploader', async () => {
+    await writeCandidateInstance({
+      candidate_id: 'C8',
+      employee_id: null,
+      is_locked: false,
+      lock_start_time: null,
+      parsed: { name: '测试候选人' },
+    });
+
+    expect(safeWriteInstance).toHaveBeenCalledWith(
+      'Candidate',
+      expect.objectContaining({
+        employee_id: null,
+        is_locked: false,
+        lock_start_time: null,
       }),
     );
   });
