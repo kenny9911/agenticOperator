@@ -89,7 +89,7 @@
     "category": "JD创建与更新",
     "object_type": "action",
     "actor": ["Agent"],
-    "trigger": ["REQUIREMENT_LOGGED", "CLARIFICATION_READY", "JD_REJECTED"],
+    "trigger": ["CLARIFICATION_READY"],
     "triggered_event": ["JD_GENERATED"],
     "target_objects": ["Job_Requisition", "Job_Posting"],
     "tool_use": ["partnerpg.getRequirement", "robohire.generateJd", "partnerpg.syncJd", "allmeta.writeInstance"],

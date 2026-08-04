@@ -84,7 +84,7 @@ import { createJdAgent } from './create-jd-agent';
 import { reportDependencyDegraded } from '@/lib/dependency-health/report';
 
 type AgentHandler = (ctx: {
-  event: { name: string; data: Record<string, unknown> };
+  event: { id: string; name: string; data: Record<string, unknown> };
   step: {
     run: (key: string, fn: () => Promise<unknown>) => Promise<unknown>;
     sendEvent: ReturnType<typeof vi.fn>;
@@ -94,6 +94,7 @@ type AgentHandler = (ctx: {
 }) => Promise<unknown>;
 
 const handler = (createJdAgent as unknown as { handler: AgentHandler }).handler;
+const config = (createJdAgent as unknown as { cfg: Record<string, unknown> }).cfg;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -112,6 +113,28 @@ beforeEach(() => {
     domain: 'RAAS-v1',
     ruleCount: 0,
     rules: [],
+  });
+  mocks.writeJobRequisitionInstance.mockResolvedValue({ ok: true });
+  mocks.writeJobPostingInstance.mockResolvedValue({ ok: true });
+  mocks.notifyRecruitmentLifecycle.mockResolvedValue(undefined);
+});
+
+describe('createJdAgent — trigger and serialization contract', () => {
+  it('only starts after clarification and serializes by source/JR', () => {
+    expect(config).toMatchObject({
+      id: 'create-jd-agent',
+      retries: 3,
+      idempotency: 'event.data.event_id',
+      concurrency: {
+        key:
+          'has(event.data.payload.job_requisition_id) ? ' +
+          'event.data.payload.job_requisition_id : event.data.entity_id',
+        limit: 1,
+      },
+      triggers: [{ event: 'CLARIFICATION_READY' }],
+    });
+    expect(config.triggers).not.toContainEqual({ event: 'REQUIREMENT_LOGGED' });
+    expect(config.triggers).not.toContainEqual({ event: 'JD_REJECTED' });
   });
 });
 
@@ -145,10 +168,13 @@ describe('createJdAgent — generate-jd strict stage gate', () => {
 
     await expect(handler({
       event: {
-        name: 'REQUIREMENT_LOGGED',
+        id: 'inngest-stage-gate',
+        name: 'CLARIFICATION_READY',
         data: {
           entity_type: 'Job_Requisition',
           entity_id: 'jr-stage-gate',
+          event_id: 'ready-stage-gate',
+          payload: { job_requisition_id: 'jr-stage-gate' },
           trace: { trace_id: 'trace-stage-gate' },
         },
       },
@@ -172,5 +198,161 @@ describe('createJdAgent — generate-jd strict stage gate', () => {
     expect(mocks.writeJobPostingInstance).not.toHaveBeenCalled();
     expect(sendEvent).not.toHaveBeenCalled();
     expect(mocks.notifyRecruitmentLifecycle).not.toHaveBeenCalled();
+  });
+});
+
+describe('createJdAgent — durable JD_GENERATED handoff', () => {
+  function successfulGenerated() {
+    return {
+      data: {
+        title: '智能硬件项目经理',
+        description: '负责智能硬件项目全生命周期交付。',
+        hardRequirements: '具备三年以上智能硬件项目管理经验。',
+      },
+      meta: { stages: { parse: 'success', generate: 'success' } },
+      requestId: 'rh-success-1',
+    };
+  }
+
+  function executableStep() {
+    return {
+      run: async (_key: string, fn: () => Promise<unknown>) => fn(),
+      sendEvent: vi.fn(),
+    };
+  }
+
+  it('persists JD_GENERATED outbox data with the source event id and never direct-sends', async () => {
+    mocks.generateJdDirect.mockResolvedValue(successfulGenerated());
+    mocks.syncJdToPartnerPg.mockResolvedValue({
+      synced: true,
+      job_posting_id: 'JP-OUTBOX-1',
+      job_requisition_id: 'jr-stage-gate',
+      jd_generated_event_id: 'JD-GENERATED-EVENT-1',
+      jd_generated_idempotency_key:
+        'JD_GENERATED:createJD:jr-stage-gate:READY-EVENT-1',
+    });
+    const step = executableStep();
+
+    const result = await handler({
+      event: {
+        id: 'inngest-ready-1',
+        name: 'CLARIFICATION_READY',
+        data: {
+          entity_type: 'Job_Requisition',
+          entity_id: 'jr-stage-gate',
+          event_id: 'READY-EVENT-1',
+          payload: { job_requisition_id: 'jr-stage-gate' },
+          trace: {
+            trace_id: 'trace-ready-1',
+            request_id: 'request-ready-1',
+          },
+        },
+      },
+      step,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      runId: 'run-ready-1',
+    });
+
+    expect(mocks.syncJdToPartnerPg).toHaveBeenCalledWith(
+      expect.objectContaining({
+        job_requisition_id: 'jr-stage-gate',
+        client_id: 'client-stage-gate',
+        jd_generated_outbox: {
+          source_event_id: 'READY-EVENT-1',
+          jd_content:
+            '# 智能硬件项目经理\n\n负责智能硬件项目全生命周期交付。\n\n## 硬性要求\n具备三年以上智能硬件项目管理经验。',
+          source_action: 'createJD',
+          trace: {
+            trace_id: 'trace-ready-1',
+            request_id: 'request-ready-1',
+          },
+        },
+      }),
+    );
+    expect(step.sendEvent).not.toHaveBeenCalled();
+    expect(mocks.writeJobPostingInstance).toHaveBeenCalledWith(
+      expect.objectContaining({ job_posting_id: 'JP-OUTBOX-1' }),
+    );
+    expect(mocks.notifyRecruitmentLifecycle).toHaveBeenCalledWith(
+      step,
+      'JD_GENERATED',
+      expect.any(Object),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      job_posting_id: 'JP-OUTBOX-1',
+      jd_generated_event_id: 'JD-GENERATED-EVENT-1',
+    });
+  });
+
+  it('does not mirror or notify when a delayed event finds a protected posting', async () => {
+    mocks.generateJdDirect.mockResolvedValue(successfulGenerated());
+    mocks.syncJdToPartnerPg.mockResolvedValue({
+      synced: false,
+      job_posting_id: 'JP-APPROVED-1',
+      job_requisition_id: 'jr-stage-gate',
+      reason: 'skipped_protected_existing_posting',
+    });
+    const step = executableStep();
+
+    const result = await handler({
+      event: {
+        id: 'inngest-delayed-1',
+        name: 'CLARIFICATION_READY',
+        data: {
+          event_id: 'READY-DELAYED-1',
+          payload: { job_requisition_id: 'jr-stage-gate' },
+        },
+      },
+      step,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      runId: 'run-delayed-1',
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      skipped: true,
+      reason: 'skipped_protected_existing_posting',
+    });
+    expect(mocks.writeJobPostingInstance).not.toHaveBeenCalled();
+    expect(mocks.notifyRecruitmentLifecycle).not.toHaveBeenCalled();
+    expect(step.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('does not repeat post-sync side effects when the source outbox already exists', async () => {
+    mocks.generateJdDirect.mockResolvedValue(successfulGenerated());
+    mocks.syncJdToPartnerPg.mockResolvedValue({
+      synced: false,
+      job_posting_id: 'JP-REPLAY-1',
+      job_requisition_id: 'jr-stage-gate',
+      jd_generated_event_id: 'JD-GENERATED-REPLAY-1',
+      reason: 'replayed_existing_outbox',
+    });
+    const step = executableStep();
+
+    const result = await handler({
+      event: {
+        id: 'inngest-replay-1',
+        name: 'CLARIFICATION_READY',
+        data: {
+          entity_type: 'Job_Requisition',
+          entity_id: 'jr-stage-gate',
+          event_id: 'READY-REPLAY-1',
+          payload: {},
+        },
+      },
+      step,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      runId: 'run-replay-1',
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      replayed: true,
+      jd_generated_event_id: 'JD-GENERATED-REPLAY-1',
+    });
+    expect(mocks.writeJobPostingInstance).not.toHaveBeenCalled();
+    expect(mocks.notifyRecruitmentLifecycle).not.toHaveBeenCalled();
+    expect(step.sendEvent).not.toHaveBeenCalled();
   });
 });

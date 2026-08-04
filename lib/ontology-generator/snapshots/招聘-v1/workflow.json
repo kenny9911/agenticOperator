@@ -3,8 +3,8 @@
     "domain": "招聘-v1",
     "source": "由 AO 现役 6 个招聘 agent 的真实事件链与业务逻辑提炼,供智能体生成器读取。objects/rules 沿用 neo4j_data/招聘- v1 既有交付物未改。",
     "workflow_count": 6,
-    "message": "招聘域 6-agent 工作流蓝图:候选人查重→简历解析→规则检查→简历匹配→面试邀约,外加 JD 生成分支。entry 事件 RESUME_DOWNLOADED / JD_GENERATION_REQUESTED / JD_REJECTED 由人工/外部产出;终态事件(*_CONFLICT/*_FAILED/*_MISSING/MATCH_PASSED_NO_INTERVIEW/JD_GENERATED/INTERVIEW_INVITATION_SENT)由本子图外的人工或系统承接。",
-    "entry_events": ["RESUME_DOWNLOADED", "JD_GENERATION_REQUESTED", "JD_REJECTED"],
+    "message": "招聘域 6-agent 工作流蓝图:候选人查重→简历解析→规则检查→简历匹配→面试邀约,外加 JD 生成分支。JD 只由 CLARIFICATION_READY 启动;JD_REJECTED 是终止性审核结果,不回流至 createJD。",
+    "entry_events": ["RESUME_DOWNLOADED", "CLARIFICATION_READY"],
     "terminal_events": ["RESUME_LOCKED_CONFLICT", "RESUME_INFO_MISSING", "RESUME_PARSE_ERROR", "MATCH_RULE_CHECK_FAILED", "MATCH_PASSED_NO_INTERVIEW", "MATCH_FAILED", "INTERVIEW_INVITATION_SENT", "INTERVIEW_INVITATION_FAILED", "JD_GENERATED"]
   },
   "workflows": [
@@ -75,11 +75,11 @@
     {
       "id": "4",
       "name": "createJD",
-      "description": "Create JD Agent。RoboHire generateJdDirect 生成 JD 散文,proseToSkillArray 拆出 must/nice 技能数组(jsonb),映射岗位需求后发 JD_GENERATED;被驳回(JD_REJECTED)回本节点重生成。retries=1。",
+      "description": "Create JD Agent。RoboHire generateJdDirect 生成 JD 散文,proseToSkillArray 拆出 must/nice 技能数组(jsonb),映射岗位需求后发 JD_GENERATED;JD_REJECTED 不回本节点。retries=1。",
       "actor": ["Agent"],
-      "trigger": ["JD_GENERATION_REQUESTED", "JD_REJECTED"],
+      "trigger": ["CLARIFICATION_READY"],
       "actions": [
-        { "order": "1", "name": "generateJDContent", "description": "RoboHire generateJdDirect 生成 hardRequirements/niceToHave 散文。", "type": "logic", "condition": "收到生成/重生成请求" },
+        { "order": "1", "name": "generateJDContent", "description": "RoboHire generateJdDirect 生成 hardRequirements/niceToHave 散文。", "type": "logic", "condition": "收到澄清就绪事件" },
         { "order": "2", "name": "proseToSkillArray", "description": "散文拆为 must_have_skills/nice_to_have_skills 数组。", "type": "logic", "condition": "JD 正文已生成" },
         { "order": "3", "name": "handleRequisitionMapping", "description": "建立 Job_Posting 与需求/规格映射,写薪资与渠道。", "type": "logic", "condition": "技能数组已拆分" }
       ],

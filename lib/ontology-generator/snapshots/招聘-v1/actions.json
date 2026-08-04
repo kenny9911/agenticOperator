@@ -339,12 +339,12 @@
   {
     "id": "4",
     "name": "createJD",
-    "description": "Create JD Agent。依据招聘需求生成职位描述(JD)。调用 RoboHire generateJdDirect 产出硬性要求 hardRequirements 与加分项 niceToHave 的散文;因 generate-jd 不返回结构化技能数组,再经 proseToSkillArray 将散文拆为 must_have_skills / nice_to_have_skills 数组(jsonb 写入)。建立/映射岗位需求后发 JD_GENERATED。被人工评审驳回(JD_REJECTED)的需求也回到本节点重生成。retries=1。",
-    "submission_criteria": "1. JD_GENERATION_REQUESTED 或 JD_REJECTED 事件已送达\n2. 招聘需求(Job_Requisition)记录存在\n3. 客户信息可用",
+    "description": "Create JD Agent。依据已澄清的招聘需求生成职位描述(JD)。调用 RoboHire generateJdDirect 产出硬性要求 hardRequirements 与加分项 niceToHave 的散文;因 generate-jd 不返回结构化技能数组,再经 proseToSkillArray 将散文拆为 must_have_skills / nice_to_have_skills 数组(jsonb 写入)。建立/映射岗位需求后发 JD_GENERATED。JD_REJECTED 只记录审核驳回结果,不自动重生成。retries=1。",
+    "submission_criteria": "1. CLARIFICATION_READY 事件已送达\n2. 招聘需求(Job_Requisition)记录存在\n3. 客户信息可用",
     "object_type": "action",
     "category": "JD创建与更新",
     "actor": ["Agent"],
-    "trigger": ["JD_GENERATION_REQUESTED", "JD_REJECTED"],
+    "trigger": ["CLARIFICATION_READY"],
     "target_objects": ["Job_Posting", "Job_Requisition", "Job_Requisition_Specification", "Client", "Sourcing_Channel"],
     "inputs": [
       { "name": "job_requisition_id", "type": "String", "description": "招聘需求编号。", "source_object": "Job_Requisition.job_requisition_id", "required": true },

@@ -5,7 +5,7 @@
 // 只同步一个 SDK 端点，所有 functions 在一个 dashboard 里看见。
 //
 // RAAS-v1 main app (real production agents 6 个):
-//   REQUIREMENT_LOGGED       → createJdAgent       → JD_GENERATED
+//   CLARIFICATION_READY       → createJdAgent       → JD_GENERATED
 //   RESUME_DOWNLOADED        → resumeParserAgent   → RESUME_PROCESSED
 //   CANDIDATE_IDENTITY_REQUESTED → candidateIdentityAgent (manual audit-only)
 //                                                   → CANDIDATE_IDENTITY_CHECKED

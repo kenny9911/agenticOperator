@@ -160,8 +160,7 @@
       "Agent"
     ],
     "trigger": [
-      "CLARIFICATION_READY",
-      "JD_REJECTED"
+      "CLARIFICATION_READY"
     ],
     "actions": [
       {

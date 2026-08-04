@@ -321,10 +321,14 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
  * BEGIN / COMMIT / ROLLBACK are logged as well so a single audit line per
  * step shows the full tx boundary.
  */
-export async function withTx<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+export async function withTx<T>(
+  fn: (client: PoolClient) => Promise<T>,
+  options: { allowMirrorFallback?: boolean } = {},
+): Promise<T> {
   try {
     return await runTxOnPool(getPool(), fn);
   } catch (err) {
+    if (options.allowMirrorFallback === false) throw err;
     const mirror = getMirrorPool();
     if (mirror && isConnFailure(err)) {
       console.warn('[partner-pg] ✗ partner 不可达 → 本地镜像兜底(事务 · 开发态)');

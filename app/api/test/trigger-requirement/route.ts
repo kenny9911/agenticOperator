@@ -1,8 +1,8 @@
 // Manual trigger for REQUIREMENT_LOGGED — emits the REAL RAAS payload shape.
 //
 // Mirrors what RAAS Web Console sends after a recruiter saves the
-// 岗位信息 form. Drops a REQUIREMENT_LOGGED event onto Inngest, which
-// fans out to createJD (workflow node 4).
+// 岗位信息 form. Drops a REQUIREMENT_LOGGED event onto Inngest, which enters
+// requirement analysis + clarification; createJD starts only after READY.
 //
 // Body (all optional — sane defaults match a 谌治中-style game-tester role):
 //   {

@@ -2,19 +2,19 @@
 //
 // Direct SQL replacement for RAAS API POST /api/v1/jd/sync-generated.
 // Mirrors raas_v4/.../jd-sync.service.ts:syncJdGenerated steps 1-3.
-// Steps 4-5 (HSM notification + jd_review HitlTask) EXPLICITLY SKIPPED —
-// per 2026-05-20 architecture decision, partner subscribes to AO's
-// JD_GENERATED event to perform those side effects.
+// HSM notification + jd_review HitlTask are created by RAAS after it consumes
+// the JD_GENERATED event persisted below.
 //
-// Three writes per call, all in one transaction:
+// Writes per call, all in one transaction:
 //   1. UPDATE job_requisition       — patch 17 matching/enrichment fields (non-null only)
 //   2. UPSERT job_posting           — by job_requisition_id, publish_status='pending'
-//   3. UPDATE spec.status           — draft → pending_publish (compare-and-set)
+//   3. INSERT event_outbox          — durable JD_GENERATED delivery
 //
 // Partner source of truth (DO NOT EDIT):
 //   raas_v4/backend/apps/api/src/modules/jd/jd-sync.service.ts:21-242
 
 import { randomUUID } from 'node:crypto';
+import type { PoolClient } from 'pg';
 import { withTx } from './client';
 
 // ──────────────────────────────────────────────────────────────────────
@@ -150,6 +150,14 @@ function pickField<T = unknown>(
 // createJdAgent's existing payload composition keeps working unchanged.
 // ──────────────────────────────────────────────────────────────────────
 
+type JdGeneratedOutboxTrace = {
+  trace_id?: string | null;
+  request_id?: string | null;
+  workflow_id?: string | null;
+  parent_trace_id?: string | null;
+  [key: string]: unknown;
+};
+
 export type SyncJdInput = {
   job_requisition_id: string;
   client_id: string;
@@ -188,6 +196,18 @@ export type SyncJdInput = {
   salary_range?: string;
   search_keywords?: string[];
   jd_content?: { title?: string; salaryBenefits?: string };
+  /**
+   * Durable event written in the same Partner PG transaction as JobPosting.
+   * The source event id scopes replay idempotency. A future revision requires
+   * an explicitly re-clarified CLARIFICATION_READY event; JD_REJECTED itself
+   * never re-enters generation.
+   */
+  jd_generated_outbox?: {
+    source_event_id: string;
+    jd_content: string;
+    source_action?: string;
+    trace?: JdGeneratedOutboxTrace | null;
+  };
   // 允许其他字段透传
   [key: string]: unknown;
 };
@@ -196,8 +216,34 @@ export type SyncJdResult = {
   synced: boolean;
   job_posting_id: string;
   job_requisition_id: string;
+  jd_generated_event_id?: string;
+  jd_generated_idempotency_key?: string;
   reason?: string;
 };
+
+type ExistingJobPostingRow = {
+  job_posting_id: string;
+  status: string | null;
+  publish_status: string | null;
+  closed_at: Date | string | null;
+};
+
+type ExistingOutboxRow = {
+  event_id: string;
+  event_name: string;
+  source_action: string | null;
+  entity_type: string | null;
+  entity_id: string | null;
+  payload: unknown;
+};
+
+const REGENERATABLE_PUBLISH_STATUSES = new Set([
+  '',
+  'draft',
+  'pending',
+  'modified',
+  'rejected',
+]);
 
 // ──────────────────────────────────────────────────────────────────────
 // Main entry — replaces RAAS POST /api/v1/jd/sync-generated
@@ -235,6 +281,7 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
 
   const job_requisition_id = input.job_requisition_id;
   const client_id = input.client_id;
+  const outboxInput = input.jd_generated_outbox;
 
   if (!job_requisition_id) {
     throw new Error('[partner-pg/job-posting] missing job_requisition_id');
@@ -246,6 +293,14 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
       job_requisition_id,
       reason: 'skipped_no_client_id',
     };
+  }
+  if (outboxInput) {
+    if (!outboxInput.source_event_id?.trim()) {
+      throw new Error('[partner-pg/job-posting] missing jd_generated_outbox.source_event_id');
+    }
+    if (!outboxInput.jd_content?.trim()) {
+      throw new Error('[partner-pg/job-posting] missing jd_generated_outbox.jd_content');
+    }
   }
 
   const postingTitleField =
@@ -286,9 +341,84 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
   const salaryMax = saneSalary(textSalaryMax ?? toInt(salaryMaxRaw));
   const cityFirst = Array.isArray(city) && city.length > 0 ? city[0] : null;
 
-  // Run all 3 writes in one transaction
+  // Run JobPosting and its durable JD_GENERATED event in one transaction.
   return withTx<SyncJdResult>(async (c) => {
-    // ── Step 1: patch job_requisition matching fields (only set non-null) ──
+    // Serialize every revision of one JR across Inngest runs/workers. The table
+    // has no unique constraint on job_requisition_id, so SELECT → INSERT alone
+    // has a TOCTOU window even when function-level concurrency is configured.
+    await c.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`job_posting:${job_requisition_id}`],
+    );
+
+    const existing = await c.query<ExistingJobPostingRow>(
+      `SELECT job_posting_id, status, publish_status, closed_at
+         FROM job_posting
+        WHERE job_requisition_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE`,
+      [job_requisition_id],
+    );
+
+    const existingPosting = existing.rows[0];
+    if (existingPosting && isProtectedExistingPosting(existingPosting)) {
+      return {
+        synced: false,
+        job_posting_id: existingPosting.job_posting_id,
+        job_requisition_id,
+        reason: 'skipped_protected_existing_posting',
+      };
+    }
+
+    const replayIdempotencyKey = outboxInput
+      ? jdGeneratedIdempotencyKey(
+          job_requisition_id,
+          outboxInput.source_event_id.trim(),
+        )
+      : null;
+    if (replayIdempotencyKey && outboxInput) {
+      const replay = await findJdGeneratedOutbox(c, replayIdempotencyKey);
+      if (replay) {
+        if (!existingPosting) {
+          throw new Error(
+            `[partner-pg/job-posting] JD_GENERATED outbox exists without JobPosting: ${replayIdempotencyKey}`,
+          );
+        }
+        const replayPayload = buildJdGeneratedPayload({
+          job_posting_id: existingPosting.job_posting_id,
+          job_requisition_id,
+          client_id,
+          jd_content: outboxInput.jd_content,
+        });
+        if (
+          !sameJdGeneratedOutbox(
+            replay,
+            {
+              job_posting_id: existingPosting.job_posting_id,
+              source_action: outboxInput.source_action ?? 'createJD',
+            },
+            replayPayload,
+          )
+        ) {
+          throw new Error(
+            `[partner-pg/job-posting] JD_GENERATED outbox idempotency collision: ${replayIdempotencyKey}`,
+          );
+        }
+        return {
+          synced: false,
+          job_posting_id: existingPosting.job_posting_id,
+          job_requisition_id,
+          jd_generated_event_id: replay.event_id,
+          jd_generated_idempotency_key: replayIdempotencyKey,
+          reason: 'replayed_existing_outbox',
+        };
+      }
+    }
+
+    // Prepare the JobRequisition patch now, but apply it only after the guarded
+    // JobPosting write succeeds. That keeps a late terminal-state detection a
+    // true no-op for the whole transaction.
     const patchPairs: Array<[string, unknown]> = [];
     // must_have_skills / nice_to_have_skills 在 partner 库是 jsonb 列:必须传 JSON 文本。
     // 直接传 JS 数组会被 pg 转成 Postgres 数组字面量 {…},jsonb 解析报
@@ -317,28 +447,7 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
     if (benefits != null) patchPairs.push(['benefits', benefits]);
     if (headcountInt != null) patchPairs.push(['headcount', headcountInt]);
 
-    if (patchPairs.length > 0) {
-      // Build dynamic SET clause: col1 = $2, col2 = $3, ...
-      const setClause = patchPairs
-        .map(([col], idx) => `${col} = $${idx + 2}`)
-        .join(', ');
-      const values = patchPairs.map(([, v]) => v);
-      // updated_at handled by DB trigger / Prisma @updatedAt; we touch it explicitly.
-      await c.query(
-        `UPDATE job_requisition SET ${setClause}, updated_at = NOW() WHERE job_requisition_id = $1`,
-        [job_requisition_id, ...values],
-      );
-    }
-
-    // ── Step 2: upsert job_posting (publish_status='pending' for HSM review) ──
-    const existing = await c.query<{ job_posting_id: string }>(
-      `SELECT job_posting_id FROM job_posting
-        WHERE job_requisition_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1`,
-      [job_requisition_id],
-    );
-
+    // ── Step 1: guarded upsert job_posting (publish_status='pending') ──
     let job_posting_id: string;
     const sharedCols = [
       'posting_title',
@@ -371,13 +480,41 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
       'pending', // force HSM review
     ];
 
-    if (existing.rows.length > 0) {
-      job_posting_id = existing.rows[0]!.job_posting_id;
+    if (existingPosting) {
+      job_posting_id = existingPosting.job_posting_id;
       const setClause = sharedCols.map((col, i) => `${col} = $${i + 2}`).join(', ');
-      await c.query(
-        `UPDATE job_posting SET ${setClause}, updated_at = NOW() WHERE job_posting_id = $1`,
+      const updated = await c.query(
+        `UPDATE job_posting
+            SET ${setClause}, updated_at = NOW()
+          WHERE job_posting_id = $1
+            AND closed_at IS NULL
+            AND BTRIM(COALESCE(status::text, '')) IN ('', 'draft')
+            AND BTRIM(COALESCE(publish_status::text, '')) IN (
+              '', 'draft', 'pending', 'modified', 'rejected'
+            )`,
         [job_posting_id, ...sharedVals],
       );
+      if (updated.rowCount !== 1) {
+        const refreshed = await c.query<ExistingJobPostingRow>(
+          `SELECT job_posting_id, status, publish_status, closed_at
+             FROM job_posting
+            WHERE job_posting_id = $1
+            LIMIT 1
+            FOR UPDATE`,
+          [job_posting_id],
+        );
+        if (refreshed.rows[0] && isProtectedExistingPosting(refreshed.rows[0])) {
+          return {
+            synced: false,
+            job_posting_id,
+            job_requisition_id,
+            reason: 'skipped_protected_existing_posting',
+          };
+        }
+        throw new Error(
+          `[partner-pg/job-posting] guarded JobPosting update affected ${updated.rowCount ?? 0} rows: ${job_posting_id}`,
+        );
+      }
     } else {
       job_posting_id = randomUUID();
       // INSERT with job_posting_id + job_requisition_id + client_id + status='draft' + shared
@@ -391,28 +528,182 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
       );
     }
 
-    // ── Step 3: advance spec.status draft → pending_publish (compare-and-set) ──
-    const jrRow = await c.query<{ job_requisition_specification_id: string | null }>(
-      `SELECT job_requisition_specification_id FROM job_requisition
-        WHERE job_requisition_id = $1
-        LIMIT 1`,
-      [job_requisition_id],
-    );
-    const specId = jrRow.rows[0]?.job_requisition_specification_id ?? null;
-    if (specId) {
+    // ── Step 2: patch job_requisition matching fields (only set non-null) ──
+    if (patchPairs.length > 0) {
+      const setClause = patchPairs
+        .map(([col], idx) => `${col} = $${idx + 2}`)
+        .join(', ');
+      const values = patchPairs.map(([, v]) => v);
       await c.query(
-        `UPDATE job_requisition_specification
-            SET status = 'pending_publish', updated_at = NOW()
-          WHERE job_requisition_specification_id = $1
-            AND status = 'draft'`,
-        [specId],
+        `UPDATE job_requisition SET ${setClause}, updated_at = NOW() WHERE job_requisition_id = $1`,
+        [job_requisition_id, ...values],
       );
     }
+
+    // Per RAAS ADR-0021, generation does not advance the requirement spec.
+    // It stays draft until CHANNEL_PUBLISHED promotes it to recruiting.
+
+    const outbox = outboxInput
+      ? await appendJdGeneratedOutbox(c, {
+          job_posting_id,
+          job_requisition_id,
+          client_id,
+          source_event_id: outboxInput.source_event_id.trim(),
+          jd_content: outboxInput.jd_content,
+          source_action: outboxInput.source_action ?? 'createJD',
+          trace: outboxInput.trace ?? null,
+        })
+      : null;
 
     return {
       synced: true,
       job_posting_id,
       job_requisition_id,
+      ...(outbox
+        ? {
+            jd_generated_event_id: outbox.event_id,
+            jd_generated_idempotency_key: outbox.idempotency_key,
+          }
+        : {}),
     };
-  });
+  }, { allowMirrorFallback: false });
+}
+
+function isProtectedExistingPosting(row: ExistingJobPostingRow): boolean {
+  if (row.closed_at != null) return true;
+  const status = String(row.status ?? '').trim().toLowerCase();
+  if (status && status !== 'draft') return true;
+  return !REGENERATABLE_PUBLISH_STATUSES.has(
+    String(row.publish_status ?? '').trim().toLowerCase(),
+  );
+}
+
+function jdGeneratedIdempotencyKey(
+  jobRequisitionId: string,
+  sourceEventId: string,
+): string {
+  return `JD_GENERATED:createJD:${jobRequisitionId}:${sourceEventId}`;
+}
+
+function buildJdGeneratedPayload(input: {
+  job_posting_id: string;
+  job_requisition_id: string;
+  client_id: string;
+  jd_content: string;
+}): Record<string, unknown> {
+  return {
+    job_posting_id: input.job_posting_id,
+    job_requisition_id: input.job_requisition_id,
+    client_id: input.client_id,
+    jd_content: input.jd_content,
+  };
+}
+
+async function findJdGeneratedOutbox(
+  c: PoolClient,
+  idempotencyKey: string,
+): Promise<ExistingOutboxRow | null> {
+  const result = await c.query<ExistingOutboxRow>(
+    `SELECT event_id, event_name, source_action, entity_type, entity_id, payload
+       FROM event_outbox
+      WHERE idempotency_key = $1
+      LIMIT 1`,
+    [idempotencyKey],
+  );
+  return result.rows[0] ?? null;
+}
+
+async function appendJdGeneratedOutbox(
+  c: PoolClient,
+  input: {
+    job_posting_id: string;
+    job_requisition_id: string;
+    client_id: string;
+    source_event_id: string;
+    jd_content: string;
+    source_action: string;
+    trace: JdGeneratedOutboxTrace | null;
+  },
+): Promise<{ event_id: string; idempotency_key: string }> {
+  const eventId = randomUUID();
+  const idempotencyKey = jdGeneratedIdempotencyKey(
+    input.job_requisition_id,
+    input.source_event_id,
+  );
+  const trace = input.trace ?? null;
+  const payload = buildJdGeneratedPayload(input);
+
+  const inserted = await c.query<{ event_id: string }>(
+    `INSERT INTO event_outbox (
+       id, event_id, event_name, source_action, topic,
+       trace_id, request_id, workflow_id, parent_trace_id,
+       entity_type, entity_id, trace_payload, idempotency_key, payload,
+       status, retry_count, next_retry_at, created_at, updated_at
+     ) VALUES (
+       $1, $1, 'JD_GENERATED', $2, 'raas.events',
+       $3, $4, $5, $6,
+       'Job_Posting', $7, $8::jsonb, $9, $10::jsonb,
+       'pending', 0, NOW(), NOW(), NOW()
+     )
+     ON CONFLICT (idempotency_key) DO NOTHING
+     RETURNING event_id`,
+    [
+      eventId,
+      input.source_action,
+      trace?.trace_id ?? null,
+      trace?.request_id ?? null,
+      trace?.workflow_id ?? null,
+      trace?.parent_trace_id ?? null,
+      input.job_posting_id,
+      JSON.stringify(trace),
+      idempotencyKey,
+      JSON.stringify(payload),
+    ],
+  );
+
+  if (inserted.rows[0]?.event_id) {
+    return { event_id: inserted.rows[0].event_id, idempotency_key: idempotencyKey };
+  }
+
+  const existing = await findJdGeneratedOutbox(c, idempotencyKey);
+  if (!existing || !sameJdGeneratedOutbox(existing, input, payload)) {
+    throw new Error(
+      `[partner-pg/job-posting] JD_GENERATED outbox idempotency collision: ${idempotencyKey}`,
+    );
+  }
+  return { event_id: existing.event_id, idempotency_key: idempotencyKey };
+}
+
+function sameJdGeneratedOutbox(
+  existing: ExistingOutboxRow,
+  input: {
+    job_posting_id: string;
+    source_action: string;
+  },
+  expectedPayload: Record<string, unknown>,
+): boolean {
+  const actualPayload =
+    typeof existing.payload === 'string'
+      ? safeParseJson(existing.payload)
+      : existing.payload;
+  return (
+    existing.event_name === 'JD_GENERATED' &&
+    existing.source_action === input.source_action &&
+    existing.entity_type === 'Job_Posting' &&
+    existing.entity_id === input.job_posting_id &&
+    isRecord(actualPayload) &&
+    Object.entries(expectedPayload).every(([key, value]) => actualPayload[key] === value)
+  );
+}
+
+function safeParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
 }

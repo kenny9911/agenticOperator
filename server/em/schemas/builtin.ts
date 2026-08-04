@@ -1,4 +1,4 @@
-// Hardcoded fallback schemas for the 8 core events.
+// Hardcoded fallback schemas for core events.
 //
 // Source-of-truth contract: when EventDefinition table has a row from Neo4j,
 // the registry uses that row. When it doesn't (cold start / off-VPN / event
@@ -25,7 +25,7 @@ const TraceSchema = z
 // Most RAAS events are wrapped in an envelope:
 //   { entity_type, entity_id?, event_id, payload: {...}, trace? }
 // Permissive base — individual events tighten the payload.
-function envelope(payload: z.ZodType) {
+function envelope<T extends z.ZodTypeAny>(payload: T) {
   return z.object({
     entity_type: z.string().optional(),
     entity_id: z.union([z.string(), z.null()]).optional(),
@@ -48,12 +48,33 @@ function addResumeProcessingContractIssues(
 
 const REQUIREMENT_LOGGED_v1 = envelope(
   z.object({
-    requirement_id: z.string(),
-    client_id: z.string().optional(),
-    job_requisition_id: z.string().optional(),
+    job_requisition_id: z.string().min(1),
+    requirement_id: z.string().optional(),
+    client_id: z.string().nullable().optional(),
     title: z.string().optional(),
   }).passthrough(),
 );
+
+const CLARIFICATION_READY_v1 = envelope(
+  z.object({
+    // Gate-runner payloads include this field. Manual force_ready events use
+    // canonical envelope.entity_id only, so keep the payload field optional.
+    job_requisition_id: z.string().min(1).optional(),
+    job_requisition_specification_id: z.string().nullable().optional(),
+    client_id: z.string().nullable().optional(),
+    clarification_status: z.string().optional(),
+    clarify_questions: z.array(z.unknown()).optional(),
+    ai_summary: z.string().nullable().optional(),
+  }).passthrough(),
+).superRefine((event, ctx) => {
+  if (!event.entity_id && !event.payload.job_requisition_id) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['entity_id'],
+      message: 'CLARIFICATION_READY requires entity_id or payload.job_requisition_id',
+    });
+  }
+});
 
 const RESUME_DOWNLOADED_v1 = envelope(
   z.object({
@@ -109,8 +130,11 @@ const RESUME_PROCESSED_v1 = envelope(
 
 const JD_GENERATED_v1 = envelope(
   z.object({
+    job_posting_id: z.string().min(1),
+    jd_content: z.string().min(1),
     requirement_id: z.string().optional(),
     job_requisition_id: z.string().optional(),
+    client_id: z.string().optional(),
     jd_id: z.string().optional(),
     title: z.string().optional(),
     summary: z.string().optional(),
@@ -170,11 +194,16 @@ const MATCH_RULE_CHECK_PASSED_v1 = envelope(
 // matching_score 在 rule-check 阶段固定为 null;data 里塞 failed_rules / decision。
 const MATCH_RULE_CHECK_FAILED_v1 = envelope(MATCH_PAYLOAD_v1);
 
-// JD_REJECTED — when JD generation hits a business reject (unclear req etc.)
+// JD_REJECTED — terminal human review result. It is retained for audit and
+// downstream visibility, but deliberately has no automatic createJD subscriber.
 const JD_REJECTED_v1 = envelope(
   z.object({
-    requirement_id: z.string().optional(),
-    reason: z.string(),
+    job_requisition_id: z.string().min(1),
+    jd_id: z.string().optional(),
+    rejector_id: z.string().nullable().optional(),
+    rejection_reason_code: z.string().optional(),
+    feedback_details: z.string().optional(),
+    revision_number: z.number().int().positive().optional(),
   }).passthrough(),
 );
 
@@ -292,10 +321,17 @@ const RESUME_LOCKED_CONFLICT_v1 = envelope(
 export const BUILTIN_SCHEMAS: EventSchemaRegistration[] = [
   {
     name: "REQUIREMENT_LOGGED",
-    description: "客户提交了一条招聘需求；触发 JD 生成",
+    description: "客户提交招聘需求；进入需求分析与澄清闸，不直接生成 JD",
     versions: [{ version: "1.0", schema: REQUIREMENT_LOGGED_v1 }],
     publishers: ["raas-dashboard", "raas-bridge"],
-    subscribers: ["createJdAgent"],
+    subscribers: ["raas-backend.requirement-clarification-gate"],
+  },
+  {
+    name: "CLARIFICATION_READY",
+    description: "需求澄清已收敛；放行 AO createJdAgent 生成或重生成 JD",
+    versions: [{ version: "1.0", schema: CLARIFICATION_READY_v1 }],
+    publishers: ["raas-backend.requirement-clarification-gate"],
+    subscribers: ["ao.createJdAgent"],
   },
   {
     name: "RESUME_DOWNLOADED",
@@ -343,14 +379,14 @@ export const BUILTIN_SCHEMAS: EventSchemaRegistration[] = [
     description: "createJdAgent 输出的 JD",
     versions: [{ version: "1.0", schema: JD_GENERATED_v1 }],
     publishers: ["createJdAgent"],
-    subscribers: ["raas-backend.jd-generated-sync"],
+    subscribers: ["raas-backend.hitl-event-fanout"],
   },
   {
     name: "JD_REJECTED",
-    description: "JD 生成被业务拒绝（需澄清等）",
+    description: "RAAS 审核驳回 JD；保留审核结果，不触发自动重生成",
     versions: [{ version: "1.0", schema: JD_REJECTED_v1 }],
-    publishers: ["createJdAgent"],
-    subscribers: ["raas-backend"],
+    publishers: ["raas-backend.jd-review"],
+    subscribers: [],
   },
   {
     name: "MATCH_PASSED_NEED_INTERVIEW",

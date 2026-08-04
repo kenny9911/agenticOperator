@@ -1,8 +1,7 @@
 // createJD agent — Workflow node 4.
 //
-// Subscribes REQUIREMENT_LOGGED → 拼一段 prompt → 调 RAAS API
-// /api/v1/generate-jd → 调 /api/v1/jd/sync-generated 持久化 → emit
-// JD_GENERATED 事件供下游 cascade.
+// Subscribes CLARIFICATION_READY → 生成 JD → 在 Partner PG
+// 同一事务写 JobPosting + JD_GENERATED outbox，由 RAAS dispatcher 可靠投递。
 //
 // Workflow A (per agentic-operator-onboarding(3).md, 2026-05-08;
 //   F4 direct-RoboHire migration 2026-05-19):
@@ -10,13 +9,11 @@
 //   ❌ 不再自己组装 partner-canonical 15 字段 payload (RAAS 处理)
 //   ❌ 不再走 RAAS /api/v1/generate-jd 透传 (PR-4 删除)
 //   ✅ 调 robohire-client.generateJdDirect (直连 RoboHire /api/v1/jobs/generate-jd)
-//   ✅ 调 raas-api-client.syncJdGenerated 持久化到 RAAS DB (写 JobPosting +
-//       回填 JobRequisition + 推进 spec.status → pending_publish)
+//   ✅ 直写 Partner PG (JobPosting + JobRequisition enrichment + event_outbox)
 //
-// Inbound:  REQUIREMENT_LOGGED { entity_type, payload: { raw_input_data: {...28} } }
+// Inbound:  CLARIFICATION_READY
 // Outbound: JD_GENERATED       JD content + bookkeeping (cascade only)
 
-import { randomUUID } from 'node:crypto';
 import { NonRetriableError } from 'inngest';
 import { isPartnerPgConfigured } from '@/lib/partner-pg/client';
 import {
@@ -52,7 +49,7 @@ import {
   writeJobPostingInstance,
   writeJobRequisitionInstance,
 } from '@/lib/allmeta-writers';
-import { inngest, type JdGeneratedEnvelope } from '@/server/inngest/client';
+import { inngest } from '@/server/inngest/client';
 import { skipIfRaasV1Paused } from '@/server/inngest/raas-v1';
 import { createAgentLogger, runWithLogger } from '@/lib/agent-logger';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
@@ -71,6 +68,7 @@ type RaasRequirementPayload = {
   client_id?: string;
   is_urgent?: boolean;
   requirement_id?: string;
+  job_requisition_id?: string;
   source_channel?: string | null;
   /** Free-text 简报 (新格式优先；如缺则从 raw_input_data 拼). */
   requirement_brief?: string;
@@ -103,7 +101,7 @@ type RaasRequirementPayload = {
   };
 };
 
-type RequirementLoggedEnvelope = {
+type ClarificationReadyEnvelope = {
   entity_type?: string;
   entity_id?: string | null;
   event_id?: string;
@@ -125,11 +123,14 @@ export const createJdAgent = inngest.createFunction(
     // bug 无法区分。给瞬时厂商故障 3 次带退避的机会;真·终态(auth/empty/AO 侧
     // bad-request)走 NonRetriableError → 依旧 0 重试、立刻失败,不受影响。
     retries: 3,
-    triggers: [
-      { event: 'REQUIREMENT_LOGGED' },
-      { event: 'CLARIFICATION_READY' },
-      { event: 'JD_REJECTED' },
-    ],
+    idempotency: 'event.data.event_id',
+    concurrency: {
+      key:
+        'has(event.data.payload.job_requisition_id) ? ' +
+        'event.data.payload.job_requisition_id : event.data.entity_id',
+      limit: 1,
+    },
+    triggers: [{ event: 'CLARIFICATION_READY' }],
   },
   async ({ event, step, logger, runId }) => {
     const paused = await skipIfRaasV1Paused(AGENT_ID, logger);
@@ -141,7 +142,7 @@ export const createJdAgent = inngest.createFunction(
       );
     }
 
-    const envelope = (event.data ?? {}) as RequirementLoggedEnvelope;
+    const envelope = (event.data ?? {}) as ClarificationReadyEnvelope;
     const traceId = getTraceId(event.data);
     const requisitionIdCandidate = pickRequisitionIdFromEnvelope(envelope);
     const fileLogger = createAgentLogger({
@@ -157,8 +158,8 @@ export const createJdAgent = inngest.createFunction(
     });
 
     // ── 1. 从事件取 entity_id (= job_requisition_id) ──
-    // 新流程: RAAS 在事件里只放 entity_id，agent 主动调
-    // GET /api/v1/requirements/:id 拉详情。entity_id 缺失时兼容老格式
+    // RAAS 闸门事件可只放 entity_id，agent 直读 Partner PG 拉详情。
+    // entity_id 缺失时兼容旧 payload 形状
     // (payload.raw_input_data.job_requisition_id / payload.requirement_id)。
     const requisitionId = requisitionIdCandidate;
     if (!requisitionId) {
@@ -167,7 +168,13 @@ export const createJdAgent = inngest.createFunction(
         event_name: event.name,
       });
       throw new NonRetriableError(
-        `[${AGENT_NAME}] ${event.name} 缺 entity_id / requisition_id —— 无法调 GET /requirements/:id`,
+        `[${AGENT_NAME}] ${event.name} 缺 entity_id / requisition_id —— 无法读取需求详情`,
+      );
+    }
+    const sourceEventId = pickSourceEventId(envelope, event.id);
+    if (!sourceEventId) {
+      throw new NonRetriableError(
+        `[${AGENT_NAME}] ${event.name} 缺 event_id —— 无法建立 JD_GENERATED 幂等 outbox`,
       );
     }
 
@@ -411,8 +418,13 @@ export const createJdAgent = inngest.createFunction(
     // 实体数据(title / responsibility / requirement / key_words /
     // recruitment_type / work_years 等 Job_Posting impacted_properties)全部
     // 写进 partner Postgres,partner 订阅 JD_GENERATED 后从表里读。
-    // 事件本身只携带 2 个字段(canonical):job_posting_id + jd_content。
-    const syncResult = await step.run(`sync-jd-${sanitize(requisitionId)}`, async () => {
+    // JD_GENERATED outbox 与岗位在同一 Partner PG 事务提交；事务任一步失败
+    // 都不会留下“岗位存在但审核事件永远丢失”的半成品。
+    const jdContent = assembleJdContent(jdData);
+    // v2 is intentional: old in-flight runs may have memoized the pre-outbox
+    // sync-jd step. A new id forces one replay-safe execution that ensures the
+    // durable outbox row exists before this run can finish.
+    const syncResult = await step.run(`sync-jd-outbox-v2-${sanitize(requisitionId)}`, async () => {
       const input: SyncJdInput = {
         job_requisition_id: requisitionId,
         client_id: clientId,
@@ -429,6 +441,12 @@ export const createJdAgent = inngest.createFunction(
         interview_mode: stringOrUndefined(requirement.interview_mode),
         recruitment_type: stringOrUndefined(requirement.recruitment_type),
         city: pickCityFromBoth(requirement, jdData),
+        jd_generated_outbox: {
+          source_event_id: sourceEventId,
+          jd_content: jdContent,
+          source_action: 'createJD',
+          trace: envelope.trace ?? null,
+        },
       };
       const r = await syncJdToPartnerPg(input);
       logger.info(
@@ -440,9 +458,54 @@ export const createJdAgent = inngest.createFunction(
     });
 
     const jobPostingId = syncResult.job_posting_id;
+    if (syncResult.reason === 'skipped_protected_existing_posting') {
+      logger.info(
+        `[${AGENT_NAME}] skipped protected existing JobPosting · ` +
+          `job_posting_id=${jobPostingId} requisition=${requisitionId}`,
+      );
+      fileLogger.event('handler.skipped', {
+        reason: syncResult.reason,
+        job_posting_id: jobPostingId,
+        job_requisition_id: requisitionId,
+      });
+      return {
+        ok: true,
+        skipped: true,
+        reason: syncResult.reason,
+        job_posting_id: jobPostingId,
+        requisition_id: requisitionId,
+        client_id: clientId,
+      };
+    }
+    if (syncResult.reason === 'replayed_existing_outbox') {
+      logger.info(
+        `[${AGENT_NAME}] source event already has JD_GENERATED outbox · ` +
+          `event_id=${syncResult.jd_generated_event_id ?? '?'} requisition=${requisitionId}`,
+      );
+      fileLogger.event('handler.replayed', {
+        event_id: syncResult.jd_generated_event_id ?? null,
+        job_posting_id: jobPostingId,
+        job_requisition_id: requisitionId,
+      });
+      return {
+        ok: true,
+        replayed: true,
+        reason: syncResult.reason,
+        job_posting_id: jobPostingId,
+        jd_generated_event_id: syncResult.jd_generated_event_id ?? null,
+        requisition_id: requisitionId,
+        client_id: clientId,
+      };
+    }
     if (!jobPostingId) {
       throw new NonRetriableError(
         `[${AGENT_NAME}] partner-pg syncJdToPartnerPg 没返回 job_posting_id (reason=${syncResult.reason ?? '?'})`,
+      );
+    }
+    const jdGeneratedEventId = syncResult.jd_generated_event_id;
+    if (!jdGeneratedEventId) {
+      throw new NonRetriableError(
+        `[${AGENT_NAME}] partner-pg 未返回 JD_GENERATED outbox event_id`,
       );
     }
 
@@ -465,40 +528,14 @@ export const createJdAgent = inngest.createFunction(
       return r;
     });
 
-    // ── 6. emit JD_GENERATED (canonical schema — events_v0_1_002.json)──
-    //
-    // canonical event_data:job_posting_id + jd_content。
-    // partner 便利 FK:job_requisition_id + client_id(对齐 REQUIREMENT_LOGGED
-    // 把 FK 平铺在 payload 顶层的习惯,让订阅者一查就到位)。
-    // 其他实体数据(title/responsibility/requirement/...)由 partner-pg 写入
-    // partner Postgres job_posting 表;partner 订阅事件后从表里读。
-    const outboundEnvelope: JdGeneratedEnvelope = {
-      entity_type: 'Job_Posting',
-      entity_id: jobPostingId,
-      event_id: randomUUID(),
-      source_action: 'createJD',
-      payload: {
-        job_posting_id: jobPostingId,
-        job_requisition_id: requisitionId,
-        client_id: clientId,
-        jd_content: assembleJdContent(jdData),
-      },
-      trace: (envelope.trace as Record<string, unknown> | undefined) ?? {
-        trace_id: null,
-        request_id: null,
-        workflow_id: null,
-        parent_trace_id: null,
-      },
-    };
-
-    fileLogger.event('emit.jd-generated', {
+    // ── 6. JD_GENERATED 已在 Step 5 进入 RAAS durable outbox ──
+    // 只允许 RAAS OutboxDispatcher 发布，AO 不再作为第二个 publisher 直发，
+    // 以免 dispatcher 竞跑造成双投；下游仍按 event_id 做防御性幂等。
+    fileLogger.event('outbox.jd-generated', {
+      event_id: jdGeneratedEventId,
       job_posting_id: jobPostingId,
       job_requisition_id: requisitionId,
       client_id: clientId,
-    });
-    await step.sendEvent(`emit-jd-generated-${sanitize(requisitionId)}`, {
-      name: 'JD_GENERATED',
-      data: outboundEnvelope,
     });
     await notifyRecruitmentLifecycle(step, 'JD_GENERATED', {
       anchors: { job_requisition_id: requisitionId, client_id: clientId },
@@ -507,10 +544,12 @@ export const createJdAgent = inngest.createFunction(
     });
 
     logger.info(
-      `[${AGENT_NAME}] ✅ emitted JD_GENERATED · job_posting_id=${jobPostingId} requisition=${requisitionId}`,
+      `[${AGENT_NAME}] ✅ enqueued JD_GENERATED · event_id=${jdGeneratedEventId} ` +
+        `job_posting_id=${jobPostingId} requisition=${requisitionId}`,
     );
     fileLogger.event('handler.done', {
       job_posting_id: jobPostingId,
+      jd_generated_event_id: jdGeneratedEventId,
       requisition_id: requisitionId,
       robohire_request_id: generated.requestId,
     });
@@ -518,6 +557,7 @@ export const createJdAgent = inngest.createFunction(
     return {
       ok: true,
       job_posting_id: jobPostingId,
+      jd_generated_event_id: jdGeneratedEventId,
       requisition_id: requisitionId,
       client_id: clientId,
       title: typeof jdData.title === 'string' ? jdData.title : null,
@@ -565,26 +605,38 @@ function assembleJdContent(jdData: RobohireGenerateJdData): string {
 // ──────────────────────────────────────────────────────────────────────
 
 /**
- * 从 REQUIREMENT_LOGGED envelope 取 job_requisition_id.
+ * 从 CLARIFICATION_READY envelope 取 job_requisition_id.
  *
  * 优先级:
  *   1. event.data.entity_id  ← Workflow A 标准位置 (RAAS canonical)
- *   2. payload.requirement_id / payload.raw_input_data.job_requisition_id
+ *   2. payload.job_requisition_id
+ *   3. payload.requirement_id / payload.raw_input_data.job_requisition_id
  *      ← 老 envelope 兼容
  */
 function pickRequisitionIdFromEnvelope(
-  envelope: RequirementLoggedEnvelope,
+  envelope: ClarificationReadyEnvelope,
 ): string | null {
   if (typeof envelope.entity_id === 'string' && envelope.entity_id.trim()) {
     return envelope.entity_id.trim();
   }
   const payload = envelope.payload ?? (envelope as unknown as RaasRequirementPayload);
   const cands: Array<unknown> = [
+    payload?.job_requisition_id,
     payload?.requirement_id,
     payload?.raw_input_data?.job_requisition_id,
   ];
   for (const c of cands) {
     if (typeof c === 'string' && c.trim().length > 0) return c.trim();
+  }
+  return null;
+}
+
+function pickSourceEventId(
+  envelope: ClarificationReadyEnvelope,
+  inngestEventId: unknown,
+): string | null {
+  for (const candidate of [envelope.event_id, inngestEventId]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
   }
   return null;
 }

@@ -1,7 +1,7 @@
 [
   {
-    "name": "JD_GENERATION_REQUESTED",
-    "description": "招聘需求澄清完成后,触发 Create JD Agent 自动生成职位描述。本事件是 JD 分支的起点,由需求侧(人工/外部系统)产出,不在本 6-agent 子图内由 Agent 生成。",
+    "name": "CLARIFICATION_READY",
+    "description": "招聘需求澄清完成后,触发 Create JD Agent 自动生成职位描述。本事件是 JD 分支的唯一起点,由需求澄清闸产出。",
     "payload": {
       "source_action": "",
       "event_data": [
@@ -13,7 +13,7 @@
   },
   {
     "name": "JD_REJECTED",
-    "description": "JD 初稿经人工评审被驳回,携带驳回原因,触发 Create JD Agent 重新生成。",
+    "description": "JD 初稿经人工评审被驳回,携带驳回原因;记录审核结果并停止自动生成,等待人工处理。",
     "payload": {
       "source_action": "",
       "event_data": [

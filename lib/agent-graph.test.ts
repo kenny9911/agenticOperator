@@ -16,10 +16,10 @@ describe('upstreamOf', () => {
     expect(manualEntry?.viaEvents).toEqual(['REQUIREMENT_LOGGED']);
   });
 
-  it('returns Clarifier + JDReviewer for JDGenerator (via CLARIFICATION_READY + JD_REJECTED)', () => {
+  it('returns only Clarifier upstream for JDGenerator via CLARIFICATION_READY', () => {
     const ups = upstreamOf('JDGenerator');
     const shorts = ups.map((u) => u.agent.short).sort();
-    expect(shorts).toEqual(['Clarifier', 'JDReviewer']);
+    expect(shorts).toEqual(['Clarifier']);
   });
 
   it('returns empty for unknown agent', () => {
