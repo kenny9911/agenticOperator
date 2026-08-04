@@ -19,9 +19,17 @@
 
 import { Inngest } from "inngest";
 import { WriteThroughMiddleware } from "./write-through-middleware";
+import type { ResumeProcessingMode } from '@/lib/raas-v1/resume-processing-contract';
+
+export type ResumeProcessingContractData = {
+  contract_version?: number;
+  processing_mode?: ResumeProcessingMode;
+  processing_reason?: 'rmhr_email_not_found' | null;
+  operator_id?: string | null;
+};
 
 // ─── §3.1 输入事件（来自 RAAS）──────────────────────────────
-export type ResumeDownloadedData = {
+export type ResumeDownloadedData = ResumeProcessingContractData & {
   bucket: string;
   objectKey: string;
   filename: string;
@@ -37,6 +45,9 @@ export type ResumeDownloadedData = {
    * 本地测试发布时若缺失，可以用 etag 兜底（见 scripts/publish-test-event.ts）。
    */
   upload_id?: string;
+  job_requisition_id?: string | null;
+  job_requisition_ids?: string[];
+  job_posting_id?: string | null;
 };
 
 // ─── §3.2 RAAS 期望的解析结果（4 对象嵌套）────────────────
@@ -87,7 +98,7 @@ export type RuntimeNested = {
   current_company: string | null;
 };
 
-export type ResumeProcessedData = {
+export type ResumeProcessedData = ResumeProcessingContractData & {
   bucket: string;
   objectKey: string;
   filename: string;
@@ -115,6 +126,8 @@ export type ResumeProcessedData = {
   // ADR-0040 — RAAS Nextcloud 路径预填的窄化客户需求 id 数组（单数 job_requisition_id
   // 为空时，ruleCheckAgent 直接循环这些 id 取详情撮合，跳过 path-B 名下全量扫描）。
   job_requisition_ids?: string[];
+  /** Explicit Job_Posting anchor, resolved to its parent JR by ruleCheckAgent. */
+  job_posting_id?: string | null;
   // 来源渠道(RAAS 在 RESUME_DOWNLOADED 里给 → AO 透传 → 下游 / partner 重新订阅时仍可见)
   sourcing_channel_id?: string | null;
   // 客户(用于下游 matcher 的 client 维度过滤)
@@ -129,7 +142,7 @@ export type ResumeProcessedData = {
 //
 // 见 docs/superpowers/specs/2026-05-19-raas-integration-divergence-fixes-design.md §4
 
-export type MatchEventData = {
+export type MatchEventData = ResumeProcessingContractData & {
   /** ★ 路径 A/B 收敛后的具体岗位 ID(必填) */
   job_requisition_id: string;
   /** ★ 候选人 ID;无显式 null */
@@ -386,11 +399,12 @@ export type RuleCheckRuntimeContext = {
  * Plus partner conv 字段:upload_id / employee_id / audit / job_requisition /
  * parsed_resume / runtime_context — matchResumeAgent 第二段需要这些避免反查。
  */
-export type MatchRuleCheckPassedData = {
+export type MatchRuleCheckPassedData = ResumeProcessingContractData & {
   // ── canonical event_data(必带,partner 直接读)──
   candidate_id: string | null;
   resume_id: string | null;
   job_requisition_id: string;
+  job_posting_id?: string | null;
   client_id: string;
   /** Canonical: '通过'(2026-05-26 起 PASS 路径只剩 '通过';pending/REVIEW 已折成 PASS) */
   rule_check_result: '通过';
@@ -446,11 +460,12 @@ export type MatchRuleCheckPassedData = {
  * canonical event_data 顶层平铺 + F3 兼容字段。partner dispatcher 看顶层
  * `rule_check_result` 直接路由(不用解构 data)。
  */
-export type MatchRuleCheckFailedData = {
+export type MatchRuleCheckFailedData = ResumeProcessingContractData & {
   // ── canonical event_data ──
   candidate_id: string | null;
   resume_id: string | null;
   job_requisition_id: string;
+  job_posting_id?: string | null;
   client_id: string;
   rule_check_result: '未通过';
   rule_check_reason: string;

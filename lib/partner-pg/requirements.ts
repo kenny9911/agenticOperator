@@ -59,6 +59,45 @@ export async function getRequirementDetail(
   };
 }
 
+export type RequirementDetailByJobPosting = RequirementDetail & {
+  job_posting_id: string;
+};
+
+/**
+ * Resolve an explicit Job_Posting anchor to its parent Job_Requisition and
+ * hydrate the same requirement shape consumed by ruleCheckAgent.
+ */
+export async function getRequirementDetailByJobPostingId(
+  jobPostingId: string,
+): Promise<RequirementDetailByJobPosting | null> {
+  const sql = `
+    SELECT
+      p.job_posting_id,
+      row_to_json(r.*) AS requirement_json,
+      row_to_json(s.*) AS specification_json
+    FROM job_posting p
+    JOIN job_requisition r
+      ON r.job_requisition_id = p.job_requisition_id
+    LEFT JOIN job_requisition_specification s
+      ON s.job_requisition_specification_id = r.job_requisition_specification_id
+    WHERE p.job_posting_id = $1
+    LIMIT 1
+  `;
+  const result = await query<{
+    job_posting_id: string;
+    requirement_json: JobRequisition;
+    specification_json: JobRequisitionSpecification | null;
+  }>(sql, [jobPostingId]);
+  const row = result.rows[0];
+  if (!row) return null;
+
+  return {
+    ...row.requirement_json,
+    specification: row.specification_json,
+    job_posting_id: row.job_posting_id,
+  };
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // client — 公司上下文(createJD 入参优化, design 2026-07-21 §2)
 // ──────────────────────────────────────────────────────────────────────

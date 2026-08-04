@@ -8,6 +8,7 @@
 
 import { z } from "zod";
 import type { EventSchemaRegistration } from "./types";
+import { validateResumeProcessingContract } from '@/lib/raas-v1/resume-processing-contract';
 
 // ── Common envelope sub-schemas ───────────────────────────────────────────
 
@@ -32,6 +33,15 @@ function envelope(payload: z.ZodType) {
     payload,
     trace: TraceSchema,
   });
+}
+
+function addResumeProcessingContractIssues(
+  payload: Record<string, unknown>,
+  ctx: z.RefinementCtx,
+) {
+  for (const issue of validateResumeProcessingContract(payload)) {
+    ctx.addIssue({ code: 'custom', path: [issue.path], message: issue.message });
+  }
 }
 
 // ── Event schemas ─────────────────────────────────────────────────────────
@@ -73,7 +83,7 @@ const RESUME_DOWNLOADED_v1 = envelope(
       .nullable()
       .optional(),
     received_at: z.string().optional(),
-  }).passthrough(),
+  }).passthrough().superRefine(addResumeProcessingContractIssues),
 );
 
 // 2026-05-24: upload_id 由必填改可选 — RaaS Web Console "更换关联岗位" / "匹配
@@ -94,7 +104,7 @@ const RESUME_PROCESSED_v1 = envelope(
       })
       .optional(),
     job_requisition_id: z.string().optional(),
-  }).passthrough(),
+  }).passthrough().superRefine(addResumeProcessingContractIssues),
 );
 
 const JD_GENERATED_v1 = envelope(
@@ -120,7 +130,8 @@ const MATCH_PAYLOAD_v1 = z
     job_posting_id: z.string().nullable().optional(),
     jd_id: z.string().optional(),
   })
-  .passthrough();
+  .passthrough()
+  .superRefine(addResumeProcessingContractIssues);
 
 const MATCH_PASSED_NEED_INTERVIEW_v1 = envelope(MATCH_PAYLOAD_v1);
 const MATCH_PASSED_NO_INTERVIEW_v1 = envelope(MATCH_PAYLOAD_v1);
@@ -152,7 +163,7 @@ const MATCH_RULE_CHECK_PASSED_v1 = envelope(
     parsed_resume: z.record(z.string(), z.unknown()).nullable().optional(),
     parsed_content: z.string().nullable().optional(),
     runtime_context: z.record(z.string(), z.unknown()).optional(),
-  }).passthrough(),
+  }).passthrough().superRefine(addResumeProcessingContractIssues),
 );
 
 // MATCH_RULE_CHECK_FAILED — ruleCheckAgent rule-check 失败时 emit;

@@ -51,11 +51,17 @@ vi.mock('@/lib/rule-check/ontology', () => ({
   severityForRuleId: vi.fn(() => 'low'),
 }));
 vi.mock('@/lib/partner-pg/client', () => ({ isPartnerPgConfigured: vi.fn(() => true) }));
-vi.mock('@/lib/partner-pg/requirements', () => ({ getRequirementDetail: vi.fn() }));
+vi.mock('@/lib/partner-pg/requirements', () => ({
+  getRequirementDetail: vi.fn(),
+  getRequirementDetailByJobPostingId: vi.fn(),
+}));
 vi.mock('@/lib/partner-pg/agent-view', () => ({ getRequirementsAgentView: vi.fn() }));
 vi.mock('@/lib/partner-pg/recruiting-jobs', () => ({ getRecruitingJobsAsRequirements: vi.fn() }));
 vi.mock('@/lib/partner-pg/parsed-resume', () => ({ getParsedResume: vi.fn() }));
 vi.mock('@/lib/partner-pg/rule-check-result', () => ({ saveRuleCheckFailToPartnerPg: vi.fn() }));
+vi.mock('@/server/notifications/ingest', () => ({
+  recordNotification: vi.fn(async () => ({ id: 'notification-test' })),
+}));
 vi.mock('@/lib/allmeta-writers', () => ({
   writeJobRequisitionInstance: vi.fn(async () => ({ ok: true })),
   writeCandidateMatchResultInstance: vi.fn(async () => ({ ok: true })),
@@ -63,12 +69,16 @@ vi.mock('@/lib/allmeta-writers', () => ({
 
 import { ruleCheckAgentHandler } from './rule-check-agent';
 import { runRuleCheck } from '@/lib/rule-check';
-import { getRequirementDetail } from '@/lib/partner-pg/requirements';
+import {
+  getRequirementDetail,
+  getRequirementDetailByJobPostingId,
+} from '@/lib/partner-pg/requirements';
 import { getRequirementsAgentView } from '@/lib/partner-pg/agent-view';
 import { getRecruitingJobsAsRequirements } from '@/lib/partner-pg/recruiting-jobs';
 
 const mockRunRuleCheck = runRuleCheck as ReturnType<typeof vi.fn>;
 const mockGetRequirementDetail = getRequirementDetail as ReturnType<typeof vi.fn>;
+const mockGetRequirementByPosting = getRequirementDetailByJobPostingId as ReturnType<typeof vi.fn>;
 const mockGetRequirementsAgentView = getRequirementsAgentView as ReturnType<typeof vi.fn>;
 const mockGetRecruitingJobs = getRecruitingJobsAsRequirements as ReturnType<typeof vi.fn>;
 
@@ -178,6 +188,75 @@ describe("ruleCheckAgent — path B' (ADR-0040 预填 job_requisition_ids)", () 
     expect(mockGetRecruitingJobs).not.toHaveBeenCalled();
     expect(step.sent).toHaveLength(1);
     expect(step.sent[0].data.job_requisition_id).toBe('JRX');
+  });
+
+  it('显式 JP 在无 JR 时解析到父 JR,并优先于 operator 岗位范围', async () => {
+    mockGetRequirementByPosting.mockResolvedValue({
+      ...detailFor('JR-FROM-JP'),
+      job_posting_id: 'JP-EXPLICIT',
+    });
+    mockRunRuleCheck.mockResolvedValue(PASS as any);
+
+    const step = mockStep();
+    await ruleCheckAgentHandler({
+      event: evt({
+        employee_id: null,
+        operator_id: 'EMP-OPERATOR',
+        contract_version: 2,
+        processing_mode: 'rmhr_deferred',
+        processing_reason: 'rmhr_email_not_found',
+        job_requisition_id: null,
+        job_posting_id: 'JP-EXPLICIT',
+        job_requisition_ids: [],
+      }) as any,
+      step: step as any,
+      logger: mockLogger as any,
+    });
+
+    expect(mockGetRequirementByPosting).toHaveBeenCalledWith('JP-EXPLICIT');
+    expect(mockGetRecruitingJobs).not.toHaveBeenCalled();
+    expect(step.sent).toHaveLength(1);
+    expect(step.sent[0].data).toMatchObject({
+      job_requisition_id: 'JR-FROM-JP',
+      job_posting_id: 'JP-EXPLICIT',
+      operator_id: 'EMP-OPERATOR',
+      contract_version: 2,
+      processing_mode: 'rmhr_deferred',
+      processing_reason: 'rmhr_email_not_found',
+    });
+  });
+
+  it('rmhr_deferred 无显式岗位时只用 operator_id 扫描,不回落默认员工', async () => {
+    const previousDefault = process.env.RAAS_DEFAULT_EMPLOYEE_ID;
+    process.env.RAAS_DEFAULT_EMPLOYEE_ID = 'EMP-WRONG-DEFAULT';
+    mockGetRecruitingJobs.mockResolvedValue({ items: [] });
+    try {
+      const step = mockStep();
+      await ruleCheckAgentHandler({
+        event: evt({
+          employee_id: null,
+          operator_id: 'EMP-OPERATOR',
+          contract_version: 2,
+          processing_mode: 'rmhr_deferred',
+          processing_reason: 'rmhr_email_not_found',
+          job_requisition_id: null,
+          job_posting_id: null,
+          job_requisition_ids: [],
+        }) as any,
+        step: step as any,
+        logger: mockLogger as any,
+      });
+    } finally {
+      if (previousDefault === undefined) delete process.env.RAAS_DEFAULT_EMPLOYEE_ID;
+      else process.env.RAAS_DEFAULT_EMPLOYEE_ID = previousDefault;
+    }
+
+    expect(mockGetRecruitingJobs).toHaveBeenCalledWith(
+      expect.objectContaining({ claimerEmployeeId: 'EMP-OPERATOR' }),
+    );
+    expect(mockGetRecruitingJobs).not.toHaveBeenCalledWith(
+      expect.objectContaining({ claimerEmployeeId: 'EMP-WRONG-DEFAULT' }),
+    );
   });
 
   it('数组与单数都空时落到 path-B 名下全量扫描', async () => {

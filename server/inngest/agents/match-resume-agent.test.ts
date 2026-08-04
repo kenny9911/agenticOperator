@@ -236,6 +236,34 @@ describe('matchResumeAgentHandler — pre-RoboHire rule-check gate', () => {
     expect(payload.jd).toContain('系统注入,非岗位 JD 原文');
     expect(payload.jd).toContain('10-25 学历底线:通过');
   });
+
+  it('propagates rmhr_deferred contract and job anchors to the terminal MATCH event', async () => {
+    const { calls } = await runHandler(
+      passedData({
+        employee_id: 'EMP-OPERATOR',
+        operator_id: 'EMP-OPERATOR',
+        contract_version: 2,
+        processing_mode: 'rmhr_deferred',
+        processing_reason: 'rmhr_email_not_found',
+        job_posting_id: 'JP1',
+      }),
+    );
+
+    const terminal = calls.events.find(({ payload }) =>
+      payload.name === 'MATCH_PASSED_NEED_INTERVIEW' || payload.name === 'MATCH_FAILED',
+    );
+    expect(terminal?.payload.data).toMatchObject({
+      job_requisition_id: 'JR1',
+      job_posting_id: 'JP1',
+      operator_id: 'EMP-OPERATOR',
+      contract_version: 2,
+      processing_mode: 'rmhr_deferred',
+      processing_reason: 'rmhr_email_not_found',
+    });
+    expect(
+      calls.events.some(({ payload }) => payload.name.startsWith('INTERVIEW_INVITATION_')),
+    ).toBe(false);
+  });
 });
 
 describe('matchResumeAgentHandler — 候选人期望接入 candidatePreferences', () => {

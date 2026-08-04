@@ -39,6 +39,7 @@ import { extractCandidateExpectation } from '@/lib/mappers/candidate-preferences
 import {
   normalizeCandidateExpectationPayload,
 } from '@/lib/raas-v1/candidate-expectation';
+import { parseResumeProcessingContract } from '@/lib/raas-v1/resume-processing-contract';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
 import { reportDependencyDegraded } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
@@ -79,6 +80,16 @@ export const resumeParserAgent = inngest.createFunction(
     //   B) Flat (legacy / publish-test) —
     //      { upload_id, bucket, object_key, parsed, ... }
     const raw = unwrapDownloadedEnvelope(event.data);
+    let processingContract;
+    try {
+      processingContract = parseResumeProcessingContract(raw);
+    } catch (error) {
+      throw new NonRetriableError(
+        `[resume-processing-contract] invalid RESUME_DOWNLOADED: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
     const expectationPayload = normalizeCandidateExpectationPayload(
       raw.expectation_payload ?? raw.expectationPayload,
     );
@@ -100,6 +111,10 @@ export const resumeParserAgent = inngest.createFunction(
       object_key: raw.object_key ?? raw.objectKey,
       filename: raw.filename,
       employee_id: raw.employee_id ?? raw.employeeId ?? raw.operator_employee_id ?? null,
+      operator_id: processingContract?.operator_id ?? raw.operator_id ?? null,
+      processing_mode: processingContract?.processing_mode ?? null,
+      processing_reason: processingContract?.processing_reason ?? null,
+      contract_version: processingContract?.contract_version ?? null,
       locked_by_employee_id: raw.locked_by_employee_id ?? raw.lockedByEmployeeId ?? null,
       client_id: raw.client_id ?? null,
       job_requisition_id: raw.job_requisition_id ?? null,
@@ -127,9 +142,25 @@ export const resumeParserAgent = inngest.createFunction(
     const eventEtag = raw.etag ?? null; // 可能是 null (RAAS 手动上传链路没填)
     const filename = raw.filename;
     const employeeId = raw.employee_id ?? raw.employeeId ?? raw.operator_employee_id ?? null;
-    const operator_id = raw.operator_id ?? null;
+    const operator_id =
+      processingContract?.operator_id ??
+      (typeof raw.operator_id === 'string' && raw.operator_id.trim()
+        ? raw.operator_id.trim()
+        : null);
+    // File-level uploader attribution may use the operator when RAAS
+    // intentionally clears employee_id for rmhr_deferred. Candidate ownership
+    // remains independent and is derived only from locked_by_employee_id.
+    const resumeUploaderEmployeeId =
+      typeof employeeId === 'string' && employeeId.trim()
+        ? employeeId.trim()
+        : operator_id;
     const client_id = raw.client_id ?? null;
     const job_requisition_id = raw.job_requisition_id ?? null;
+    const job_posting_id =
+      typeof (raw.job_posting_id ?? raw.jobPostingId) === 'string' &&
+      (raw.job_posting_id ?? raw.jobPostingId).trim()
+        ? (raw.job_posting_id ?? raw.jobPostingId).trim()
+        : null;
     // RAAS Nextcloud 路径(ADR-0040)在 RESUME_DOWNLOADED 预填窄化后的客户需求 id
     // 数组:已按「文件名岗位名 × 招聘员名下在招岗位」模糊匹配收敛。透传给下游
     // ruleCheckAgent,使其直接对这些 JR 撮合,而非按 employee_id 扫名下全部在招岗位。
@@ -338,7 +369,7 @@ export const resumeParserAgent = inngest.createFunction(
         etag: finalEtag,
         size: typeof file_size === 'number' ? file_size : null,
         filename: filename ?? undefined,
-        employee_id: employeeId ?? undefined,
+        employee_id: resumeUploaderEmployeeId ?? undefined,
         locked_by_employee_id: locked_by_employee_id ?? undefined,
         locked_at: locked_at ?? undefined,
         lock_observed_at: lock_observed_at ?? undefined,
@@ -476,7 +507,7 @@ export const resumeParserAgent = inngest.createFunction(
         resume_id: saveResult.resume_id,
         candidate_id: saveResult.candidate_id,
         job_requisition_id: job_requisition_id ?? null,
-        employee_id: employeeId,
+        employee_id: resumeUploaderEmployeeId,
         file_path: object_key,
         parsed: parsed as unknown as Record<string, unknown>,
       });
@@ -494,8 +525,14 @@ export const resumeParserAgent = inngest.createFunction(
     // (运行轨迹里不再出现 rmhr-lock-check,主流程零影响);恢复 = 打开开关,代码不动。
     // 开启时:调公司 RMHR uploadByRecruiterEmail(上传+锁定合一)拿当前锁定真相、
     // 刷新 AO 认知并据此放行/拦截。
+    const rmhrDeferred = processingContract?.processing_mode === 'rmhr_deferred';
+    if (rmhrDeferred && process.env.LOCK_CHECK_ENABLED === '1') {
+      logger.info(
+        '[resumeParser] rmhr_deferred 已由 RAAS 完成 email_not_found 分类;跳过 AO 二次 RMHR 锁检查',
+      );
+    }
     const lockResult =
-      process.env.LOCK_CHECK_ENABLED === '1'
+      process.env.LOCK_CHECK_ENABLED === '1' && !rmhrDeferred
         ? await step.run('rmhr-lock-check', async () =>
             runLockCheck({
               candidateId: saveResult.candidate_id,
@@ -548,6 +585,10 @@ export const resumeParserAgent = inngest.createFunction(
       // 给 matcher 用的 anchor
       upload_id,
       employee_id: employeeId ?? undefined,
+      operator_id,
+      contract_version: processingContract?.contract_version,
+      processing_mode: processingContract?.processing_mode,
+      processing_reason: processingContract?.processing_reason,
       // parsed.data 透传 (matcher 仍可以用作 resume text 来源)
       parsed: { data: parsed as unknown as Record<string, unknown> },
       // 持久化的产物 — 让下游知道 candidate_id 已经存在
@@ -556,6 +597,7 @@ export const resumeParserAgent = inngest.createFunction(
       // 透传上传时关联的岗位 — matchResumeAgent 据此决定"单岗位精准匹配"
       // 还是"上传者名下全部 recruiting 岗位扫描"。
       job_requisition_id: job_requisition_id ?? null,
+      job_posting_id,
       // ADR-0040 — RAAS 预填的窄化 JR 数组(单数 job_requisition_id 为空时,
       // ruleCheckAgent 直接循环这些 id 取详情撮合,跳过 path-B 名下全量扫描)。
       job_requisition_ids: job_requisition_ids.length > 0 ? job_requisition_ids : undefined,
@@ -584,6 +626,11 @@ export const resumeParserAgent = inngest.createFunction(
       resume_id: saveResult.resume_id,
       application_id: saveResult.application_id,
       job_requisition_id: job_requisition_id ?? null,
+      job_posting_id,
+      operator_id,
+      contract_version: processingContract?.contract_version ?? null,
+      processing_mode: processingContract?.processing_mode ?? null,
+      processing_reason: processingContract?.processing_reason ?? null,
       sourcing_channel_id: sourcing_channel_id ?? null,
       client_id: client_id ?? null,
       filename: (filename ?? 'resume.pdf').trim(),

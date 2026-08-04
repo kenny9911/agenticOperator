@@ -38,6 +38,7 @@ import {
   extractCandidateExpectation,
   formatCandidatePreferences,
 } from '@/lib/mappers/candidate-preferences';
+import { parseResumeProcessingContract } from '@/lib/raas-v1/resume-processing-contract';
 
 // Loose shape — the merged JR object from rule-check carries arbitrary
 // keys (path A flatten + path B agent-view item). Field-name probes below.
@@ -67,6 +68,21 @@ export const matchResumeAgent = inngest.createFunction(
 
 export async function matchResumeAgentHandler({ event, step, logger, runId }: any) {
   const data = event.data as MatchRuleCheckPassedData;
+  let processingContract;
+  try {
+    processingContract = parseResumeProcessingContract(data as unknown as Record<string, unknown>);
+  } catch (error) {
+    throw new NonRetriableError(
+      `[resume-processing-contract] invalid MATCH_RULE_CHECK_PASSED: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  const processingContractData =
+    processingContract ??
+    (typeof data.operator_id === 'string' && data.operator_id.trim()
+      ? { operator_id: data.operator_id.trim() }
+      : {});
   const traceId = data.runtime_context?.trace_id ?? undefined;
   const stepKey = sanitizeStepKey(data.job_requisition_id);
   const req = (data.job_requisition ?? {}) as RequirementsAgentViewItem;
@@ -252,7 +268,9 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
     // later retry-success). Mirrors rule-check's infra-failure park model.
     if (!isRecoverableReason(oc.reason)) {
       const failedPayload: MatchEventData = {
+        ...processingContractData,
         job_requisition_id: data.job_requisition_id,
+        job_posting_id: pickExplicitJobPostingId(data, req),
         candidate_id: candidateId || null,
         matching_score: null,
         upload_id: uploadId || null,
@@ -290,9 +308,7 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
       job_requisition_id: data.job_requisition_id,
       client_id: pickClientId(req) ?? null,
       job_posting_id:
-        typeof (req as Record<string, unknown>).job_posting_id === 'string'
-          ? ((req as Record<string, unknown>).job_posting_id as string)
-          : null,
+        pickExplicitJobPostingId(data, req),
       source: 'need_interview',
       created_by: 'ai_engine',
       raw_llm_response: rd,
@@ -355,14 +371,13 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
   }
 
   const payload: MatchEventData = {
+    ...processingContractData,
     job_requisition_id: data.job_requisition_id,
     candidate_id: candidateId || null,
     matching_score,
     upload_id: uploadId || null,
     job_posting_id:
-      typeof (req as any).job_posting_id === 'string' && (req as any).job_posting_id.trim()
-        ? ((req as any).job_posting_id as string).trim()
-        : null,
+      saveResult.job_posting_id ?? pickExplicitJobPostingId(data, req),
     candidate_match_result_id: saveResult.candidate_match_result_id,
     overall_status,
     success: true,
@@ -416,6 +431,16 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────
+
+function pickExplicitJobPostingId(
+  data: MatchRuleCheckPassedData,
+  req: RequirementsAgentViewItem,
+): string | null {
+  for (const value of [data.job_posting_id, req.job_posting_id]) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
 
 function pickClientId(req: RequirementsAgentViewItem): string | undefined {
   for (const c of [(req as any).client_id, (req as any).clientId]) {
