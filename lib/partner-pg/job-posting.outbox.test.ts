@@ -277,3 +277,120 @@ describe('syncJdToPartnerPg — transactional JD_GENERATED outbox', () => {
     expect(calls.some((call) => /INSERT INTO event_outbox/i.test(call.text))).toBe(false);
   });
 });
+
+// RAAS ADR-0154 — 用户在需求详情页显式勾选「覆盖已发布岗位」后的重新生成。
+describe('syncJdToPartnerPg — force_regenerate (RAAS ADR-0154)', () => {
+  it('overwrites a published posting and resets it to an unpublished, review-pending state', async () => {
+    const { calls } = installTransaction(
+      standardQueryHandler({
+        posting: existingPosting({ status: 'published', publish_status: 'distributed' }),
+      }),
+    );
+
+    const result = await syncJdToPartnerPg(baseInput({ force_regenerate: true }));
+
+    expect(result.synced).toBe(true);
+    expect(result.reason).toBeUndefined();
+    // 覆盖的是「本来受保护」的岗位 → 打标记，RAAS 侧据此重置发布生命周期。
+    expect(result.regenerated).toBe(true);
+
+    const update = calls.find((call) => /UPDATE job_posting/i.test(call.text));
+    expect(update).toBeDefined();
+    // 岗位必须真的回到未发布态：只写 publish_status='pending' 是不够的，
+    // status 留在 'published' 会让下一次重新生成又被同一条闸拦住。
+    expect(update!.text).toMatch(/status = 'draft'/);
+    expect(update!.text).toMatch(/published_at = NULL/);
+    expect(update!.params).toContain('pending');
+    // force 时守卫 WHERE 只保留 closed_at，不再限制 status / publish_status，
+    // 否则 UPDATE 会 0 行然后抛错。
+    expect(update!.text).toMatch(/closed_at IS NULL/);
+    expect(update!.text).not.toMatch(/BTRIM\(COALESCE\(publish_status/);
+
+    const outbox = calls.find((call) => /INSERT INTO event_outbox/i.test(call.text));
+    expect(outbox).toBeDefined();
+    const payload = JSON.parse(
+      (outbox!.params ?? []).find(
+        (p): p is string => typeof p === 'string' && p.includes('"job_posting_id"'),
+      ) ?? '{}',
+    );
+    expect(payload.regenerated).toBe(true);
+  });
+
+  it('never overwrites a closed posting, even with force_regenerate', async () => {
+    const { calls } = installTransaction(
+      standardQueryHandler({
+        posting: existingPosting({
+          status: 'closed',
+          publish_status: 'closed',
+          closed_at: '2026-08-01T00:00:00.000Z',
+        }),
+      }),
+    );
+
+    const result = await syncJdToPartnerPg(baseInput({ force_regenerate: true }));
+
+    // closed 是终态，复活走 RAAS ADR-0069 的岗位「重新开启」，不从生成侧放行。
+    expect(result).toEqual({
+      synced: false,
+      job_posting_id: 'JP-OUTBOX-1',
+      job_requisition_id: 'JR-OUTBOX-1',
+      reason: 'skipped_protected_existing_posting',
+    });
+    expect(calls.some((call) => /UPDATE job_posting/i.test(call.text))).toBe(false);
+    expect(calls.some((call) => /INSERT INTO event_outbox/i.test(call.text))).toBe(false);
+  });
+
+  it('does not mark a plain draft overwrite as regenerated', async () => {
+    installTransaction(
+      standardQueryHandler({ posting: existingPosting({ publish_status: 'pending' }) }),
+    );
+
+    const result = await syncJdToPartnerPg(baseInput({ force_regenerate: true }));
+
+    // 草稿 / 待审岗位本来就可覆盖 —— 不是「重新生成覆盖了已发布岗位」，
+    // 不该触发 RAAS 侧的发布态重置。
+    expect(result.synced).toBe(true);
+    expect(result.regenerated).toBeUndefined();
+  });
+
+  it('keeps skipping a published posting when force_regenerate is absent', async () => {
+    const { calls } = installTransaction(
+      standardQueryHandler({
+        posting: existingPosting({ status: 'published', publish_status: 'distributed' }),
+      }),
+    );
+
+    const result = await syncJdToPartnerPg(baseInput());
+
+    expect(result.reason).toBe('skipped_protected_existing_posting');
+    expect(calls.some((call) => /UPDATE job_posting/i.test(call.text))).toBe(false);
+  });
+});
+
+// 这份集合与 RAAS 侧 `REGENERATABLE_POSTING_PUBLISH_STATUSES`
+// (backend/apps/api/src/modules/requirements/requirement.service.ts) 必须逐字一致 ——
+// 两边漂移 = RAAS 说能重新生成而这里跳过（或反过来），对用户都是静默失败。
+describe('regeneratable publish statuses — cross-repo contract', () => {
+  const REGENERATABLE = ['', 'draft', 'pending', 'modified', 'rejected'];
+  const PROTECTED = ['approved', 'distributed', 'published', 'paused', 'closed'];
+
+  for (const publish_status of REGENERATABLE) {
+    it(`overwrites publish_status="${publish_status}" without force`, async () => {
+      installTransaction(
+        standardQueryHandler({ posting: existingPosting({ publish_status }) }),
+      );
+      const result = await syncJdToPartnerPg(baseInput());
+      expect(result.synced).toBe(true);
+    });
+  }
+
+  for (const publish_status of PROTECTED) {
+    it(`protects publish_status="${publish_status}" without force`, async () => {
+      installTransaction(
+        standardQueryHandler({ posting: existingPosting({ publish_status }) }),
+      );
+      const result = await syncJdToPartnerPg(baseInput());
+      expect(result.reason).toBe('skipped_protected_existing_posting');
+    });
+  }
+});

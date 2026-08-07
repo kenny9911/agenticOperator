@@ -197,9 +197,22 @@ export type SyncJdInput = {
   search_keywords?: string[];
   jd_content?: { title?: string; salaryBenefits?: string };
   /**
+   * RAAS ADR-0154 — 显式「重新生成岗位库」放行既有岗位保护闸。
+   *
+   * 只有 RAAS 端用户在需求详情页勾选「覆盖已发布岗位」时，
+   * `CLARIFICATION_READY.payload.force_regenerate` 才为 true；createJdAgent
+   * 原样透传到这里。放行后覆盖既有 JobPosting 正文并把它强制写回未发布态
+   * (`status='draft'` / `publish_status='pending'` / `published_at=NULL`)，
+   * 由 RAAS 重新建 jd_review 待办走人工复审。
+   *
+   * `closed_at` 非空的岗位**不在放行范围**：closed 是终态，复活走 RAAS
+   * ADR-0069 的 reopenJD 路径，从这里放行会绕过它的守卫。
+   */
+  force_regenerate?: boolean;
+  /**
    * Durable event written in the same Partner PG transaction as JobPosting.
-   * The source event id scopes replay idempotency. A future revision requires
-   * an explicitly re-clarified CLARIFICATION_READY event; JD_REJECTED itself
+   * The source event id scopes replay idempotency. Revising an existing
+   * posting requires `force_regenerate` above (ADR-0154); JD_REJECTED itself
    * never re-enters generation.
    */
   jd_generated_outbox?: {
@@ -219,6 +232,8 @@ export type SyncJdResult = {
   jd_generated_event_id?: string;
   jd_generated_idempotency_key?: string;
   reason?: string;
+  /** ADR-0154 — 本次覆盖的是一条本来受保护的岗位（已审核 / 已发布）。 */
+  regenerated?: boolean;
 };
 
 type ExistingJobPostingRow = {
@@ -237,6 +252,15 @@ type ExistingOutboxRow = {
   payload: unknown;
 };
 
+/**
+ * 可被重新生成覆盖的 `publish_status` 集合（未走完 HSM 审核 → 发布的岗位）。
+ *
+ * ⚠️ 跨仓库共享判据：RAAS 侧 `isRegeneratableJobPosting()`
+ * (backend/apps/api/src/modules/requirements/requirement.service.ts) 保存了
+ * 逐字相同的一份，用于在发事件前预检并给用户明确提示。两处必须同步修改，
+ * 否则 RAAS 说「能重新生成」而 AO 这里 skip（或反之），用户看到的是静默失败。
+ * 两边各有测试锁死这个集合。
+ */
 const REGENERATABLE_PUBLISH_STATUSES = new Set([
   '',
   'draft',
@@ -265,6 +289,8 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
     jd_content,
     search_keywords,
   } = input;
+  // ADR-0154 — RAAS 用户显式勾选「覆盖已发布岗位」才为 true。
+  const forceRegenerate = input.force_regenerate === true;
 
   const degree_requirement = mapEnum(
     pickField<string>(body, 'degree_requirement', 'education'),
@@ -362,7 +388,10 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
     );
 
     const existingPosting = existing.rows[0];
-    if (existingPosting && isProtectedExistingPosting(existingPosting)) {
+    if (
+      existingPosting &&
+      isProtectedExistingPosting(existingPosting, { forceRegenerate })
+    ) {
       return {
         synced: false,
         job_posting_id: existingPosting.job_posting_id,
@@ -370,6 +399,12 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
         reason: 'skipped_protected_existing_posting',
       };
     }
+    // 只有真的覆盖了一条「本来受保护」的岗位才算重新生成 —— RAAS 侧据此重置
+    // per-recruiter 发布生命周期并改用复审文案；首次生成/覆盖草稿都不算。
+    const regeneratedProtectedPosting =
+      forceRegenerate === true &&
+      existingPosting != null &&
+      isProtectedExistingPosting(existingPosting);
 
     const replayIdempotencyKey = outboxInput
       ? jdGeneratedIdempotencyKey(
@@ -483,15 +518,28 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
     if (existingPosting) {
       job_posting_id = existingPosting.job_posting_id;
       const setClause = sharedCols.map((col, i) => `${col} = $${i + 2}`).join(', ');
-      const updated = await c.query(
-        `UPDATE job_posting
-            SET ${setClause}, updated_at = NOW()
-          WHERE job_posting_id = $1
-            AND closed_at IS NULL
+      // ADR-0154 — 强制重新生成时把岗位一并写回未发布态：`publish_status`
+      // 已在 sharedVals 里恒为 'pending'，但 `status` 与 `published_at` 不在
+      // sharedCols 中（只有 INSERT 写 status='draft'）。不补这两列，覆盖一条
+      // 已发布岗位后 status 仍是 'published'，下一次重新生成又会被同一条闸
+      // 拦住，而且 RAAS 岗位库会显示「已发布」却挂着待审 JD。
+      const forcedResetClause = regeneratedProtectedPosting
+        ? `, status = 'draft', published_at = NULL`
+        : '';
+      // 守卫 WHERE 与本次放行口径一致：非 force 时保持原白名单（防并发期间
+      // 岗位被人推进到已发布后仍被静默覆盖）；force 时只保留 closed 一条。
+      const guardClause = forceRegenerate
+        ? ''
+        : `
             AND BTRIM(COALESCE(status::text, '')) IN ('', 'draft')
             AND BTRIM(COALESCE(publish_status::text, '')) IN (
               '', 'draft', 'pending', 'modified', 'rejected'
-            )`,
+            )`;
+      const updated = await c.query(
+        `UPDATE job_posting
+            SET ${setClause}${forcedResetClause}, updated_at = NOW()
+          WHERE job_posting_id = $1
+            AND closed_at IS NULL${guardClause}`,
         [job_posting_id, ...sharedVals],
       );
       if (updated.rowCount !== 1) {
@@ -503,7 +551,10 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
             FOR UPDATE`,
           [job_posting_id],
         );
-        if (refreshed.rows[0] && isProtectedExistingPosting(refreshed.rows[0])) {
+        if (
+          refreshed.rows[0] &&
+          isProtectedExistingPosting(refreshed.rows[0], { forceRegenerate })
+        ) {
           return {
             synced: false,
             job_posting_id,
@@ -552,6 +603,7 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
           jd_content: outboxInput.jd_content,
           source_action: outboxInput.source_action ?? 'createJD',
           trace: outboxInput.trace ?? null,
+          regenerated: regeneratedProtectedPosting,
         })
       : null;
 
@@ -559,6 +611,7 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
       synced: true,
       job_posting_id,
       job_requisition_id,
+      ...(regeneratedProtectedPosting ? { regenerated: true } : {}),
       ...(outbox
         ? {
             jd_generated_event_id: outbox.event_id,
@@ -569,8 +622,19 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
   }, { allowMirrorFallback: false });
 }
 
-function isProtectedExistingPosting(row: ExistingJobPostingRow): boolean {
+/**
+ * 既有岗位是否受保护（= 本次生成必须跳过，不覆盖正文）。
+ *
+ * `forceRegenerate`(ADR-0154) 是 RAAS 用户显式勾选「覆盖已发布岗位」的结果：
+ * 它只放开「已越过审核/已发布」这一层保护，**closed 岗位在任何情况下都保护**
+ * —— 那是终态，复活走 RAAS ADR-0069 的 reopenJD，从生成侧放行会绕过守卫。
+ */
+function isProtectedExistingPosting(
+  row: ExistingJobPostingRow,
+  opts: { forceRegenerate?: boolean } = {},
+): boolean {
   if (row.closed_at != null) return true;
+  if (opts.forceRegenerate === true) return false;
   const status = String(row.status ?? '').trim().toLowerCase();
   if (status && status !== 'draft') return true;
   return !REGENERATABLE_PUBLISH_STATUSES.has(
@@ -590,12 +654,19 @@ function buildJdGeneratedPayload(input: {
   job_requisition_id: string;
   client_id: string;
   jd_content: string;
+  /**
+   * ADR-0154 — 本次覆盖的是一条「本来受保护」的岗位（已审核 / 已发布）。
+   * RAAS 侧据此重置 per-recruiter 发布生命周期并改用复审文案。
+   * 首次生成与覆盖草稿都不带该字段（replay 比对是子集比对，缺省不影响幂等）。
+   */
+  regenerated?: boolean;
 }): Record<string, unknown> {
   return {
     job_posting_id: input.job_posting_id,
     job_requisition_id: input.job_requisition_id,
     client_id: input.client_id,
     jd_content: input.jd_content,
+    ...(input.regenerated === true ? { regenerated: true } : {}),
   };
 }
 
@@ -623,6 +694,7 @@ async function appendJdGeneratedOutbox(
     jd_content: string;
     source_action: string;
     trace: JdGeneratedOutboxTrace | null;
+    regenerated?: boolean;
   },
 ): Promise<{ event_id: string; idempotency_key: string }> {
   const eventId = randomUUID();

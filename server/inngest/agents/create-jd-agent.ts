@@ -70,6 +70,11 @@ type RaasRequirementPayload = {
   requirement_id?: string;
   job_requisition_id?: string;
   source_channel?: string | null;
+  /**
+   * RAAS ADR-0154 — 用户在需求详情页显式勾选「覆盖已发布岗位」。
+   * 放行 partner-pg 的既有岗位保护闸；覆盖后岗位强制写回未发布态重审。
+   */
+  force_regenerate?: boolean;
   /** Free-text 简报 (新格式优先；如缺则从 raw_input_data 拼). */
   requirement_brief?: string;
   raw_input_data?: {
@@ -145,6 +150,8 @@ export const createJdAgent = inngest.createFunction(
     const envelope = (event.data ?? {}) as ClarificationReadyEnvelope;
     const traceId = getTraceId(event.data);
     const requisitionIdCandidate = pickRequisitionIdFromEnvelope(envelope);
+    // ADR-0154 — 只认 payload 里的显式 true；缺省 / 非布尔一律按 false 走原保护闸。
+    const forceRegenerate = envelope.payload?.force_regenerate === true;
     const fileLogger = createAgentLogger({
       agent: 'createJD',
       runId: runId ?? `local-${Date.now()}`,
@@ -441,6 +448,7 @@ export const createJdAgent = inngest.createFunction(
         interview_mode: stringOrUndefined(requirement.interview_mode),
         recruitment_type: stringOrUndefined(requirement.recruitment_type),
         city: pickCityFromBoth(requirement, jdData),
+        force_regenerate: forceRegenerate,
         jd_generated_outbox: {
           source_event_id: sourceEventId,
           jd_content: jdContent,
@@ -452,6 +460,7 @@ export const createJdAgent = inngest.createFunction(
       logger.info(
         `[${AGENT_NAME}] partner-pg syncJdToPartnerPg OK · synced=${r.synced} ` +
           `job_posting_id=${r.job_posting_id}` +
+          (r.regenerated ? ' regenerated=true' : '') +
           (r.reason ? ` reason=${r.reason}` : ''),
       );
       return r;
@@ -459,14 +468,18 @@ export const createJdAgent = inngest.createFunction(
 
     const jobPostingId = syncResult.job_posting_id;
     if (syncResult.reason === 'skipped_protected_existing_posting') {
+      // force_regenerate=true 时仍走到这里，只可能是岗位已 closed(ADR-0154 保留
+      // 的唯一硬闸)——日志带上该标记，免得排查时误以为放行没生效。
       logger.info(
         `[${AGENT_NAME}] skipped protected existing JobPosting · ` +
-          `job_posting_id=${jobPostingId} requisition=${requisitionId}`,
+          `job_posting_id=${jobPostingId} requisition=${requisitionId} ` +
+          `force_regenerate=${forceRegenerate}`,
       );
       fileLogger.event('handler.skipped', {
         reason: syncResult.reason,
         job_posting_id: jobPostingId,
         job_requisition_id: requisitionId,
+        force_regenerate: forceRegenerate,
       });
       return {
         ok: true,
@@ -475,6 +488,7 @@ export const createJdAgent = inngest.createFunction(
         job_posting_id: jobPostingId,
         requisition_id: requisitionId,
         client_id: clientId,
+        force_regenerate: forceRegenerate,
       };
     }
     if (syncResult.reason === 'replayed_existing_outbox') {
