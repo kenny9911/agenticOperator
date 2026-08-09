@@ -64,8 +64,8 @@ export const CANONICAL_WORKFLOW: WorkflowJsonNode[] = workflowJson as WorkflowJs
 
 export type NodeKind = 'trigger' | 'agent' | 'branch' | 'hitl' | 'guard' | 'done';
 
-/** wsIds owned by resume-parser-agent (real deployed Inngest functions). */
-const RPA_OWNED_WSIDS = new Set(['4', '9-1', '10', '10-5']);
+/** wsIds owned by real deployed Inngest functions. */
+const RPA_OWNED_WSIDS = new Set(['4', '6', '9-1', '10', '10-5']);
 
 export type WorkflowNode = {
   id: string;

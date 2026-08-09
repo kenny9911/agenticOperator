@@ -420,7 +420,7 @@ async function generateOne(a: RichAction, ctx: GenerationContext, useLlm: boolea
   const slug = `${slugifyDomain(ctx.domainId)}-${kebab(a.name)}`;
   // HITL (Human-actor) actions become human-gate agents (simulated-human), kept
   // instead of dropped. Pure LLM agents are "llm". recruitment actions are all
-  // actor=agent → hitl stays false (verified against the 6 real agents).
+  // actor=agent → hitl stays false (verified against the 7 real agents).
   const kind: GeneratedAgentSpec["kind"] = role === "agent" ? "llm" : "simulated-human";
   const refinedHigh = refinement && refinement.finalScore >= REFINE_THRESHOLD;
   return {

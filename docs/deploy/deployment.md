@@ -42,7 +42,7 @@ RESUME_DOWNLOADED 等事件直接进这个实例触发 AO 函数）。因此：
   `INNGEST_BASE_URL` 和 `INNGEST_SERVE_ORIGIN`。所有 shared 命令都叠加
   `docker-compose.shared-inngest.yml`；app、archiver、monitor-sweeper 一起
   加入该网络，bundled 服务不会进入 Compose 服务集合。
-  **如果错误地自带一套新 Inngest，partner 事件到不了 AO，六函数链路直接
+  **如果错误地自带一套新 Inngest，partner 事件到不了 AO，七函数链路直接
   断掉。**
 - **模式 B · 自带 Inngest（全新隔离机器的显式 opt-in）**——必须先在
   `.env.deploy` 明确设置 bundled mode/profile/URL，再使用
@@ -51,17 +51,18 @@ RESUME_DOWNLOADED 等事件直接进这个实例触发 AO 函数）。因此：
   `http://inngest:8288` / `http://app:3002`。它不能携带 shared network/alias，
   也不能叠加 shared overlay。预检对任何混用 fail-closed。
 
-**验收目标**：RAAS-v1 域六个核心 agent 函数注册并能端到端跑通 ——
-`createJdAgent` / `resumeParserAgent` / `candidateIdentityAgent` /
+**验收目标**：RAAS-v1 域七个核心 agent 函数注册并能端到端跑通 ——
+`createJdAgent` / `taskAssignerAgent` / `resumeParserAgent` / `candidateIdentityAgent` /
 `ruleCheckAgent` / `matchResumeAgent` / `interviewInviterAgent`。
 
-它们依赖五个**外部系统**（不由本 compose 提供，凭证向对应所有者索取）：
+它们依赖六个**外部系统**（不由本 compose 提供，凭证向对应所有者索取）：
 
 | 依赖 | 用途 | 不可达时的表现 |
 | --- | --- | --- |
 | LLM 网关（`AI_BASE_URL`） | rule-check 评估、JD 生成、匹配解释 | 相关 agent 全部失败 |
 | Allmeta（`ALLMETA_BASE_URL`） | Neo4j 唯一 HTTP 入口：实体写入 + 规则拉取 | 实体写入步骤报错；规则回退内置快照 |
 | RoboHire（`ROBOHIRE_API_BASE_URL`，**公网**） | 简历解析 + 匹配评分 | resumeParser/matchResume 失败，下游全停 |
+| RAAS typed dispatch API（`RAAS_API_BASE_URL`） | TaskAssigner 实时上下文、事务复验和最终认领 | shadow/auto 失败；禁止回退为 AO 直写 PG |
 | RAAS partner Postgres（`RAAS_POSTGRES_URL`） | 候选人/岗位/匹配结果业务双写（七张表由 RAAS 方建） | 双写步骤失败 |
 | MinIO（`MINIO_ENDPOINT`） | PDF/DOC/DOCX 简历二进制存取 | RESUME_DOWNLOADED 卡在 parser |
 
@@ -95,7 +96,7 @@ bash scripts/survey-old-deployment.sh          # 在仓库里时
 4. **端口空位**：3002/8288/8289/5433 是否被占；被占则停老服务或在
    `.env.deploy` 里改 `AO_PORT`/`INNGEST_PORT`/`AO_POSTGRES_PORT`
    （注意老 AO 自己的 ao-postgres 常占 5433/5434）。
-5. **外部依赖连通性**：五个依赖里"✗"的项，部署前先解决网络（尤其
+5. **外部依赖连通性**：六个依赖里"✗"的项，部署前先解决网络（尤其
    RoboHire 是公网域名，内网机器要确认出网口子）。
 
 ## 3. 阶段一 · 把代码/镜像弄到目标机（两条路径）
@@ -163,7 +164,7 @@ scripts/             # deploy-compose.sh · deploy-preflight.mjs · connectivity
 shared 包始终携带固定版本的 Gotenberg LibreOffice 镜像，但默认不携带 Inngest
 镜像；只有 `--mode bundled` 才额外拉取并打包 Inngest。镜像构建成功不等于
 生产验收；目标机仍须逐项完成第 6 节的五容器健康、数据库、转换器、
-唯一 callback、6/6 函数和端到端事件证据。
+唯一 callback、7/7 函数和端到端事件证据。
 
 两个常见构建失败及自救：`next build` 阶段报 TS 错误 = 工作区有改到一半
 的代码（构建用的是工作区快照），改完重跑；`npm ci` 阶段网络重置 = 直接
@@ -269,7 +270,7 @@ vi .env.deploy        # 或 open -e .env.deploy 用文本编辑打开
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 沿用老 env §3（`https://new-api.jointpilot.com/v1` + key + `kimi-k2.6`） | 或换成内网网关 `http://host.docker.internal:3010/v1`，二选一 |
 | `ALLMETA_BASE_URL` | `http://host.docker.internal:3500` | Allmeta 栈在目标机本机 Docker 里 |
 | `ALLMETA_API_KEY` | 沿用老 env §6 的 `oskey_*` | 与 Allmeta Studio 一致 |
-| `ALLMETA_DOMAIN` | `RAAS-v1` | 六函数验收用这个域 |
+| `ALLMETA_DOMAIN` | `RAAS-v1` | 七函数验收用这个域 |
 | `ROBOHIRE_API_BASE_URL` | `https://api.gohire.top` | **不带 /v1**（client 自己拼 `/api/v1`） |
 | `ROBOHIRE_API_KEY` | 沿用老 env §4 的 `rh_*` | |
 | `ROBOHIRE_TIMEOUT_MS` | `300000` | ⚠ 老 env 是 120000——那是坑：match 实测 ~195s 会被杀，必须用 300000 |
@@ -278,6 +279,10 @@ vi .env.deploy        # 或 open -e .env.deploy 用文本编辑打开
 | `DOCUMENT_CONVERTER_*` / `GOTENBERG_*` 限额 | 保持模板默认 | 客户端 130s、服务端 120s、输入/输出各 10 MiB；除非有实测证据不要放宽 |
 | `RAAS_POSTGRES_URL` | 沿用老 env §5a：`postgresql://postgres:<密码URL编码>@postgres:5432/raas` | `postgres` 容器**未发布宿主端口**，必须靠 shared overlay 按容器名访问（网络名见上行 `RAAS_SHARED_NETWORK`）；库名 `raas`；密码含 `@` 写成 `%40` |
 | `RAAS_DEFAULT_EMPLOYEE_ID` | `0000199059`（老 env §5b） | 匹配结果归属兜底 |
+| `RAAS_API_BASE_URL` / `RAAS_AGENT_API_KEY` | 由 RAAS 服务所有者提供 | TaskAssigner shadow/auto 的 v2 typed context + assign-team 契约；不得用 partner PG 直写替代 |
+| `TASK_ASSIGNER_POLICY_VERSION` | `v2` | 团队派单 v2 policy；必须与 RAAS live context/write validation 使用的版本一致 |
+| `TASK_ASSIGNER_MODE` | `disabled` | RAAS v2 API、权威 live BG/operational resolvers 与旧 auto-claim 停用证明全部就绪前不得开 auto；任一 live eligibility 为 unknown 时保持 fail-closed，先用 shadow 验证 |
+| `TASK_ASSIGNER_LEGACY_AUTO_CLAIM_DISABLED` | `0` | 只有旧 writer 已停用且 RAAS context 也返回 live guard 后才能改为 `1` |
 | `MINIO_ENDPOINT` / `MINIO_PORT` | `host.docker.internal` / `9000` | 共享 MinIO 在目标机本机；endpoint 不带 scheme |
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | 沿用老 env §8 | |
 | `AGENT_EXECUTION_API_KEY` | 长随机串（老 env 没有，是新版本新增） | 保护对外管理/执行 API；正常部署不启用 factory，故不要求 factory token |
@@ -537,7 +542,7 @@ bash scripts/deploy-compose.sh --env-file .env.deploy -- \
 ```
 
 在 Inngest UI 确认 `agentic-operator-main` 只有一个有效 callback，指向
-`http://ao-v2-app:3002/api/inngest`，6/6 函数正常；再恢复 RAAS 新事件入口，
+`http://ao-v2-app:3002/api/inngest`，7/7 函数正常；再恢复 RAAS 新事件入口，
 观察 queued 归零且没有重复 run。
 
 隔离机器的模式 B 不是默认入口。只有明确需要时才把 `.env.deploy` 改成 bundled
@@ -647,10 +652,10 @@ bash scripts/deploy-compose.sh --env-file .env.deploy -- \
   "fetch('http://gotenberg:3000/health').then(async r=>{console.log(r.status,await r.text());if(!r.ok)process.exit(1)}).catch(e=>{console.error(e);process.exit(1)})"
 ```
 
-**⑤ 六函数注册**：在目标机本机浏览器打开 `http://localhost:8288`
+**⑤ 七函数注册**：在目标机本机浏览器打开 `http://localhost:8288`
 （Mac Studio 的共享 `inngest-server` 只绑 loopback，须在本机/ToDesk 里开）
-→ Apps → 应看到 `agentic-operator-main` 同步无错误，函数列表包含六个核心
-agent（createJd / resumeParser / candidateIdentity / ruleCheck /
+→ Apps → 应看到 `agentic-operator-main` 同步无错误，函数列表包含七个核心
+agent（createJd / taskAssigner / resumeParser / candidateIdentity / ruleCheck /
 matchResume / interviewInviter）。
 共享模式升级后，老容器注册的旧条目（URL 指向老容器名）会变成
 unreachable——确认新 callback 已按 5.6 显式注册后，再删除指向旧容器的条目。
@@ -774,7 +779,7 @@ aoc up -d --wait
 3. 按旧 Steven compose 启动旧 `ao-postgres` 与 `ao-main`，不要让两个 AO app
    同时注册/消费。
 4. 对旧 AO `/api/inngest` 执行注册 PUT，把唯一 callback 切回旧容器；确认
-   6 个函数及 queued drain 后再恢复入口。
+   旧版本原有的 6 个函数及 queued drain 后再恢复入口。
 5. main 运行窗口中已经写入新卷的数据不会自动回灌旧卷；保留新卷和最终 dump，
    单独做差异对账，禁止双栈同时接单。
 

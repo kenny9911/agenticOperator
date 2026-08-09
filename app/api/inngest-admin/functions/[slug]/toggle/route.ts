@@ -25,7 +25,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
       return NextResponse.json(
         {
           error: 'unsupported-function-scope',
-          message: `${slug} is not one of the six RAAS-v1 functions served by agentic-operator-main`,
+          message: `${slug} is not a registered RAAS-v1 function served by agentic-operator-main`,
         },
         { status: 400 },
       );

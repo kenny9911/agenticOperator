@@ -141,6 +141,17 @@ const JD_GENERATED_v1 = envelope(
   }).passthrough(),
 );
 
+const JD_APPROVED_v1 = envelope(
+  z.object({
+    jd_id: z.string().min(1),
+    job_requisition_id: z.string().min(1),
+    approver_id: z.string().nullable().optional(),
+    target_hiring_manager_id: z.string().nullable().optional(),
+    headcount_total: z.number().int().nonnegative().nullable().optional(),
+    is_confidential: z.boolean().optional(),
+  }).passthrough(),
+);
+
 // MATCH_PASSED_NEED_INTERVIEW / MATCH_PASSED_NO_INTERVIEW / MATCH_FAILED
 // share the same shape — F3 (2026-05-19): top-level candidate_id / matching_score /
 // upload_id with explicit nulls. Partner auto-invitation dispatcher reads these
@@ -380,6 +391,13 @@ export const BUILTIN_SCHEMAS: EventSchemaRegistration[] = [
     versions: [{ version: "1.0", schema: JD_GENERATED_v1 }],
     publishers: ["createJdAgent"],
     subscribers: ["raas-backend.hitl-event-fanout"],
+  },
+  {
+    name: "JD_APPROVED",
+    description: "HSM 审核通过 JD；触发招聘自动派单决策",
+    versions: [{ version: "1.0", schema: JD_APPROVED_v1 }],
+    publishers: ["raas-backend.jd-review"],
+    subscribers: ["ao.taskAssignerAgent"],
   },
   {
     name: "JD_REJECTED",

@@ -501,6 +501,33 @@ export type RequirementLoggedData = {
 };
 
 /**
+ * RAAS emits JD_APPROVED only after the HSM review gate has completed.
+ * TaskAssigner consumes the identifiers and always reloads live dispatch
+ * context from RAAS; no recruiter roster or client name belongs in this event.
+ */
+export type JdApprovedPayload = {
+  jd_id: string;
+  job_requisition_id: string;
+  approver_id?: string | null;
+  target_hiring_manager_id?: string | null;
+  headcount_total?: number | null;
+  is_confidential?: boolean;
+};
+
+export type JdApprovedEnvelope = {
+  entity_type?: string;
+  entity_id?: string | null;
+  event_id?: string;
+  payload: JdApprovedPayload;
+  trace?: {
+    trace_id?: string | null;
+    request_id?: string | null;
+    workflow_id?: string | null;
+    parent_trace_id?: string | null;
+  };
+};
+
+/**
  * JD_GENERATED canonical schema (neo4j_data/events_v0_1_002.json).
  *
  * Per ontology event registry (event_data 列出的 2 个字段必带):
