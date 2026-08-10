@@ -34,6 +34,10 @@ import {
   type CandidateExpectationPatch,
 } from '@/lib/raas-v1/candidate-expectation';
 import { parseRmhrLockTime } from '@/lib/rmhr/lock-time';
+import {
+  RMHR_MANUAL_IDENTITY_SOURCE,
+  type RmhrManualCandidateIdentity,
+} from '@/lib/raas-v1/resume-candidate-identity';
 
 // ──────────────────────────────────────────────────────────────────────
 // Input mirrors lib/raas-api-client.ts SaveCandidateInput so callers
@@ -66,6 +70,11 @@ export type SaveCandidateInput = {
   sourcing_channel_id?: string | null;
   /** RAAS RESUME_DOWNLOADED.payload.expectation_payload (partial, non-empty fields only). */
   expectation_payload?: CandidateExpectationPatch | null;
+  /**
+   * RMHR-accepted operator refill. This is Candidate identity input only;
+   * `parsed` remains the untouched RoboHire evidence stored on Resume.
+   */
+  authoritative_identity?: RmhrManualCandidateIdentity | null;
   /** RoboHire parse-resume output (data field). */
   parsed?: {
     data?: {
@@ -96,12 +105,10 @@ export type SaveCandidateResult = {
   mobile_review_status: CandidateMobileStatus;
   /** True when upload/object identity reused an already persisted candidate/resume. */
   idempotent_replay: boolean;
-  /** Final partner-PG values after a canonical-phone hit. Allmeta must mirror
-   * this snapshot instead of replaying a conflicting parser identity. New
-   * candidates return null because their parsed payload is the just-written
-   * source. */
+  /** Final partner-PG Candidate values for inserts, phone hits, and transport
+   * replays. Allmeta uses this snapshot where parser identity must not win. */
   candidate_snapshot: PersistedCandidateSnapshot | null;
-  /** Exact lock tuple committed to partner PG. Null only for an idempotent replay. */
+  /** Exact lock tuple read from or committed to partner PG. */
   candidate_lock_snapshot: CandidateLockSnapshot | null;
 };
 
@@ -324,19 +331,28 @@ export async function saveCandidateToPartnerPg(
     : null;
 
   const parsed = input.parsed?.data ?? {};
-  const name = nonEmpty(parsed.name) ?? '未命名候选人';
+  const authoritativeIdentity =
+    input.authoritative_identity?.source === RMHR_MANUAL_IDENTITY_SOURCE
+      ? input.authoritative_identity
+      : null;
+  const authoritativeName = nonEmpty(authoritativeIdentity?.name);
+  const authoritativePhone = nonEmpty(authoritativeIdentity?.phone);
+  const name = authoritativeName ?? nonEmpty(parsed.name) ?? '未命名候选人';
   // Candidate identity accepts exactly one strong mainland mobile. All aliases
   // are resolved together so Postgres / Allmeta cannot silently choose different
   // fields. Unusable raw values stay in resume.raw_parse_result only.
-  const mobileResolution = resolveCandidateMobile([
-    parsed.mobile,
-    parsed.phone,
-    (parsed as Record<string, unknown>).phoneNumber,
-  ]);
+  const mobileResolution = authoritativePhone
+    ? resolveCandidateMobile(authoritativePhone)
+    : resolveCandidateMobile([
+        parsed.mobile,
+        parsed.phone,
+        (parsed as Record<string, unknown>).phoneNumber,
+      ]);
   const mobile = mobileResolution.mobile;
   const mobile_normalized = mobileResolution.mobile;
   const needsMobileReview = mobileResolution.status !== 'valid';
   const email = nonEmpty(parsed.email);
+  const gender = nonEmpty(parsed.gender);
 
   // Structured-column derivations from the RoboHire parse-resume output.
   // These map 1:1 to partner Postgres `resume.*` columns so RAAS readers
@@ -453,11 +469,11 @@ export async function saveCandidateToPartnerPg(
     let candidateLockSnapshot: CandidateLockSnapshot | null = null;
 
     if (candidate_id) {
-      const target = await c.query<{
-        mobile: string | null;
-        mobile_normalized: string | null;
-      }>(
-        `SELECT mobile, mobile_normalized
+      const target = await c.query<PersistedCandidateSnapshot>(
+        `SELECT name, mobile, mobile_normalized, email, gender, birth_date,
+                current_location, highest_acquired_degree, work_years,
+                employee_id, is_locked,
+                lock_start_time AT TIME ZONE 'UTC' AS lock_start_time
            FROM candidate
           WHERE candidate_id = $1
           FOR UPDATE`,
@@ -472,6 +488,15 @@ export async function saveCandidateToPartnerPg(
         target.rows[0].mobile,
         target.rows[0].mobile_normalized,
       ]);
+      // A transport/upload replay must not rewrite Candidate, but it still
+      // returns the exact persisted row so an Allmeta mirror can be repaired
+      // safely when the event is delivered again.
+      candidateSnapshot = target.rows[0];
+      candidateLockSnapshot = {
+        employee_id: candidateSnapshot.employee_id,
+        is_locked: candidateSnapshot.is_locked,
+        lock_start_time: candidateSnapshot.lock_start_time,
+      };
     }
 
     if (!idempotentReplay && mobile_normalized) {
@@ -522,7 +547,7 @@ export async function saveCandidateToPartnerPg(
           mobile,
           mobile_normalized,
           email,
-          nonEmpty(parsed.gender),
+          gender,
           currentLocation,
           currentCompany,
           currentTitle,
@@ -538,6 +563,20 @@ export async function saveCandidateToPartnerPg(
         ],
       );
       candidateLockSnapshot = {
+        employee_id: lockedBy,
+        is_locked: hasIncomingLock,
+        lock_start_time: newCandidateLockStartTime,
+      };
+      candidateSnapshot = {
+        name,
+        mobile,
+        mobile_normalized,
+        email,
+        gender,
+        birth_date: null,
+        current_location: currentLocation,
+        highest_acquired_degree: null,
+        work_years: null,
         employee_id: lockedBy,
         is_locked: hasIncomingLock,
         lock_start_time: newCandidateLockStartTime,

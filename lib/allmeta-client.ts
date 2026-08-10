@@ -6,6 +6,7 @@
 import { currentLogger } from '@/lib/agent-logger';
 import { logApiCall } from '@/lib/external-api-log';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
+import { summarizeLogValue } from '@/lib/security/log-value-summary';
 
 // Read at module load. No silent localhost fallback for the base URL —
 // a partner whose .env.local is half-configured used to get cryptic
@@ -79,6 +80,7 @@ async function doRequest<T>(
   const logger = currentLogger();
   const label = callLabel(method, path);
   const start = Date.now();
+  const requestForLog = summarizeLogValue(body);
 
   let res: Response;
   try {
@@ -96,7 +98,7 @@ async function doRequest<T>(
       url,
       method,
       duration_ms: Date.now() - start,
-      request: body,
+      request: requestForLog,
       error: (err as Error).message,
     });
     // Network / abort error — nothing to parse, but still emit a log line so
@@ -104,7 +106,7 @@ async function doRequest<T>(
     logger?.apiCall(label, {
       url,
       method,
-      request: body,
+      request: requestForLog,
       durationMs: Date.now() - start,
       error: (err as Error).message,
     });
@@ -120,6 +122,7 @@ async function doRequest<T>(
   } catch {
     parsed = rawText;
   }
+  const responseForLog = summarizeLogValue(parsed);
 
   // 独立 sink — 完整 in/out,绕过 ALS
   logApiCall({
@@ -129,17 +132,17 @@ async function doRequest<T>(
     method,
     status: res.status,
     duration_ms: Date.now() - start,
-    request: body,
-    response: parsed,
+    request: requestForLog,
+    response: responseForLog,
     ...(res.ok ? {} : { error: `HTTP ${res.status}` }),
   });
   logger?.apiCall(label, {
     url,
     method,
-    request: body,
+    request: requestForLog,
     status: res.status,
     durationMs: Date.now() - start,
-    response: parsed,
+    response: responseForLog,
     ...(res.ok ? {} : { error: `HTTP ${res.status}` }),
   });
 
@@ -184,6 +187,32 @@ export async function writeInstance(
     'POST',
     path,
     { ...payload, domainId: domain },
+    opts,
+  );
+}
+
+/**
+ * PATCH /api/v1/ontology/instances/{label}/{primaryKey}?domain=RAAS-v1
+ *
+ * Unlike collection POST (which replaces the complete Neo4j property map),
+ * this endpoint applies only the supplied properties. Use it for replay-safe
+ * identity/lock repair where unrelated graph fields must be preserved.
+ */
+export async function patchInstance(
+  label: string,
+  primaryKey: string,
+  partial: Record<string, unknown>,
+  opts: CommonOpts = {},
+): Promise<Record<string, unknown>> {
+  const domain = opts.domain ?? DEFAULT_DOMAIN;
+  const strict = opts.validateStrict ? '&validate=strict' : '';
+  const path =
+    `/api/v1/ontology/instances/${encodeURIComponent(label)}/` +
+    `${encodeURIComponent(primaryKey)}?domain=${encodeURIComponent(domain)}${strict}`;
+  return doRequest<Record<string, unknown>>(
+    'PATCH',
+    path,
+    { ...partial, domainId: domain },
     opts,
   );
 }

@@ -95,6 +95,40 @@ describe("em.publish — happy path", () => {
     expect(sendMock.mock.calls[0][0].id).toBe("evt-ext-1");
     expect(sendMock.mock.calls[0][0].name).toBe("RESUME_DOWNLOADED");
   });
+
+  it("redacts RMHR manual identity from EventInstance/Audit while forwarding it unchanged", async () => {
+    const event = {
+      ...VALID_RESUME_DOWNLOADED,
+      payload: {
+        ...VALID_RESUME_DOWNLOADED.payload,
+        candidate_name: "张三",
+        candidate_phone: "13800138000",
+        candidate_identity_source: "rmhr_manual_refill",
+      },
+    };
+
+    await em.publish("RESUME_DOWNLOADED", event, {
+      source: "raas-bridge",
+      externalEventId: "evt-manual-identity",
+    });
+
+    const instancePayload = prismaMock.eventInstance.create.mock.calls[0][0].data.payloadSummary;
+    const auditPayload = prismaMock.auditLog.create.mock.calls[0][0].data.payload;
+    expect(instancePayload).not.toContain("张三");
+    expect(instancePayload).not.toContain("13800138000");
+    expect(auditPayload).not.toContain("张三");
+    expect(auditPayload).not.toContain("13800138000");
+    expect(instancePayload).toContain("[REDACTED]");
+    expect(auditPayload).toContain("[REDACTED]");
+
+    expect(sendMock.mock.calls[0][0].data).toMatchObject({
+      payload: {
+        candidate_name: "张三",
+        candidate_phone: "13800138000",
+        candidate_identity_source: "rmhr_manual_refill",
+      },
+    });
+  });
 });
 
 describe("em.publish — schema reject", () => {

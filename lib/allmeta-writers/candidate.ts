@@ -12,6 +12,7 @@
 
 import {
   safeWriteInstance,
+  safePatchInstance,
   compact,
   nonEmptyString,
   asNumberOrNull,
@@ -27,9 +28,8 @@ export type WriteCandidateInput = {
   parsed: Record<string, unknown>;
   /** Canonical phone returned by partner-pg save; null means no strong mobile. */
   normalized_phone?: string | null;
-  /** Final values returned by a partner-PG phone-hit UPDATE. When present they
-   * override RoboHire fields, preventing the graph identity from diverging
-   * from the authoritative Candidate row. */
+  /** Final values from a partner-PG Candidate insert or phone-hit update. When
+   * present they override RoboHire fields, preventing graph identity drift. */
   persisted_candidate?: {
     name: string;
     mobile: string | null;
@@ -42,6 +42,9 @@ export type WriteCandidateInput = {
     work_years: number | null;
     employee_id: string | null;
   } | null;
+  /** Replay repair mode: update only Candidate identity/contact + lock fields.
+   * Parser-only graph fields are omitted so PG nulls cannot erase them. */
+  identity_lock_only?: boolean;
   // Candidate-lock mirror. resumeParserAgent passes the exact tuple returned by
   // Partner PG so the graph cannot independently reinterpret an RMHR event.
   is_locked?: boolean | null;
@@ -78,28 +81,11 @@ export async function writeCandidateInstance(
       ? input.normalized_phone
       : [p.phone, p.mobile, (p as Record<string, unknown>).phoneNumber],
   ).mobile;
-  const address =
-    nonEmptyString(p.address) ??
-    nonEmptyString(p.currentLocation) ??
-    nonEmptyString(p.location);
-  const workYears = asNumberOrNull(p.workYears ?? p.experienceYears ?? p.work_years);
-  const payload = compact({
+  const identityAndLockPayload = {
     candidate_id: input.candidate_id,
     employee_id: nonEmptyString(stored?.employee_id ?? input.employee_id),
     name: parsedName ?? '未命名候选人',
     phone,
-    email: nonEmptyString(p.email),
-    gender: nonEmptyString(p.gender),
-    birth_date: asIsoDateOrNull(p.birthDate ?? p.birth_date),
-    address,
-    highest_acquired_degree:
-      nonEmptyString(p.highestDegree) ??
-      nonEmptyString(
-        p.education &&
-          Array.isArray(p.education) &&
-          (p.education[0] as Record<string, unknown>)?.degree,
-      ),
-    work_years: workYears,
     // Lock-mirror fields are included when the caller supplies the Partner PG snapshot.
     ...(input.is_locked !== undefined ? { is_locked: input.is_locked ?? undefined } : {}),
     ...(input.lock_start_time !== undefined
@@ -108,9 +94,76 @@ export async function writeCandidateInstance(
     ...(input.blacklist_status !== undefined
       ? { blacklist_status: nonEmptyString(input.blacklist_status) }
       : {}),
-  });
+  };
+  const buildFullPayload = (source: Record<string, unknown>) => {
+    const address =
+      nonEmptyString(source.address) ??
+      nonEmptyString(source.currentLocation) ??
+      nonEmptyString(source.location);
+    const workYears = asNumberOrNull(
+      source.workYears ?? source.experienceYears ?? source.work_years,
+    );
+    return compact({
+      ...identityAndLockPayload,
+      email: nonEmptyString(source.email),
+      gender: nonEmptyString(source.gender),
+      birth_date: asIsoDateOrNull(source.birthDate ?? source.birth_date),
+      address,
+      highest_acquired_degree:
+        nonEmptyString(source.highestDegree) ??
+        nonEmptyString(
+          source.education &&
+            Array.isArray(source.education) &&
+            (source.education[0] as Record<string, unknown>)?.degree,
+        ),
+      work_years: workYears,
+    });
+  };
 
-  const result = await safeWriteInstance('Candidate', payload);
+  let result: WriteCandidateResult;
+  if (input.identity_lock_only) {
+    const patched = await safePatchInstance(
+      'Candidate',
+      input.candidate_id,
+      compact(identityAndLockPayload),
+    );
+    if (!patched.ok && patched.status === 404) {
+      // The original Allmeta POST may have failed until its Inngest retries
+      // were exhausted. A fresh event replay then sees an existing PG row but
+      // no graph node. POST is safe only in this explicit 404 branch; seed the
+      // missing node with parser-only graph fields plus persisted identity.
+      const replayCreateSource: Record<string, unknown> = stored
+        ? {
+            ...input.parsed,
+            name: stored.name,
+            phone: stored.mobile_normalized ?? stored.mobile,
+            // These columns are persisted by Partner PG, so an explicit null
+            // remains authoritative and must not fall back to replay parser data.
+            email: stored.email,
+            gender: stored.gender,
+            currentLocation: stored.current_location,
+            birthDate:
+              stored.birth_date ??
+              input.parsed.birthDate ??
+              input.parsed.birth_date,
+            highestDegree:
+              stored.highest_acquired_degree ??
+              input.parsed.highestDegree ??
+              input.parsed.highest_acquired_degree,
+            workYears:
+              stored.work_years ??
+              input.parsed.workYears ??
+              input.parsed.experienceYears ??
+              input.parsed.work_years,
+          }
+        : input.parsed;
+      result = await safeWriteInstance('Candidate', buildFullPayload(replayCreateSource));
+    } else {
+      result = patched;
+    }
+  } else {
+    result = await safeWriteInstance('Candidate', buildFullPayload(p));
+  }
   return {
     ...result,
     nameWasPlaceholder: !parsedName,

@@ -50,6 +50,10 @@ import { prisma } from '@/server/db';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
 import { runLockCheck } from '@/lib/candidate-lock/run-lock-check';
 import { readResumeDownloadedLockEvidence } from '@/lib/rmhr/resume-downloaded-lock';
+import {
+  readRmhrManualCandidateIdentity,
+  redactResumeDownloadedIdentityForLog,
+} from '@/lib/raas-v1/resume-candidate-identity';
 
 // Local alias mirroring the RoboHire parse-resume `data` shape that we
 // historically imported from raas-api-client.ts. After the 2026-05-20
@@ -80,6 +84,7 @@ export const resumeParserAgent = inngest.createFunction(
     //   B) Flat (legacy / publish-test) —
     //      { upload_id, bucket, object_key, parsed, ... }
     const raw = unwrapDownloadedEnvelope(event.data);
+    const authoritativeIdentity = readRmhrManualCandidateIdentity(raw);
     let processingContract;
     try {
       processingContract = parseResumeProcessingContract(raw);
@@ -118,6 +123,8 @@ export const resumeParserAgent = inngest.createFunction(
       locked_by_employee_id: raw.locked_by_employee_id ?? raw.lockedByEmployeeId ?? null,
       client_id: raw.client_id ?? null,
       job_requisition_id: raw.job_requisition_id ?? null,
+      has_rmhr_manual_name: authoritativeIdentity?.name != null,
+      has_rmhr_manual_phone: authoritativeIdentity?.phone != null,
       sourcing_channel_id: raw.sourcing_channel_id ?? raw.sourcingChannelId ?? null,
       hr_folder: raw.hr_folder ?? raw.hrFolder ?? null,
       expectation_payload_keys: expectationPayload
@@ -132,7 +139,7 @@ export const resumeParserAgent = inngest.createFunction(
       from: 'RAAS',
       to: 'AO.resumeParser',
       event_name: event.name,
-      raw_event_data: event.data,
+      raw_event_data: redactResumeDownloadedIdentityForLog(event.data),
     });
 
     // ── 提取 anchor 字段 ──
@@ -239,7 +246,7 @@ export const resumeParserAgent = inngest.createFunction(
       parsed = parsedFromEvent;
       logger.info(
         `[resume-persist] legacy path · 事件已带 parsed.data, 跳过 download+parse · ` +
-          `name="${parsed.name ?? '?'}"`,
+          `parsed_fields=${Object.keys(parsed).length}`,
       );
     } else {
       // v7 §4.8 标准路径: 自己拉 PDF 字节 + 自己 parse.
@@ -334,7 +341,7 @@ export const resumeParserAgent = inngest.createFunction(
         if (!oc.ok) await reportDependencyDegraded(oc, depCtx);
         logger.info(
           `[resume-persist] RoboHire parse-resume OK · cached=${parseRes.cached} ` +
-            `name="${parseRes.data?.name ?? '?'}" requestId=${parseRes.requestId}`,
+            `requestId=${parseRes.requestId}`,
         );
 
         // 3) 算 MD5 etag 作为 saveCandidate dedup 兜底.
@@ -377,6 +384,7 @@ export const resumeParserAgent = inngest.createFunction(
         job_requisition_id: job_requisition_id ?? undefined,
         sourcing_channel_id: sourcing_channel_id ?? undefined,
         expectation_payload: expectationPayload,
+        authoritative_identity: authoritativeIdentity,
         parsed: { data: parsed as Record<string, unknown> },
       };
 
@@ -398,8 +406,10 @@ export const resumeParserAgent = inngest.createFunction(
           application_id: r.application_id,
           candidate_created: r.candidate_created,
           resume_created: r.resume_created,
-          full_input_to_save: input,        // 完整传给 saveCandidateToPartnerPg 的入参
-          full_robohire_parsed: parsed,     // 完整 RoboHire parse-resume 输出
+          authoritative_identity_source: authoritativeIdentity?.source ?? null,
+          has_authoritative_name: authoritativeIdentity?.name != null,
+          has_authoritative_phone: authoritativeIdentity?.phone != null,
+          robohire_parsed_keys: Object.keys(parsed).sort(),
         });
         return r;
       } catch (e) {
@@ -422,18 +432,24 @@ export const resumeParserAgent = inngest.createFunction(
     // ── 5b. 写 Neo4j Candidate + Candidate_Expectation + Resume via Allmeta ──
     const stepKeyForNeo4j = sanitize(String(upload_id));
     await step.run(`write-candidate-neo4j-${stepKeyForNeo4j}`, async () => {
-      if (saveResult.idempotent_replay) {
-        logger.info(
-          `[resume-persist] idempotent replay: preserved Allmeta Candidate identity ${saveResult.candidate_id}`,
-        );
-        return { ok: true as const, skipped: 'idempotent-replay' as const };
-      }
       const lockSnapshot = saveResult.candidate_lock_snapshot;
-      if (!lockSnapshot) {
+      const candidateSnapshot = saveResult.candidate_snapshot;
+      if (!lockSnapshot || !candidateSnapshot) {
         throw new Error(
-          `[resume-persist] partner-pg returned no Candidate lock snapshot for ${saveResult.candidate_id}`,
+          `[resume-persist] partner-pg returned incomplete Candidate snapshot for ${saveResult.candidate_id}`,
         );
       }
+      // New candidates historically projected parser-only graph fields such as
+      // birth date / degree / work years. Keep that behavior while replacing
+      // only the missing name with the exact Partner-PG value. Phone hits use
+      // the full persisted row; transport replays use the identity/lock-only
+      // projection below so PG nulls cannot erase parser-only graph fields.
+      const candidateMirrorParsed = saveResult.candidate_created
+        ? {
+            ...(parsed as Record<string, unknown>),
+            name: candidateSnapshot.name,
+          }
+        : (parsed as Record<string, unknown>);
       const r = await writeCandidateInstance({
         candidate_id: saveResult.candidate_id,
         // Mirror the exact tuple committed by Partner PG. Re-deriving from the
@@ -441,14 +457,18 @@ export const resumeParserAgent = inngest.createFunction(
         employee_id: lockSnapshot.employee_id,
         is_locked: lockSnapshot.is_locked,
         lock_start_time: lockSnapshot.lock_start_time,
-        parsed: parsed as unknown as Record<string, unknown>,
+        parsed: candidateMirrorParsed,
         // Candidate contact mirrors the exact 11-digit value committed to partner PG;
         // raw RoboHire phone remains only in Resume.raw_parse_result.
         normalized_phone: saveResult.mobile_normalized,
         // A phone hit may intentionally preserve an established Candidate name
         // and other identity fields. Mirror the UPDATE RETURNING snapshot so
         // Allmeta cannot overwrite that candidate with conflicting parser data.
-        persisted_candidate: saveResult.candidate_snapshot,
+        persisted_candidate: saveResult.candidate_created ? null : candidateSnapshot,
+        // A replay repairs only identity + lock. Candidate columns that Partner
+        // PG does not populate (birth date / degree / work years) must not be
+        // sent as null and erase the earlier parser-derived graph values.
+        identity_lock_only: saveResult.idempotent_replay,
       });
       if (r.ok) {
         logger.info(`[resume-persist] ✓ allmeta wrote Candidate ${saveResult.candidate_id}`);
@@ -473,6 +493,14 @@ export const resumeParserAgent = inngest.createFunction(
           }).catch(() => { /* never break the agent run on observability */ });
         }
       } else {
+        // RMHR manual identity is the exact bug-fixed path: do not announce a
+        // successfully processed resume while its authoritative Candidate
+        // identity exists only in Partner PG. Inngest retries this failed step;
+        // a later event replay can also re-read and mirror the PG snapshot.
+        if (authoritativeIdentity) {
+          logger.warn('[resume-persist] RMHR manual Candidate mirror failed; retry required');
+          throw new Error('[resume-persist] RMHR manual Candidate mirror failed');
+        }
         logger.warn(`[resume-persist] allmeta Candidate write failed: ${r.error}`);
       }
       return r;
@@ -590,7 +618,7 @@ export const resumeParserAgent = inngest.createFunction(
       processing_mode: processingContract?.processing_mode,
       processing_reason: processingContract?.processing_reason,
       // parsed.data 透传 (matcher 仍可以用作 resume text 来源)
-      parsed: { data: parsed as unknown as Record<string, unknown> },
+      parsed: { data: parsed as Record<string, unknown> },
       // 持久化的产物 — 让下游知道 candidate_id 已经存在
       candidate_id: saveResult.candidate_id,
       resume_id: saveResult.resume_id,
@@ -636,7 +664,7 @@ export const resumeParserAgent = inngest.createFunction(
       filename: (filename ?? 'resume.pdf').trim(),
       bucket,
       object_key,
-      full_payload: processedPayload,    // 完整 emit payload (含 parsed.data, snapshot 等)
+      parsed_keys: Object.keys(parsed).sort(),
     });
     if (!lockOnly) {
       await step.sendEvent('emit-resume-processed', {
@@ -694,7 +722,8 @@ export const resumeParserAgent = inngest.createFunction(
       ok: true,
       upload_id,
       candidate_id: saveResult.candidate_id,
-      candidate_name: parsed.name ?? null,
+      candidate_name:
+        saveResult.candidate_snapshot?.name ?? parsed.name ?? null,
       resume_id: saveResult.resume_id,
       application_id: saveResult.application_id,
       is_new_candidate: saveResult.candidate_created,

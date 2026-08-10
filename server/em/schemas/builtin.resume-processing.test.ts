@@ -36,6 +36,33 @@ describe('resume-processing fallback event schemas', () => {
     ).toBe(true);
   });
 
+  it('accepts the explicit RMHR manual identity extension and rejects an unknown source', () => {
+    expect(
+      schemaFor('RESUME_DOWNLOADED').safeParse({
+        payload: downloadedPayload({
+          candidate_name: '张三',
+          candidate_phone: '13800138000',
+          candidate_identity_source: 'rmhr_manual_refill',
+        }),
+      }).success,
+    ).toBe(true);
+    expect(
+      schemaFor('RESUME_DOWNLOADED').safeParse({
+        payload: downloadedPayload({
+          candidate_name: '张三',
+          candidate_identity_source: 'untrusted_display_field',
+        }),
+      }).success,
+    ).toBe(false);
+    expect(
+      schemaFor('RESUME_DOWNLOADED').safeParse({
+        payload: downloadedPayload({
+          candidate_identity_source: 'rmhr_manual_refill',
+        }),
+      }).success,
+    ).toBe(false);
+  });
+
   it('rejects rmhr_deferred when operator_id is missing', () => {
     const parsed = schemaFor('RESUME_DOWNLOADED').safeParse({
       payload: downloadedPayload({

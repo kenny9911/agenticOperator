@@ -100,6 +100,54 @@ describe('saveCandidateToPartnerPg — mainland mobile normalization', () => {
     expect(result.mobile_review_status).not.toBe('valid');
     expect(resumeInsert()?.params[6]).toContain(phone);
   });
+
+  it('uses RMHR manual identity for Candidate while preserving raw RoboHire evidence', async () => {
+    const result = await saveCandidateToPartnerPg({
+      ...base,
+      authoritative_identity: {
+        source: 'rmhr_manual_refill',
+        name: '人工姓名',
+        phone: '13800138000',
+      },
+      parsed: {
+        data: {
+          name: null,
+          phone: '13900139000',
+          rawText: 'original parser result',
+        },
+      },
+    });
+
+    const insert = candidateInsert();
+    expect(insert?.params[1]).toBe('人工姓名');
+    expect(insert?.params[2]).toBe('13800138000');
+    expect(insert?.params[3]).toBe('13800138000');
+    expect(result.mobile_normalized).toBe('13800138000');
+    expect(result.candidate_snapshot).toMatchObject({
+      name: '人工姓名',
+      mobile: '13800138000',
+      mobile_normalized: '13800138000',
+    });
+    expect(resumeInsert()?.params[6]).toContain('13900139000');
+    expect(resumeInsert()?.params[6]).not.toContain('人工姓名');
+  });
+
+  it('fails closed on an invalid manual phone instead of falling back to parser phone', async () => {
+    const result = await saveCandidateToPartnerPg({
+      ...base,
+      authoritative_identity: {
+        source: 'rmhr_manual_refill',
+        name: null,
+        phone: 'not-a-phone',
+      },
+      parsed: { data: { name: '解析姓名', phone: '13800138000' } },
+    });
+
+    expect(candidateInsert()?.params[2]).toBeNull();
+    expect(result.mobile_normalized).toBeNull();
+    expect(result.mobile_review_status).toBe('invalid');
+    expect(mobileLookup()).toBeUndefined();
+  });
 });
 
 describe('saveCandidateToPartnerPg — phone is the only identity key', () => {

@@ -48,6 +48,10 @@ export type ResumeDownloadedData = ResumeProcessingContractData & {
   job_requisition_id?: string | null;
   job_requisition_ids?: string[];
   job_posting_id?: string | null;
+  /** RMHR-accepted operator refill; authoritative only with the source marker. */
+  candidate_name?: string | null;
+  candidate_phone?: string | null;
+  candidate_identity_source?: 'rmhr_manual_refill' | null;
 };
 
 // ─── §3.2 RAAS 期望的解析结果（4 对象嵌套）────────────────

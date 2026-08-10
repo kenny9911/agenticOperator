@@ -11,7 +11,35 @@ let runtimeRows: Array<{
   status: string | null;
 }> = [];
 let transportRows: Array<{ candidate_id: string; resume_id: string }> = [];
-let candidateContactRows: Array<{ mobile: string | null; mobile_normalized: string | null }> = [];
+let candidateContactRows: Array<{
+  name: string;
+  mobile: string | null;
+  mobile_normalized: string | null;
+  email: string | null;
+  gender: string | null;
+  birth_date: Date | string | null;
+  current_location: string | null;
+  highest_acquired_degree: string | null;
+  work_years: number | null;
+  employee_id: string | null;
+  is_locked: boolean;
+  lock_start_time: Date | string | null;
+}> = [];
+
+const persistedCandidate = {
+  name: '既有姓名',
+  mobile: '13800138000',
+  mobile_normalized: '13800138000',
+  email: 'stored@example.com',
+  gender: '女',
+  birth_date: '1990-01-01T00:00:00.000Z',
+  current_location: '上海',
+  highest_acquired_degree: '本科',
+  work_years: 8,
+  employee_id: 'EMP-OWNER',
+  is_locked: true,
+  lock_start_time: '2026-07-01T00:00:00.000Z',
+};
 
 vi.mock('./client', () => ({
   withTx: vi.fn(async (fn: (c: unknown) => Promise<unknown>) => {
@@ -24,7 +52,7 @@ vi.mock('./client', () => ({
         if (/SELECT resume_id, candidate_id[\s\S]*FROM resume[\s\S]*bucket_name/i.test(text)) {
           return { rows: transportRows };
         }
-        if (/SELECT mobile, mobile_normalized[\s\S]*FROM candidate/i.test(text)) {
+        if (/SELECT name, mobile, mobile_normalized[\s\S]*FROM candidate/i.test(text)) {
           return { rows: candidateContactRows };
         }
         if (/UPDATE resume SET[\s\S]*RETURNING resume_id/i.test(text)) {
@@ -64,7 +92,7 @@ beforeEach(() => {
 describe('saveCandidateToPartnerPg — transport idempotency is not identity dedup', () => {
   it('same completed upload refreshes the exact resume and never rewrites Candidate identity', async () => {
     runtimeRows = [{ candidate_id: 'candidate-existing', resume_id: 'resume-existing', status: 'completed' }];
-    candidateContactRows = [{ mobile: '13800138000', mobile_normalized: '13800138000' }];
+    candidateContactRows = [persistedCandidate];
 
     const result = await saveCandidateToPartnerPg({
       ...base,
@@ -88,7 +116,12 @@ describe('saveCandidateToPartnerPg — transport idempotency is not identity ded
       mobile_normalized: '13800138000',
       mobile_review_status: 'valid',
       idempotent_replay: true,
-      candidate_lock_snapshot: null,
+      candidate_snapshot: persistedCandidate,
+      candidate_lock_snapshot: {
+        employee_id: 'EMP-OWNER',
+        is_locked: true,
+        lock_start_time: '2026-07-01T00:00:00.000Z',
+      },
     });
     expect(queries[0]).toMatchObject({ params: [`upload:${base.upload_id}`] });
     expect(queries[1].text).toMatch(/FROM resume_upload_runtime[\s\S]*FOR UPDATE/i);
@@ -125,7 +158,7 @@ describe('saveCandidateToPartnerPg — transport idempotency is not identity ded
       { candidate_id: 'candidate-proven', resume_id: 'resume-proven', status: 'pending' },
     ];
     transportRows = [{ candidate_id: 'candidate-proven', resume_id: 'resume-proven' }];
-    candidateContactRows = [{ mobile: '13800138000', mobile_normalized: '13800138000' }];
+    candidateContactRows = [persistedCandidate];
 
     const result = await saveCandidateToPartnerPg({
       ...base,

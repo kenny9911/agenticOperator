@@ -42,6 +42,17 @@ function addResumeProcessingContractIssues(
   for (const issue of validateResumeProcessingContract(payload)) {
     ctx.addIssue({ code: 'custom', path: [issue.path], message: issue.message });
   }
+  if (
+    payload.candidate_identity_source === 'rmhr_manual_refill' &&
+    payload.candidate_name == null &&
+    payload.candidate_phone == null
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['candidate_identity_source'],
+      message: 'rmhr_manual_refill requires candidate_name or candidate_phone',
+    });
+  }
 }
 
 // ── Event schemas ─────────────────────────────────────────────────────────
@@ -86,6 +97,9 @@ const RESUME_DOWNLOADED_v1 = envelope(
     size: z.number().nullable().optional(),
     employee_id: z.string().nullable().optional(),
     job_requisition_id: z.string().nullable().optional(),
+    candidate_name: z.string().trim().min(1).nullable().optional(),
+    candidate_phone: z.string().trim().min(1).nullable().optional(),
+    candidate_identity_source: z.literal('rmhr_manual_refill').nullable().optional(),
     // ADR-0040 — RAAS Nextcloud 路径预填的窄化客户需求 id 数组(可空/缺省)。
     job_requisition_ids: z.array(z.string()).optional(),
     // Browser-extension upload contract. RAAS only sends non-empty fields;

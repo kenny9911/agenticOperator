@@ -1,10 +1,10 @@
 // Shared helpers for allmeta writers.
 
-import { writeInstance, AllmetaApiError } from '@/lib/allmeta-client';
+import { writeInstance, patchInstance, AllmetaApiError } from '@/lib/allmeta-client';
 
 export type WriteResult =
   | { ok: true; instance: Record<string, unknown> }
-  | { ok: false; error: string };
+  | { ok: false; error: string; status?: number };
 
 /**
  * Soft-fail wrapper around allmeta writeInstance.
@@ -18,11 +18,32 @@ export async function safeWriteInstance(
     const r = await writeInstance(label, payload);
     return { ok: true, instance: r as unknown as Record<string, unknown> };
   } catch (e) {
+    const status = e instanceof AllmetaApiError ? e.status : undefined;
     const msg =
       e instanceof AllmetaApiError
         ? `${e.status} ${e.message}`
         : (e as Error).message ?? String(e);
-    return { ok: false, error: msg.slice(0, 400) };
+    return { ok: false, error: msg.slice(0, 400), ...(status ? { status } : {}) };
+  }
+}
+
+/** Partial-update counterpart used when a replay must preserve unmentioned
+ * properties on an existing Allmeta instance. */
+export async function safePatchInstance(
+  label: string,
+  primaryKey: string,
+  partial: Record<string, unknown>,
+): Promise<WriteResult> {
+  try {
+    const r = await patchInstance(label, primaryKey, partial);
+    return { ok: true, instance: r };
+  } catch (e) {
+    const status = e instanceof AllmetaApiError ? e.status : undefined;
+    const msg =
+      e instanceof AllmetaApiError
+        ? `${e.status} ${e.message}`
+        : (e as Error).message ?? String(e);
+    return { ok: false, error: msg.slice(0, 400), ...(status ? { status } : {}) };
   }
 }
 
