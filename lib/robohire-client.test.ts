@@ -10,20 +10,53 @@ import {
   inviteCandidateDirect,
   RobohireApiError,
 } from './robohire-client';
+import type { AgentLogger } from './agent-logger';
+import { SYNTHETIC_JPEG, SYNTHETIC_PNG } from './resume-convert/image-test-fixtures';
+
+const logApiCall = vi.hoisted(() => vi.fn());
+vi.mock('./external-api-log', () => ({ logApiCall }));
 
 const env = {
   ROBOHIRE_API_BASE_URL: 'https://api.robohire.io',
   ROBOHIRE_API_KEY: 'rh_test_key',
   ROBOHIRE_TIMEOUT_MS: '120000',
 };
-const VALID_PDF = Buffer.from('%PDF-1.7\n1 0 obj\n<<>>\nendobj\nstartxref\n0\n%%EOF\n');
+function classicPdf(): Buffer {
+  const body = Buffer.from(
+    '%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n',
+    'ascii',
+  );
+  const xref = Buffer.from(
+    'xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n' +
+      'trailer\n<< /Size 2 /Root 1 0 R >>\n',
+    'ascii',
+  );
+  return Buffer.concat([
+    body,
+    xref,
+    Buffer.from(`startxref\n${body.length}\n%%EOF\n`, 'ascii'),
+  ]);
+}
+
+const VALID_PDF = classicPdf();
 const REAL_DOCX = readFileSync(
   join(process.cwd(), 'lib', 'resume-convert', 'fixtures', 'synthetic-resume.docx'),
 );
 
+function capturingLogger(apiCall: AgentLogger['apiCall']): AgentLogger {
+  return {
+    ctx: { agent: 'test', runId: 'run-test', traceId: 'trace-test' },
+    step: async <T>(_stepId: string, fn: () => Promise<T>) => fn(),
+    event: vi.fn(),
+    apiCall,
+    currentLogFile: () => 'test.log',
+  };
+}
+
 beforeEach(() => {
   Object.assign(process.env, env);
   delete process.env.DOCUMENT_CONVERTER_URL;
+  logApiCall.mockClear();
   vi.restoreAllMocks();
 });
 
@@ -93,19 +126,27 @@ describe('parseResumeDirect', () => {
   // problem, not a vendor outage — it must NOT be coded SERVER (which the
   // dependency-health classifier treats as a recoverable RoboHire degradation).
   it('throws UNPARSEABLE when RoboHire reports no extractable text (200 success:false)', async () => {
+    const vendorError =
+      'PDF extraction failed: no text for 张三候选人.pdf / 19999990001 / private resume body';
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
           success: false,
-          error: 'PDF extraction failed: no text could be extracted by any method',
+          error: vendorError,
           requestId: 'req_np',
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(VALID_PDF, 'scan.pdf')).rejects.toMatchObject({
+    const error = await parseResumeDirect(VALID_PDF, 'scan.pdf').catch((caught) => caught);
+    expect(error).toMatchObject({
       code: 'UNPARSEABLE',
       requestId: 'req_np',
+      message: 'parse-resume returned success=false (UNPARSEABLE)',
+    });
+    expect(JSON.stringify(logApiCall.mock.calls)).not.toContain(vendorError);
+    expect(logApiCall.mock.calls.at(-1)?.[0]?.response).toMatchObject({
+      error_category: 'UNPARSEABLE',
     });
   });
 
@@ -137,7 +178,7 @@ describe('parseResumeDirect', () => {
     process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
     const convertedPdf = VALID_PDF;
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(convertedPdf, {
+      .mockResolvedValueOnce(new Response(new Uint8Array(convertedPdf), {
         status: 200,
         headers: { 'content-type': 'application/pdf' },
       }))
@@ -155,8 +196,110 @@ describe('parseResumeDirect', () => {
     expect(fetchSpy.mock.calls[0][0]).toBe('http://gotenberg:3000/forms/libreoffice/convert');
     const robohireBody = fetchSpy.mock.calls[1][1]?.body as FormData;
     const uploadedPdf = robohireBody.get('file') as File;
-    expect(uploadedPdf.name).toBe('candidate.pdf');
+    expect(uploadedPdf.name).toBe('resume.pdf');
+    expect(uploadedPdf.type).toBe('application/pdf');
     expect(Buffer.from(await uploadedPdf.arrayBuffer())).toEqual(convertedPdf);
+  });
+
+  it('converts an image first and never sends or logs the original image bytes/filename to RoboHire', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const convertedPdf = VALID_PDF;
+    const apiCall = vi.fn<AgentLogger['apiCall']>();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(new Uint8Array(convertedPdf), {
+        status: 200,
+        headers: { 'content-type': 'application/pdf' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        data: {
+          name: 'Image Candidate',
+          email: 'image.candidate@example.invalid',
+          phone: '19999990001',
+          rawText: 'PRIVATE SYNTHETIC RESUME BODY',
+          experience: [{ company: 'Private Example Company' }],
+          education: [{ institution: 'Private Example University' }],
+          skills: { technical: ['TypeScript', 'Testing'] },
+        },
+        cached: false,
+        requestId: 'req_image_converted',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const result = await parseResumeDirect(SYNTHETIC_JPEG, '张三候选人.JPG', {
+      logger: capturingLogger(apiCall),
+    });
+
+    expect(result.requestId).toBe('req_image_converted');
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const converterBody = fetchSpy.mock.calls[0][1]?.body as FormData;
+    const converterImage = converterBody.get('files') as File;
+    expect(converterImage.name).toBe('resume.jpeg');
+    expect(converterImage.type).toBe('image/jpeg');
+    expect(Buffer.from(await converterImage.arrayBuffer())).toEqual(SYNTHETIC_JPEG);
+
+    const robohireBody = fetchSpy.mock.calls[1][1]?.body as FormData;
+    const uploadedPdf = robohireBody.get('file') as File;
+    const uploadedBytes = Buffer.from(await uploadedPdf.arrayBuffer());
+    expect(uploadedPdf.name).toBe('resume.pdf');
+    expect(uploadedPdf.type).toBe('application/pdf');
+    expect(uploadedBytes).toEqual(convertedPdf);
+    expect(uploadedBytes).not.toEqual(SYNTHETIC_JPEG);
+
+    const parseCall = apiCall.mock.calls.find(([label]) => label === 'RoboHire.parseResume');
+    expect(parseCall?.[1]?.request).toMatchObject({
+      filename: 'resume.pdf',
+      source_format: 'jpeg',
+      converted: true,
+    });
+    expect(parseCall?.[1]?.response).toEqual({
+      http_status: 200,
+      success: true,
+      cached: false,
+      request_id: 'req_image_converted',
+      data_present: true,
+      data_field_count: 7,
+      experience_count: 1,
+      education_count: 1,
+      skill_count: 2,
+      error_category: null,
+    });
+
+    const durableCall = logApiCall.mock.calls.find(([entry]) =>
+      entry?.label === 'RoboHire.parseResume');
+    expect(durableCall?.[0]?.response).toEqual(parseCall?.[1]?.response);
+    const auditJson = JSON.stringify({ parseCall, durableCall });
+    for (const forbidden of [
+      '张三候选人',
+      'Image Candidate',
+      'image.candidate@example.invalid',
+      '19999990001',
+      'PRIVATE SYNTHETIC RESUME BODY',
+      'Private Example Company',
+      'Private Example University',
+    ]) {
+      expect(auditJson).not.toContain(forbidden);
+    }
+  });
+
+  it('keeps image-only converted PDFs UNPARSEABLE when RoboHire extracts no text', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(new Uint8Array(VALID_PDF), {
+        status: 200,
+        headers: { 'content-type': 'application/pdf' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: false,
+        error: 'PDF extraction failed: no text could be extracted by any method',
+        requestId: 'req_image_no_text',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    await expect(parseResumeDirect(SYNTHETIC_PNG, 'scan.png')).rejects.toMatchObject({
+      code: 'UNPARSEABLE',
+      requestId: 'req_image_no_text',
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it('never calls RoboHire when Office conversion fails', async () => {

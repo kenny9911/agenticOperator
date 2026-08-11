@@ -20,7 +20,8 @@
 //
 //   Sink 文件: logs/robohire-YYYY-MM-DD.log   (覆盖 AO_LOG_DIR env)
 //   每行 1 个 JSON: { ts, label, url, method, status, duration_ms, request, response/error }
-//   全字段 in/out — 不 truncate, 不 cherry-pick.
+//   默认记录完整 in/out；parse-resume 因包含候选人身份与简历正文，只记录
+//   格式、字节数、状态、request id 与字段/数组计数。
 
 import { currentLogger, type AgentLogger } from './agent-logger';
 import { logApiCall } from './external-api-log';
@@ -38,6 +39,7 @@ async function instrumentedFetch<T>(
   parse: (res: Response) => Promise<T>,
   traceId?: string,
   loggerOverride?: AgentLogger | null,
+  summarizeResponseForLog?: (response: unknown, status: number) => unknown,
 ): Promise<T> {
   // 2026-05-27 — 优先用 agent 显式传入的 fileLogger(闭包,带 run_id,Inngest
   // step.run 内部也稳定);ALS-based currentLogger() 在 step.run 里不可靠.
@@ -84,7 +86,10 @@ async function instrumentedFetch<T>(
       responseBody = null;
     }
   }
-  // 独立 sink — 必落,绕过 ALS,完整 in/out
+  const loggedResponse = summarizeResponseForLog
+    ? summarizeResponseForLog(responseBody, status)
+    : responseBody;
+  // 独立 sink — 必落,绕过 ALS；PII 类响应由调用方先收敛为元数据。
   logApiCall({
     category: 'robohire',
     label,
@@ -96,7 +101,7 @@ async function instrumentedFetch<T>(
     status,
     duration_ms: Date.now() - start,
     request,
-    response: responseBody,
+    response: loggedResponse,
   });
   // Agent logger 兜底(ALS context 在的话同步一份)
   logger?.apiCall(label, {
@@ -105,7 +110,7 @@ async function instrumentedFetch<T>(
     request,
     status,
     durationMs: Date.now() - start,
-    response: responseBody,
+    response: loggedResponse,
   });
   return parse(res);
 }
@@ -173,6 +178,55 @@ function isUnparseableDocMessage(msg: string): boolean {
   );
 }
 
+/**
+ * Resume parsing returns candidate identity and the full extracted resume.
+ * Those values are needed by the caller, but must never be copied into the
+ * durable external-API or per-run audit logs. Keep only operational metadata
+ * and cardinalities; error text is classified instead of echoed because a
+ * vendor message may repeat the uploaded filename or extracted content.
+ */
+function summarizeParseResumeResponseForLog(response: unknown, status: number): unknown {
+  if (response == null || typeof response !== 'object' || Array.isArray(response)) {
+    return {
+      http_status: status,
+      response_kind: response == null ? 'empty' : typeof response,
+    };
+  }
+
+  const body = response as Record<string, unknown>;
+  const data =
+    body.data != null && typeof body.data === 'object' && !Array.isArray(body.data)
+      ? (body.data as Record<string, unknown>)
+      : null;
+  const skills = data?.skills;
+  const skillCount = Array.isArray(skills)
+    ? skills.length
+    : skills != null && typeof skills === 'object'
+      ? Object.values(skills as Record<string, unknown>).reduce<number>(
+          (count, value) => count + (Array.isArray(value) ? value.length : 0),
+          0,
+        )
+      : 0;
+  const error = typeof body.error === 'string' ? body.error : null;
+
+  return {
+    http_status: status,
+    success: body.success === true,
+    cached: typeof body.cached === 'boolean' ? body.cached : null,
+    request_id: typeof body.requestId === 'string' ? body.requestId : null,
+    data_present: data !== null,
+    data_field_count: data ? Object.keys(data).length : 0,
+    experience_count: Array.isArray(data?.experience) ? data.experience.length : 0,
+    education_count: Array.isArray(data?.education) ? data.education.length : 0,
+    skill_count: skillCount,
+    error_category: error
+      ? isUnparseableDocMessage(error)
+        ? 'UNPARSEABLE'
+        : 'VENDOR_ERROR'
+      : null,
+  };
+}
+
 export type CommonOpts = {
   traceId?: string;
   timeoutMs?: number;
@@ -233,7 +287,9 @@ export async function parseResumeDirect(
   form.append(
     'file',
     new Blob([new Uint8Array(prepared.pdf)], { type: 'application/pdf' }),
-    prepared.filename,
+    // Candidate filenames frequently contain PII. GoHire only needs a stable
+    // PDF name; keep the original name out of both vendor and local logs.
+    'resume.pdf',
   );
 
   const headers: Record<string, string> = {
@@ -243,9 +299,11 @@ export async function parseResumeDirect(
 
   const url = `${baseUrl}/api/v1/parse-resume`;
   // Logged request body is a metadata-only summary (we can't serialize the
-  // multipart form bytes meaningfully; PDF blob would dump base64 noise).
+  // multipart form bytes meaningfully; PDF blob would dump base64 noise). Do
+  // not repeat the caller-provided filename here because it often contains
+  // candidate PII and this summary is mirrored into durable audit logs.
   const requestSummary = {
-    filename: prepared.filename,
+    filename: 'resume.pdf',
     source_format: prepared.sourceFormat,
     converted: prepared.converted,
     original_bytes: prepared.originalBytes,
@@ -269,6 +327,7 @@ export async function parseResumeDirect(
     (res) => handleJsonResponse<RobohireParseResumeResponse>(res, 'parse-resume'),
     opts.traceId,
     opts.logger,
+    summarizeParseResumeResponseForLog,
   );
 }
 
@@ -589,7 +648,12 @@ async function handleJsonResponse<T>(res: Response, op: string): Promise<T> {
       op === 'parse-resume' && typeof body?.error === 'string' && isUnparseableDocMessage(body.error)
         ? 'UNPARSEABLE'
         : statusToCode(res.status);
-    throw new RobohireApiError(res.status, code, errMsg, body?.requestId);
+    throw new RobohireApiError(
+      res.status,
+      code,
+      op === 'parse-resume' ? `parse-resume failed (${code})` : errMsg,
+      body?.requestId,
+    );
   }
 
   if (!body || body.success === false) {
@@ -601,7 +665,9 @@ async function handleJsonResponse<T>(res: Response, op: string): Promise<T> {
     throw new RobohireApiError(
       res.status,
       code,
-      `${op} returned success=false: ${errMsg}`,
+      op === 'parse-resume'
+        ? `parse-resume returned success=false (${code})`
+        : `${op} returned success=false: ${errMsg}`,
       body?.requestId,
     );
   }
