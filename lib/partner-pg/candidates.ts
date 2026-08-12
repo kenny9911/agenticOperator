@@ -25,10 +25,12 @@
 
 import { randomUUID } from 'node:crypto';
 import { withTx } from './client';
+import { currentLogger } from '@/lib/agent-logger';
 import {
   resolveCandidateMobile,
   type CandidateMobileStatus,
 } from '@/lib/phone/normalize-e164';
+import { canonicalGender, isDroppedGender } from '@/lib/gender/canonical-gender';
 import {
   normalizeCandidateExpectationPayload,
   type CandidateExpectationPatch,
@@ -352,7 +354,22 @@ export async function saveCandidateToPartnerPg(
   const mobile_normalized = mobileResolution.mobile;
   const needsMobileReview = mobileResolution.status !== 'valid';
   const email = nonEmpty(parsed.email);
-  const gender = nonEmpty(parsed.gender);
+  // Partner constrains the column to 'male' | 'female' | NULL
+  // (candidate_gender_canonical_check). The parser reports whatever the résumé
+  // says — '男', '⼥', '♂', '性别：邱杰' — and one unmapped string would abort the
+  // whole ingest transaction, losing Candidate + Resume over a cosmetic field.
+  // Unmappable values become NULL; the raw string survives in raw_parse_result.
+  const genderRaw = parsed.gender;
+  const gender = canonicalGender(genderRaw);
+  if (isDroppedGender(genderRaw)) {
+    // Value-free log — a junk gender is sometimes a misplaced name ('性别：邱杰').
+    // upload_id is enough to pull the literal from resume.raw_parse_result and
+    // decide whether the token table in lib/gender/canonical-gender.ts needs it.
+    currentLogger()?.event('partner_pg.gender_dropped', {
+      upload_id: input.upload_id,
+      raw_length: String(genderRaw).length,
+    });
+  }
 
   // Structured-column derivations from the RoboHire parse-resume output.
   // These map 1:1 to partner Postgres `resume.*` columns so RAAS readers

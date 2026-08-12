@@ -6,6 +6,7 @@
 
 import type { MatchField } from './rules-data';
 import { ruleCheckKey } from '@/lib/phone/normalize-e164';
+import { canonicalGender } from '@/lib/gender/canonical-gender';
 
 const s = (raw: string | null | undefined): string => (raw ?? '').trim();
 
@@ -28,12 +29,11 @@ export function normalizeEmail(raw: string | null | undefined): string {
   return s(raw).toLowerCase();
 }
 
-/** Canonicalize common male/female spellings; otherwise pass through normalized. */
+/** Canonicalize common male/female spellings; otherwise pass through normalized.
+ *  Shares the mapping table with the DB writers (lib/gender/canonical-gender.ts)
+ *  so matching and persistence can never disagree on what '男' means. */
 export function normalizeGender(raw: string | null | undefined): string {
-  const v = s(raw).toLowerCase();
-  if (['男', 'm', 'male', '男性'].includes(v)) return 'male';
-  if (['女', 'f', 'female', '女性'].includes(v)) return 'female';
-  return v;
+  return canonicalGender(raw) ?? s(raw).toLowerCase();
 }
 
 /** Generic text canonicalization for school / major / degree. Collapses whitespace

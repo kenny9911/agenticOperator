@@ -20,6 +20,7 @@ import {
   type WriteResult,
 } from './_helpers';
 import { resolveCandidateMobile } from '@/lib/phone/normalize-e164';
+import { canonicalGender } from '@/lib/gender/canonical-gender';
 
 export type WriteCandidateInput = {
   candidate_id: string;
@@ -106,7 +107,11 @@ export async function writeCandidateInstance(
     return compact({
       ...identityAndLockPayload,
       email: nonEmptyString(source.email),
-      gender: nonEmptyString(source.gender),
+      // Same vocabulary as partner Postgres ('male' | 'female' | absent). A new
+      // Candidate reaches this writer with `persisted_candidate: null`, i.e. the
+      // raw parser string — canonicalizing here keeps the graph from holding a
+      // second gender vocabulary for the exact rows PG already canonicalized.
+      gender: canonicalGender(source.gender),
       birth_date: asIsoDateOrNull(source.birthDate ?? source.birth_date),
       address,
       highest_acquired_degree:
