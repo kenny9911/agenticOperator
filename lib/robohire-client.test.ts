@@ -342,28 +342,39 @@ describe('matchResumeDirect', () => {
     expect(r.data.recommendation).toBe('STRONG_MATCH');
   });
 
-  it('serializes resume + jd as JSON body and defaults locale to zh', async () => {
+  it('serializes resume + jd as JSON body and defaults locale and employmentType', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(JSON.stringify({ success: true, data: { matchScore: 50, recommendation: 'PARTIAL_MATCH' }, requestId: 'r' })));
     await matchResumeDirect({ resume: 'R', jd: 'J' });
     const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
-    expect(body).toEqual({ resume: 'R', jd: 'J', locale: 'zh' });
+    expect(body).toEqual({
+      resume: 'R',
+      jd: 'J',
+      employmentType: 'outsourcing',
+      locale: 'zh',
+    });
   });
 
-  it('honors an explicit locale override', async () => {
+  it('honors explicit locale and employmentType overrides', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(JSON.stringify({ success: true, data: { matchScore: 50, recommendation: 'PARTIAL_MATCH' }, requestId: 'r' })));
-    await matchResumeDirect({ resume: 'R', jd: 'J', locale: 'en' });
+    await matchResumeDirect({
+      resume: 'R',
+      jd: 'J',
+      locale: 'en',
+      employmentType: 'permanent',
+    });
     const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
     expect(body.locale).toBe('en');
+    expect(body.employmentType).toBe('permanent');
   });
 });
 
 describe('generateJdDirect', () => {
   it('returns generate-jd data on 200', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
           success: true,
@@ -386,6 +397,32 @@ describe('generateJdDirect', () => {
     expect(r.data.title).toBe('Senior FE');
     expect(r.meta?.stages?.parse).toBe('success');
     expect(r.requestId).toBe('req_jd_xyz');
+    const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
+    expect(body).toEqual({
+      prompt: 'Senior Frontend, React, 5 years, Shenzhen',
+      employmentType: 'outsourcing',
+    });
+  });
+
+  it('honors an explicit employmentType override', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: { title: 'Contract FE' },
+          meta: { stages: { parse: 'success', generate: 'success' } },
+          requestId: 'req_jd_override',
+        }),
+      ),
+    );
+
+    await generateJdDirect({
+      prompt: 'Contract frontend role with sufficient detail',
+      employmentType: 'contract',
+    });
+
+    const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
+    expect(body.employmentType).toBe('contract');
   });
 
   it('throws RobohireApiError on 400', async () => {

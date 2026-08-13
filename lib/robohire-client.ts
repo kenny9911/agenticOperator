@@ -28,6 +28,7 @@ import { logApiCall } from './external-api-log';
 import { prepareResumePdf } from './resume-convert/prepare-resume-pdf';
 
 const DEFAULT_TIMEOUT_MS = 300_000;
+const DEFAULT_EMPLOYMENT_TYPE = 'outsourcing';
 
 /** Shared apiCall wrapper — logs request + response (or error) for every RoboHire op. */
 async function instrumentedFetch<T>(
@@ -338,6 +339,8 @@ export type RobohireMatchResumeInput = {
   jd: string;
   candidatePreferences?: string;
   jobMetadata?: string;
+  /** Employment model expected by GoHire; defaults to outsourcing. */
+  employmentType?: string;
   /**
    * 匹配分析输出语言 — RoboHire 据此决定 summary / analysis 文本语言。
    * 调用方不显式指定时,matchResumeDirect 统一回填 'zh'(中文)。可传 'en' 等覆盖。
@@ -373,10 +376,13 @@ export async function matchResumeDirect(
   if (opts.traceId) headers['X-Trace-Id'] = opts.traceId;
 
   const url = `${baseUrl}/api/v1/match-resume`;
-  // /api/v1/match-resume 入参统一补 locale,默认 'zh' —— 调用方未显式指定时
-  // 一律按中文输出匹配分析,可经 input.locale 覆盖(如 'en')。在 HTTP 边界单点
-  // 回填,覆盖所有调用方(当前生产链路 matchResumeAgent + 未来新调用方)。(partner-pg 79a6257)
-  const body = { ...input, locale: input.locale ?? 'zh' };
+  // 在 HTTP 边界统一回填 locale='zh' 与 employmentType='outsourcing',覆盖
+  // 当前生产链路 matchResumeAgent、动态工具和未来新调用方；显式入参仍可覆盖。
+  const body = {
+    ...input,
+    employmentType: input.employmentType ?? DEFAULT_EMPLOYMENT_TYPE,
+    locale: input.locale ?? 'zh',
+  };
   return instrumentedFetch(
     'RoboHire.matchResume',
     url,
@@ -405,6 +411,8 @@ export type RobohireGenerateJdInput = {
   language?: 'en' | 'zh' | 'zh-TW' | 'ja' | 'es' | 'fr' | 'pt' | 'de';
   companyName?: string;
   department?: string;
+  /** Employment model expected by GoHire; defaults to outsourcing. */
+  employmentType?: string;
 };
 
 /**
@@ -471,16 +479,20 @@ export async function generateJdDirect(
   if (opts.traceId) headers['X-Trace-Id'] = opts.traceId;
 
   const url = `${baseUrl}/api/v1/jobs/generate-jd`;
+  const body = {
+    ...input,
+    employmentType: input.employmentType ?? DEFAULT_EMPLOYMENT_TYPE,
+  };
   const resp = await instrumentedFetch(
     'RoboHire.generateJd',
     url,
     'POST',
-    input,
+    body,
     () =>
       fetch(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(input),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(opts.timeoutMs ?? timeoutMs),
       }).catch((e) => {
         throw new RobohireApiError(0, 'NETWORK', `jobs/generate-jd fetch failed: ${(e as Error).message}`);
