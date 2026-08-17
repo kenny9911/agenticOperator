@@ -25,7 +25,7 @@
 #
 # 脚本不读、不打印、不外传任何密钥。macOS 自带 bash 3.2 —— 无关联数组，用平行索引数组。
 #
-# ⚠️ 改本脚本时注意：所有紧跟全角字符（）「」，—— 等）的变量必须写成 ${VAR}，不能写 $VAR。
+# ⚠️ 改本脚本时注意：变量后面紧跟全角字符（）「」，—— 等）时必须用花括号形式，裸写会崩。
 #    macOS bash 3.2 在非 C locale 下会把全角字符的字节吞进变量名，`set -u` 当场退出。
 #    这和 scripts/check-connectivity.sh 的本地补丁是同一个坑（2026-08-17 本脚本首跑踩中）。
 #    自查：node -e 'console.log((require("fs").readFileSync(process.argv[1],"utf8")
@@ -38,20 +38,26 @@ FORCE=0
 CHECK_ONLY=0
 ASSUME_DRAINED=0
 ASSUME_YES=0
-for arg in "$@"; do
-  case "$arg" in
-    -f|--force)   FORCE=1 ;;
-    -n|--check)   CHECK_ONLY=1 ;;
-    --drained)    ASSUME_DRAINED=1 ;;
-    -y|--yes)     ASSUME_YES=1 ;;
+REUSE_IMAGE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--force)   FORCE=1; shift ;;
+    -n|--check)   CHECK_ONLY=1; shift ;;
+    --drained)    ASSUME_DRAINED=1; shift ;;
+    -y|--yes)     ASSUME_YES=1; shift ;;
+    --reuse-image)
+      [[ $# -ge 2 ]] || { echo "--reuse-image 需要一个镜像 tag"; exit 64; }
+      REUSE_IMAGE="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $(basename "$0") [--check] [--force] [--drained] [--yes]"
-      echo "  --check,   -n   只做只读体检 + 预览待升 commit，不 pull / 不构建 / 不重启"
-      echo "  --force,   -f   没有新 commit 也重新构建并重建容器"
-      echo "  --drained       已确认 RAAS 入口已暂停且 running=0/queued=0，跳过交互确认"
-      echo "  --yes,     -y   非交互模式（CI / 无 TTY）：所有确认视为 yes"
+      echo "Usage: $(basename "$0") [--check] [--force] [--drained] [--yes] [--reuse-image TAG]"
+      echo "  --check,   -n     只做只读体检 + 预览待升 commit，不 pull / 不构建 / 不重启"
+      echo "  --force,   -f     没有新 commit 也重新构建并重建容器"
+      echo "  --drained         已确认 RAAS 入口已暂停且 running=0/queued=0，跳过交互确认"
+      echo "  --yes,     -y     非交互模式（CI / 无 TTY）：所有确认视为 yes"
+      echo "  --reuse-image TAG 跳过构建，复用已有镜像（用于上一轮构建成功但后续步骤失败的重跑）。"
+      echo "                    会逐个比对镜像内源码与工作区的 sha256，不一致直接中止。"
       exit 0 ;;
-    *) echo "Unknown arg: $arg (use --help)"; exit 64 ;;
+    *) echo "Unknown arg: $1 (use --help)"; exit 64 ;;
   esac
 done
 
@@ -396,6 +402,7 @@ if [[ -z "${AO_UPGRADE_REEXECED:-}" && "$(self_hash)" != "$SELF_HASH_AT_START" ]
   REEXEC_ARGS=(--force)
   (( ASSUME_DRAINED )) && REEXEC_ARGS+=(--drained)
   (( ASSUME_YES ))     && REEXEC_ARGS+=(--yes)
+  [[ -n "$REUSE_IMAGE" ]] && REEXEC_ARGS+=(--reuse-image "$REUSE_IMAGE")
   exec bash "$SELF_PATH" "${REEXEC_ARGS[@]}"
 fi
 
@@ -404,53 +411,93 @@ step "7/12  本地补丁校验（pull 后）"
 check_patches "pull 后"
 
 # ── 8. 构建新镜像（打新 tag，旧镜像保留作回滚锚点）──────────────────
-step "8/12  构建新镜像（旧栈仍在服务，零影响）"
-NEW_IMAGE="agentic-operator:${TS}-${NEW_SHORT}-${ARCH}"
-sed -i '' "s|^AO_IMAGE=.*|AO_IMAGE=${NEW_IMAGE}|" "$ENV_FILE" || die "无法改写 AO_IMAGE"
-ENV_BUMPED=1
-ok "AO_IMAGE: $OLD_IMAGE → $NEW_IMAGE"
-do_build(){ aoc build app; }
-retry "$BUILD_RETRIES" "compose build app" do_build \
-  || die "构建 $BUILD_RETRIES 次都失败。常见原因：代理没开（拉不到 prisma engines / npm 包）、\
+# 复用已有镜像时的内容校验：把本次改动涉及的源文件在镜像里和工作区里各算一次
+# sha256。运行时阶段是 `COPY . .`，所以源码确实在 /app 下。任何一个对不上就中止 ——
+# 否则 --reuse-image 会变成"拿旧代码冒充新版本上线"的静默事故。
+verify_reused_image(){ # verify_reused_image <tag>
+  local img="$1" f in_img host bad=0 files
+  files="$(git diff --name-only "$ROLLBACK_HASH" HEAD -- server lib app prisma 2>/dev/null \
+           | grep -vE '\.test\.|\.spec\.' | head -6)"
+  if [[ -z "$files" ]]; then
+    warn "本次改动不含 server/lib/app/prisma 下的源文件，跳过镜像内容校验"
+    return 0
+  fi
+  for f in $files; do
+    in_img="$(docker run --rm --entrypoint sha256sum "$img" "/app/$f" 2>/dev/null | awk '{print $1}')"
+    host="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')"
+    if [[ -z "$in_img" || -z "$host" || "$in_img" != "$host" ]]; then
+      fail "镜像内 /app/$f 与工作区不一致（镜像=${in_img:-取不到} 工作区=${host:-取不到}）"
+      bad=1
+    else
+      ok "镜像内容校验通过：$f"
+    fi
+  done
+  return $bad
+}
+
+if [[ -n "$REUSE_IMAGE" ]]; then
+  step "8/12  复用已有镜像（--reuse-image，跳过构建）"
+  docker image inspect "$REUSE_IMAGE" >/dev/null 2>&1 \
+    || die "镜像不存在：${REUSE_IMAGE}（docker images | grep agentic-operator 看看有哪些）"
+  NEW_IMAGE="$REUSE_IMAGE"
+  verify_reused_image "$NEW_IMAGE" \
+    || die "复用的镜像与当前代码不一致，拒绝上线。去掉 --reuse-image 正常构建。"
+  sed -i '' "s|^AO_IMAGE=.*|AO_IMAGE=${NEW_IMAGE}|" "$ENV_FILE" || die "无法改写 AO_IMAGE"
+  ENV_BUMPED=1
+  ok "AO_IMAGE: $OLD_IMAGE → ${NEW_IMAGE}（未重新构建）"
+else
+  step "8/12  构建新镜像（旧栈仍在服务，零影响）"
+  NEW_IMAGE="agentic-operator:${TS}-${NEW_SHORT}-${ARCH}"
+  sed -i '' "s|^AO_IMAGE=.*|AO_IMAGE=${NEW_IMAGE}|" "$ENV_FILE" || die "无法改写 AO_IMAGE"
+  ENV_BUMPED=1
+  ok "AO_IMAGE: $OLD_IMAGE → $NEW_IMAGE"
+  do_build(){ aoc build app; }
+  retry "$BUILD_RETRIES" "compose build app" do_build \
+    || die "构建 $BUILD_RETRIES 次都失败。常见原因：代理没开（拉不到 prisma engines / npm 包）、\
 工作区有改到一半的 TS 代码（next build 用的是工作区快照）。旧容器完全没被动过。"
-docker image inspect "$NEW_IMAGE" >/dev/null 2>&1 || die "构建声称成功但镜像 $NEW_IMAGE 不存在"
-ok "新镜像已就绪：$NEW_IMAGE"
+  docker image inspect "$NEW_IMAGE" >/dev/null 2>&1 || die "构建声称成功但镜像 $NEW_IMAGE 不存在"
+  ok "新镜像已就绪：$NEW_IMAGE"
+fi
 
 # ── 9. Schema 闸门（只读；有差异就停在切换之前）─────────────────────
 step "9/12  Schema 闸门（新镜像的 schema.prisma vs 生产库）"
 # 本脚本【不】改数据库。这里只证明「新代码需要的 schema == 生产库现状」。
 # 一旦有差异，必须走 docs/deploy/deployment.md §5.5 的人工审批链，
 # 而不是让任何自动化对生产库执行 DDL。
-SCHEMA_DIFF_FILE="$BACKUP_DIR/schema-diff-$TS.sql"
-aoc run --rm -T --no-deps --entrypoint /app/node_modules/.bin/prisma app \
-  migrate diff --from-config-datasource --to-schema /app/prisma/schema.prisma --script \
-  > "$SCHEMA_DIFF_FILE" 2>"$BACKUP_DIR/schema-diff-$TS.err"
-DIFF_RC=$?
-if (( DIFF_RC != 0 )); then
-  tail -15 "$BACKUP_DIR/schema-diff-$TS.err" | sed 's/^/      /'
-  die "prisma migrate diff 执行失败（rc=${DIFF_RC}）。这不代表没差异——是查不出来。\
-排除故障后重跑；在证明空差异之前不要启动新 app。"
-fi
-DDL_LINES="$(grep -vE '^[[:space:]]*(--.*)?$' "$SCHEMA_DIFF_FILE" | head -40 || true)"
-if [[ -n "$DDL_LINES" ]]; then
-  echo ""
-  echo -e "${R}━━━ 检测到 SCHEMA 差异 —— 本脚本不会自动改库 ━━━${N}"
-  echo "$DDL_LINES" | sed 's/^/    /'
-  echo ""
-  echo "  完整 SQL：$SCHEMA_DIFF_FILE"
-  echo "  按 docs/deploy/deployment.md §5.5 处理：人工评审这份 SQL → 危险语句停点 →"
-  echo "  批准后用 psql -1 执行【同一份文件】→ 再验空差异 → 然后重跑本脚本。"
-  echo "  禁止 --accept-data-loss，禁止让 entrypoint 自动 db push。"
-  die "存在未审批的 schema 差异，拒绝切换（旧栈仍在正常服务）"
-fi
+#
+# ⚠️ 权威判据是 --exit-code（Empty=0 / Error=1 / Not empty=2），不是 --script 的文本输出。
+#    Prisma 7 的 CLI 会把 dotenvx 横幅（"◇ injected env (0) from .env.local …"）打到
+#    stdout，和 SQL 混在一起；按"文本非空即有差异"判断会稳定误报。2026-08-17 首次
+#    生产运行就是这样被误拦的（当时真实差异为空）。退出码不受 stdout 噪声影响。
 aoc run --rm -T --no-deps --entrypoint /app/node_modules/.bin/prisma app \
   migrate diff --from-config-datasource --to-schema /app/prisma/schema.prisma --exit-code \
-  >/dev/null 2>&1
-EXITCODE_RC=$?
-case "$EXITCODE_RC" in
-  0) ok "空差异：生产库已与新代码的 datamodel 一致（本次无需改库）" ;;
-  2) die "--exit-code 报告仍有差异，但 --script 输出为空。两者不一致，人工核对后再继续。" ;;
-  *) die "schema 空差异复核失败（rc=${EXITCODE_RC}）" ;;
+  >/dev/null 2>"$BACKUP_DIR/schema-diff-$TS.err"
+DIFF_RC=$?
+case "$DIFF_RC" in
+  0)
+    ok "空差异：生产库已与新代码的 datamodel 一致（本次无需改库）"
+    ;;
+  2)
+    # 确有差异，这时才去取 SQL 证据；顺手滤掉 dotenvx 横幅，让人工评审看到的是纯 SQL。
+    SCHEMA_DIFF_FILE="$BACKUP_DIR/schema-diff-$TS.sql"
+    aoc run --rm -T --no-deps --entrypoint /app/node_modules/.bin/prisma app \
+      migrate diff --from-config-datasource --to-schema /app/prisma/schema.prisma --script \
+      2>/dev/null | grep -vE '^[[:space:]]*[◇◈⌘✔✖]|dotenvx\.com' > "$SCHEMA_DIFF_FILE" || true
+    echo ""
+    echo -e "${R}━━━ 检测到 SCHEMA 差异 —— 本脚本不会自动改库 ━━━${N}"
+    grep -vE '^[[:space:]]*(--.*)?$' "$SCHEMA_DIFF_FILE" | head -40 | sed 's/^/    /'
+    echo ""
+    echo "  完整 SQL：$SCHEMA_DIFF_FILE"
+    echo "  按 docs/deploy/deployment.md §5.5 处理：人工评审这份 SQL → 危险语句停点 →"
+    echo "  批准后用 psql -1 执行【同一份文件】→ 再验空差异 → 然后重跑本脚本。"
+    echo "  禁止 --accept-data-loss，禁止让 entrypoint 自动 db push。"
+    die "存在未审批的 schema 差异，拒绝切换（旧栈仍在正常服务）"
+    ;;
+  *)
+    tail -15 "$BACKUP_DIR/schema-diff-$TS.err" 2>/dev/null | sed 's/^/      /'
+    die "prisma migrate diff 执行失败（rc=${DIFF_RC}）。这不代表没差异——是查不出来。\
+排除故障后重跑；在证明空差异之前不要启动新 app。"
+    ;;
 esac
 
 # ── 10. 排空在途事件 ────────────────────────────────────────────────
