@@ -24,6 +24,12 @@
 #      `git reset --hard` 会把它们全部抹掉。
 #
 # 脚本不读、不打印、不外传任何密钥。macOS 自带 bash 3.2 —— 无关联数组，用平行索引数组。
+#
+# ⚠️ 改本脚本时注意：所有紧跟全角字符（）「」，—— 等）的变量必须写成 ${VAR}，不能写 $VAR。
+#    macOS bash 3.2 在非 C locale 下会把全角字符的字节吞进变量名，`set -u` 当场退出。
+#    这和 scripts/check-connectivity.sh 的本地补丁是同一个坑（2026-08-17 本脚本首跑踩中）。
+#    自查：node -e 'console.log((require("fs").readFileSync(process.argv[1],"utf8")
+#      .match(/\$[A-Za-z_0-9@*?#][A-Za-z0-9_]*[^\x00-\x7F]/g)||[]).join("\n"))' scripts/upgrade-on-mac.sh
 
 set -uo pipefail
 
@@ -123,7 +129,7 @@ restore_ao_image(){
   (( ENV_BUMPED )) || return 0
   [[ -n "$OLD_IMAGE" ]] || return 0
   sed -i '' "s|^AO_IMAGE=.*|AO_IMAGE=${OLD_IMAGE}|" "$ENV_FILE" \
-    && { ENV_BUMPED=0; warn "$ENV_FILE 的 AO_IMAGE 已回退为 $OLD_IMAGE（旧容器未被动过）"; } \
+    && { ENV_BUMPED=0; warn "$ENV_FILE 的 AO_IMAGE 已回退为 ${OLD_IMAGE}（旧容器未被动过）"; } \
     || fail "无法回退 AO_IMAGE，请手工把 $ENV_FILE 的 AO_IMAGE 改回 $OLD_IMAGE"
 }
 
@@ -178,7 +184,7 @@ pg_scalar(){ # pg_scalar <sql-without-single-quotes>
 
 confirm(){ # confirm <prompt>
   (( ASSUME_YES )) && { ok "非交互模式，自动确认：$1"; return 0; }
-  [[ -t 0 ]] || die "需要人工确认「$1」但当前无 TTY。确认无误后加 --yes 重跑。"
+  [[ -t 0 ]] || die "需要人工确认「${1}」但当前无 TTY。确认无误后加 --yes 重跑。"
   local reply=""
   read -r -p "  ❔ $1 [y/N] " reply
   [[ "$reply" == "y" || "$reply" == "Y" ]] || die "操作员未确认：$1"
@@ -198,7 +204,7 @@ retry(){ # retry <n> <label> <cmd...>
 
 # ── 0. preflight ────────────────────────────────────────────────────
 step "0/12  Preflight"
-[[ -d "$DEPLOY_DIR" ]] || die "部署目录不存在：$DEPLOY_DIR（可用 DEPLOY_DIR=... 覆盖）"
+[[ -d "$DEPLOY_DIR" ]] || die "部署目录不存在：${DEPLOY_DIR}（可用 DEPLOY_DIR=... 覆盖）"
 cd "$DEPLOY_DIR" || die "cd 失败：$DEPLOY_DIR"
 command -v docker >/dev/null || die "PATH 里没有 docker"
 command -v git    >/dev/null || die "PATH 里没有 git"
@@ -219,9 +225,9 @@ MIRROR_V="$(read_env PRISMA_ENGINES_MIRROR)"
 OLD_IMAGE="$(read_env AO_IMAGE)"
 
 [[ "$DEPLOY_MODE_V" == "$EXPECT_MODE" ]] \
-  || die "DEPLOY_MODE=$DEPLOY_MODE_V，期望 $EXPECT_MODE（生产是共享 Inngest）"
+  || die "DEPLOY_MODE=${DEPLOY_MODE_V}，期望 ${EXPECT_MODE}（生产是共享 Inngest）"
 [[ "$VOLUME_MODE_V" == "$EXPECT_VOLUME_MODE" ]] \
-  || die "AO_POSTGRES_VOLUME_MODE=$VOLUME_MODE_V，期望 $EXPECT_VOLUME_MODE"
+  || die "AO_POSTGRES_VOLUME_MODE=${VOLUME_MODE_V}，期望 $EXPECT_VOLUME_MODE"
 [[ "$SCHEMA_SYNC_V" == "0" ]] \
   || die "DATABASE_SCHEMA_SYNC=$SCHEMA_SYNC_V —— 生产必须是 0，否则 app 启动会自动 prisma db push 改生产库"
 [[ -n "$OLD_IMAGE" ]] \
@@ -257,7 +263,7 @@ check_patches(){ # check_patches <label>
     fi
     i=$((i+1))
   done
-  (( bad == 0 )) || die "本地补丁校验未通过（$1）。见 docs/deploy/deployment.md 与部署备忘；\
+  (( bad == 0 )) || die "本地补丁校验未通过（${1}）。见 docs/deploy/deployment.md 与部署备忘；\
 补齐后再升级——否则构建失败、或归档静默 401（UI 完全看不出来）。"
 }
 check_patches "pull 前"
@@ -279,14 +285,14 @@ ok "已存 $BACKUP_DIR/upgrade-$TS.rollback"
 # ── 3. git fetch + 预览待升内容（--check 到这里就结束）──────────────
 step "3/12  git fetch + 预览待升 commit"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[[ "$BRANCH" == "main" ]] || warn "当前分支是 $BRANCH（生产口径是 main）"
+[[ "$BRANCH" == "main" ]] || warn "当前分支是 ${BRANCH}（生产口径是 main）"
 git fetch origin --prune || die "git fetch 失败（代理没开？）"
 NEW_REMOTE="$(git rev-parse "origin/$BRANCH" 2>/dev/null)" \
   || die "取不到 origin/$BRANCH"
 NEW_SHORT="$(git rev-parse --short "$NEW_REMOTE")"
 
 if [[ "$NEW_REMOTE" == "$ROLLBACK_HASH" ]]; then
-  ok "已经是 origin/$BRANCH（$NEW_SHORT），没有新 commit"
+  ok "已经是 origin/${BRANCH}（${NEW_SHORT}），没有新 commit"
   HAS_NEW=0
 else
   HAS_NEW=1
@@ -313,7 +319,7 @@ if (( HAS_NEW )); then
       if [[ -n "$(git status --porcelain -- "$f")" ]]; then
         COLLISION="$COLLISION $f"
       else
-        warn "上游改了 $f，但本机该文件无未提交改动（补丁可能已回流）"
+        warn "上游改了 ${f}，但本机该文件无未提交改动（补丁可能已回流）"
       fi
     fi
   done
@@ -351,7 +357,7 @@ fi
 (( HAS_NEW == 0 )) && warn "没有新 commit —— --force：继续重建 + 重启"
 
 # ── 4. 备份（在线，不停服）──────────────────────────────────────────
-step "4/12  备份（pg_dump + $ENV_FILE）"
+step "4/12  备份（pg_dump + ${ENV_FILE}）"
 cp "$ENV_FILE" "$BACKUP_DIR/$(basename "$ENV_FILE").bak.$TS" \
   && ok "$BACKUP_DIR/$(basename "$ENV_FILE").bak.$TS" \
   || die "备份 $ENV_FILE 失败"
@@ -359,7 +365,7 @@ DB_BACKUP_FILE="$BACKUP_DIR/ao-$TS.dump"
 aoc exec -T ao-postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$DB_BACKUP_FILE" \
   || die "pg_dump 失败（ao-postgres 没起？）"
 [[ -s "$DB_BACKUP_FILE" ]] || die "pg_dump 产出空文件：$DB_BACKUP_FILE"
-ok "数据库备份 $DB_BACKUP_FILE（$(du -h "$DB_BACKUP_FILE" | cut -f1)）"
+ok "数据库备份 ${DB_BACKUP_FILE}（$(du -h "$DB_BACKUP_FILE" | cut -f1)）"
 find "$BACKUP_DIR" -maxdepth 1 -name 'ao-*.dump' -type f \
   -mtime +"$BACKUP_RETENTION_DAYS" -delete 2>/dev/null || true
 
@@ -379,7 +385,7 @@ if (( HAS_NEW )); then
     || die "ff-only merge 失败（部署树分叉了？先 git status / git log 看清楚）"
   ok "$(git rev-parse --short "$ROLLBACK_HASH") → $NEW_SHORT"
 else
-  ok "已在 $NEW_SHORT，跳过 merge"
+  ok "已在 ${NEW_SHORT}，跳过 merge"
 fi
 
 if [[ -z "${AO_UPGRADE_REEXECED:-}" && "$(self_hash)" != "$SELF_HASH_AT_START" ]]; then
@@ -422,7 +428,7 @@ aoc run --rm -T --no-deps --entrypoint /app/node_modules/.bin/prisma app \
 DIFF_RC=$?
 if (( DIFF_RC != 0 )); then
   tail -15 "$BACKUP_DIR/schema-diff-$TS.err" | sed 's/^/      /'
-  die "prisma migrate diff 执行失败（rc=$DIFF_RC）。这不代表没差异——是查不出来。\
+  die "prisma migrate diff 执行失败（rc=${DIFF_RC}）。这不代表没差异——是查不出来。\
 排除故障后重跑；在证明空差异之前不要启动新 app。"
 fi
 DDL_LINES="$(grep -vE '^[[:space:]]*(--.*)?$' "$SCHEMA_DIFF_FILE" | head -40 || true)"
@@ -444,7 +450,7 @@ EXITCODE_RC=$?
 case "$EXITCODE_RC" in
   0) ok "空差异：生产库已与新代码的 datamodel 一致（本次无需改库）" ;;
   2) die "--exit-code 报告仍有差异，但 --script 输出为空。两者不一致，人工核对后再继续。" ;;
-  *) die "schema 空差异复核失败（rc=$EXITCODE_RC）" ;;
+  *) die "schema 空差异复核失败（rc=${EXITCODE_RC}）" ;;
 esac
 
 # ── 10. 排空在途事件 ────────────────────────────────────────────────
@@ -536,7 +542,7 @@ step "11/12  用新镜像重建容器"
 SHOW_ROLLBACK=1
 aoc up -d --wait 2>&1 | tail -8 | sed 's/^/      /'
 UP_RC=${PIPESTATUS[0]}
-(( UP_RC == 0 )) || die "compose up 失败（rc=$UP_RC）。看 'aoc logs app'；回滚见下方。"
+(( UP_RC == 0 )) || die "compose up 失败（rc=${UP_RC}）。看 'aoc logs app'；回滚见下方。"
 ok "容器已按新镜像重建"
 
 step "11.5/12  等待 app 健康 + 重注册 Inngest callback"
@@ -549,7 +555,7 @@ done
 echo ""
 if (( HEALTHY == 0 )); then
   aoc logs --tail=40 app 2>&1 | sed 's/^/      /'
-  die "app 在 ${HEALTH_TIMEOUT_S}s 内没有健康（$HEALTH_URL）"
+  die "app 在 ${HEALTH_TIMEOUT_S}s 内没有健康（${HEALTH_URL}）"
 fi
 ok "app /api/health（ready，含 Postgres 可查）通过"
 
