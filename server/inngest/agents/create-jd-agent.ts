@@ -392,14 +392,17 @@ export const createJdAgent = inngest.createFunction(
     // RoboHire generate-jd 不返回 must_have_skills / nice_to_have_skills 数组,
     // 只给散文 hardRequirements / niceToHave。把它们拆成 List<String> 存进
     // Job_Requisition 的 must_have_skills / nice_to_have_skills(下游 matchResume /
-    // ruleCheck 读的就是这两个数组)。已有结构化值优先(upstream 录入更权威),
-    // 为空才用 RoboHire 派生。
-    const mustHaveSkills =
-      arrayOrUndefined(requirement.must_have_skills) ??
-      arrayOrUndefined(proseToSkillArray(jdData.hardRequirements));
-    const niceToHaveSkills =
-      arrayOrUndefined(requirement.nice_to_have_skills) ??
-      arrayOrUndefined(proseToSkillArray(jdData.niceToHave));
+    // ruleCheck 读的就是这两个数组)。
+    const mustHaveSkills = resolveSkillArray(
+      requirement.must_have_skills,
+      proseToSkillArray(jdData.hardRequirements),
+      { forceRegenerate },
+    );
+    const niceToHaveSkills = resolveSkillArray(
+      requirement.nice_to_have_skills,
+      proseToSkillArray(jdData.niceToHave),
+      { forceRegenerate },
+    );
 
     // 派生技能回填进 requirement,allmeta + partner-pg 两边写入都带上。
     const enrichedRequirement: Record<string, unknown> = {
@@ -659,13 +662,17 @@ function pickSourceEventId(
  * 从 GET /requirements/:id 返回的 requirement + specification 拼一段
  * RoboHire /api/v1/jobs/generate-jd 期望的 free-text prompt (4-4000 chars).
  *
- * F4 spec (2026-05-19): 40+ 字段，重要日期语义校正:
- *   - s.deadline 之前误标 "截止日期" → 应作为 "期望到岗日期" 的 fallback
- *     (primary: r.required_arrival_date)
- *   - s.start_date 之前误标 "期望到岗" → 应作为 "服务开始日期" (HRO contract)
- *   - 新增 "发布日期" = pick(r.client_published_at, r.open_date)
+ * 取舍原则:只拼「候选人该看到、且能改善 JD 正文」的字段。generate-jd 是纯文本
+ * 进 / JD 文本出,响应里没有任何日期或技能数组字段,所以拼进去的东西唯一的去向
+ * 就是候选人可见的 JD 正文。据此排除(2026-08-17):
+ *   - 期望级别        客户自家级别区间,无通用映射,且可反推客户身份
+ *   - 发布日期        纯元数据,易被误读成 deadline
+ *   - 期望到岗日期    内部排期口径
+ *   - 服务开始日期    HRO↔客户合同条款
+ *   - 必备/加分技能   本 agent 自己派生并回写的字段,拼回去构成自反馈回路
+ * 详见各处内联说明。
  */
-function buildPromptFromRequirement(
+export function buildPromptFromRequirement(
   requirement: RaasRequirement,
   specification: RaasRequirementSpecification | null,
   clarifications: RequirementClarificationRecord[] = [],
@@ -720,7 +727,10 @@ function buildPromptFromRequirement(
   push('服务BG', r.service_bg);
   push('需求类型', r.demand_type);
   push('招聘类型', r.recruitment_type);
-  push('期望级别', r.expected_level);
+  // ❌ 期望级别(expected_level)不进 prompt:各客户的级别体系是自家原始区间
+  //    (P7 / 2-2 / T3-2 / M2 …),没有跨客户的通用映射。塞给 Gohire 只会把客户
+  //    内部职级黑话写进候选人可见 JD,而那套黑话本身就是可反推客户身份的强特征
+  //    (规则 4-2 精神)。expected_level 仍照常回写 job_requisition 列(见 §5)。
   if (typeof r.headcount === 'number') push('招聘人数', String(r.headcount));
   push('工作城市', r.city);
   push('工作地点', formatWorkAddress(r.work_address));
@@ -764,27 +774,28 @@ function buildPromptFromRequirement(
   push('紧急度', r.urgency_level);
   push('填充难度', r.fill_difficulty);
 
-  // ── 三个日期(F4 关键校正点)──
-  push(
-    '发布日期',
-    formatDate(r.client_published_at) ?? formatDate(r.open_date),
-  );
-  push(
-    '期望到岗日期',
-    formatDate(r.required_arrival_date) ?? formatDate((s as any).deadline),
-  );
-  push('服务开始日期', formatDate((s as any).start_date));
-
+  // ── 日期一律不进 prompt ──
+  // generate-jd 的响应 schema 里没有任何日期字段(RobohireGenerateJdData),日期
+  // 从不被结构化回吐;塞进去唯一可能的后果就是被写进候选人可见的 JD 正文。而这
+  // 三个日期没有一个是候选人该看的:
+  //   · 发布日期(client_published_at / open_date)  纯需求元数据,且易被模型误读成 deadline
+  //   · 期望到岗日期(required_arrival_date / s.deadline) 内部排期口径,仅供内部查看
+  //   · 服务开始日期(s.start_date)                  HRO↔客户的合同服务起始日,商务条款
+  // 三者仍在 job_requisition / specification 表里,内部视图照常读。
   if (s.is_exclusive) push('独家委托', '是');
   push('招聘策略', r.recruitment_strategies);
 
-  // ── 技能 / 排除 / 原始文本 ──
-  if (Array.isArray(r.must_have_skills) && r.must_have_skills.length) {
-    lines.push(`\n必备技能:\n  - ${(r.must_have_skills as string[]).join('\n  - ')}`);
-  }
-  if (Array.isArray(r.nice_to_have_skills) && r.nice_to_have_skills.length) {
-    lines.push(`\n加分技能:\n  - ${(r.nice_to_have_skills as string[]).join('\n  - ')}`);
-  }
+  // ── 排除条件 / 原始文本 ──
+  // ❌ must_have_skills / nice_to_have_skills 不进 prompt —— 这是自反馈回路。
+  //    客户需求侧从不录入这两个字段;job_requisition 上它们的唯一写入者就是本
+  //    agent 自己(§4b 从 Gohire 的 hardRequirements/niceToHave 散文派生 → §5
+  //    UPDATE job_requisition)。所以第 2 次跑(用户在需求详情页点「重新生成岗位」)
+  //    读到的值 100% 是上一轮 Gohire 自己的输出,拼回 prompt 等于把模型的旧输出
+  //    当成客户硬性要求喂回去,逐轮自我强化 / 漂移。
+  //    客户真正录入的技能要求本来就在下面「岗位职责(原始)/任职要求(原始)」里,
+  //    那才是权威输入。
+  //    ⚠️ 若将来 upstream 支持客户直接录入这两个字段,不能简单地把这段加回来 ——
+  //    必须先能区分「客户录入」与「Gohire 派生」两种来源,只拼前者。
   if (typeof r.negative_requirement === 'string' && r.negative_requirement.trim()) {
     lines.push(`\n排除条件: ${r.negative_requirement}`);
   }
@@ -863,6 +874,31 @@ export function proseToSkillArray(s: unknown): string[] {
     .split('\n')
     .map((line) => line.replace(/^\s*(?:[-*•·]|\d+\s*[.．、)）])\s*/, '').trim())
     .filter((line) => line.length > 0);
+}
+
+/**
+ * 决定 must_have_skills / nice_to_have_skills 最终落库用哪份值。
+ *
+ * `job_requisition` 上这两列的唯一写入者就是本 agent(§4b 派生 → §5 UPDATE),
+ * 客户需求侧从不录入。于是「已有值优先」在重新生成时会把**第一轮**的派生结果永久
+ * 冻结:Gohire 基于新需求产出的新散文写进了 `hard_requirements` 列,数组却还是旧
+ * 的 —— 同一次写入里两份数据自相矛盾,且用户点多少次「重新生成岗位」都改不掉。
+ *
+ * 所以按 force_regenerate(ADR-0154,用户在需求详情页显式勾选)分流:
+ *   - 显式重新生成 → 新派生值优先,派生为空才回退旧值(宁可留旧值也不清空下游依赖)
+ *   - 普通首轮/重放 → 保持既有语义:已有值优先,为空才用派生值
+ * 后者留给「upstream 将来支持客户录入」的可能:那时首轮不会覆盖客户填的值。
+ */
+export function resolveSkillArray(
+  existing: unknown,
+  derived: string[],
+  opts: { forceRegenerate?: boolean } = {},
+): string[] | undefined {
+  const existingArr = arrayOrUndefined(existing);
+  const derivedArr = arrayOrUndefined(derived);
+  return opts.forceRegenerate === true
+    ? (derivedArr ?? existingArr)
+    : (existingArr ?? derivedArr);
 }
 
 /** Keep RoboHire's non-blank title; otherwise use the requisition title. */
