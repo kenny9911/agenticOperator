@@ -204,6 +204,10 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
     );
   }
 
+  // 2026-08-20 业务要求:候选人期望城市除 candidatePreferences 旁路外,还必须
+  // 拼进 resume 参数正文,保证 /match-resume 的地域匹配一定读到它。
+  const resumeForMatch = appendExpectedCitiesToResume(resumeText, candidateExpectation);
+
   // External-dependency-health context — when RoboHire is dead we still emit
   // MATCH_FAILED (downstream keeps its context) but then fail the run instead of
   // reporting false success, and the monitor alerts (没钱/故障/说不准).
@@ -222,12 +226,12 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
   const matchResult = await step.run(`match-${stepKey}`, async () => {
     logger.info(
       `[${AGENT_NAME}] calling RoboHire /match-resume · jr=${data.job_requisition_id} ` +
-        `jd_chars=${jdText.length} resume_chars=${resumeText.length} resume_src=${resumeSource}`,
+        `jd_chars=${jdText.length} resume_chars=${resumeForMatch.length} resume_src=${resumeSource}`,
     );
     fileLogger.event('match.input', {
       job_requisition_id: data.job_requisition_id,
       candidate_id: candidateId || undefined,
-      resume_chars: resumeText.length,
+      resume_chars: resumeForMatch.length,
       resume_src: resumeSource,
       jd_chars: jdText.length,
       candidate_preferences_chars: candidatePreferences?.length ?? 0,
@@ -236,8 +240,8 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
     try {
       r = await matchResumeDirect(
         candidatePreferences
-          ? { resume: resumeText, jd: jdText, candidatePreferences }
-          : { resume: resumeText, jd: jdText },
+          ? { resume: resumeForMatch, jd: jdText, candidatePreferences }
+          : { resume: resumeForMatch, jd: jdText },
         // 显式传 fileLogger → RoboHire match-resume 完整 in/out 进 per-run 审计
         // (Inngest step.run 内 ALS 不可靠,必须显式传闭包 logger).
         { traceId: traceId ?? undefined, logger: fileLogger },
@@ -512,6 +516,22 @@ export function buildResumeTextFromParsed(parsed: Record<string, unknown> | null
   if (str(r.selfEvaluation)) lines.push(`\n自我评价:\n${str(r.selfEvaluation)}`);
 
   return lines.join('\n').trim();
+}
+
+// 把候选人期望城市(MATCH_RULE_CHECK_PASSED.candidate_expectation.expected_cities,
+// 缺失时为简历现抽结果)追加到发给 RoboHire /match-resume 的 resume 文本末尾。
+// candidatePreferences 旁路继续照传;这里保证期望城市一定出现在 resume 正文里。
+// 无期望城市、或基础简历为空(上游已抛错)时原样返回,不改变既有输入。
+export function appendExpectedCitiesToResume(
+  resumeText: string,
+  expectation: { expected_cities?: unknown } | Record<string, never> | null | undefined,
+): string {
+  const raw = (expectation as { expected_cities?: unknown } | null | undefined)?.expected_cities;
+  const cities = Array.isArray(raw)
+    ? raw.map((c) => (typeof c === 'string' ? c.trim() : '')).filter(Boolean)
+    : [];
+  if (cities.length === 0 || !resumeText.trim()) return resumeText;
+  return `${resumeText}\n\n求职期望:\n期望城市: ${cities.join('、')}`;
 }
 
 type RuleCheckGateResult =
