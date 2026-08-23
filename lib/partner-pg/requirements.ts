@@ -21,6 +21,45 @@ import type {
 } from './types';
 
 /**
+ * 办公城市多选 → 城市名数组（保序，首项 = 主城市）。
+ *
+ * RAAS 的 `job_requisition.city_ids` 是有序城市 **UUID** 数组（权威多值，2026-06-19 加），
+ * `city` / `city_id` 只存首项当兼容主城市。AO 此前只读 `city`，所以多城市需求生成出来的
+ * JD 永远只有一个城市（根因之一）。
+ *
+ * 这里在**读时**把 UUID 解析成城市名，不物化到任何列 —— RAAS 的城市字典支持改名
+ * (`city_dict.city_name`) 与合并 (`merged_into`)，物化的名字会 stale，读时派生则下一次
+ * 读就是新名。
+ *
+ * 🔴 红线：city UUID 绝不进 prompt / JD 正文 / ontology payload。内 JOIN 天然丢弃解析
+ * 不到的 id —— 宁可少一个城市，也不能把一串 UUID 写进候选人可见的 JD。
+ *
+ * 三个都踩得到的实现细节：
+ *   - `WITH ORDINALITY` 保序：首项必须仍是主城市，与 RAAS 的 city/city_id 口径对齐。
+ *   - 按 **text** 比较（`cd.city_id::text = t.cid`）而不是 `t.cid::uuid`：数组里若混进
+ *     非 UUID 字符串，cast 会让整条需求查询抛错（= JD 生成全挂），text 比较只是不命中。
+ *   - `jsonb_typeof` 守卫：`city_ids` 是可空 JSONB，存量行是 NULL、脏行可能不是数组。
+ *   - 不过滤 `is_active` / `merged_into`：合并只置标记不删行，显示旧名与 RAAS 的
+ *     jd-export 行为一致；过滤掉反而会让城市凭空消失。
+ */
+const CITY_NAMES_SQL = `
+      COALESCE((
+        SELECT json_agg(cd.city_name ORDER BY t.ord)
+        FROM jsonb_array_elements_text(
+               CASE WHEN jsonb_typeof(r.city_ids) = 'array'
+                    THEN r.city_ids
+                    ELSE '[]'::jsonb END
+             ) WITH ORDINALITY AS t(cid, ord)
+        JOIN city_dict cd ON cd.city_id::text = t.cid
+      ), '[]'::json) AS city_names`;
+
+/** pg 会把 json_agg 结果解析成数组；防御非数组 / 空值，并丢掉空串。 */
+function toCityNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+}
+
+/**
  * GET job_requisition + LEFT JOIN job_requisition_specification by ID.
  *
  * Returns null if not found — caller should treat as NonRetriable
@@ -35,7 +74,7 @@ export async function getRequirementDetail(
   const sql = `
     SELECT
       row_to_json(r.*) AS requirement_json,
-      row_to_json(s.*) AS specification_json
+      row_to_json(s.*) AS specification_json,${CITY_NAMES_SQL}
     FROM job_requisition r
     LEFT JOIN job_requisition_specification s
       ON s.job_requisition_specification_id = r.job_requisition_specification_id
@@ -45,6 +84,7 @@ export async function getRequirementDetail(
   const result = await query<{
     requirement_json: JobRequisition;
     specification_json: JobRequisitionSpecification | null;
+    city_names: unknown;
   }>(sql, [jobRequisitionId]);
 
   const row = result.rows[0];
@@ -55,6 +95,9 @@ export async function getRequirementDetail(
 
   return {
     ...requirement,
+    // 覆盖 row_to_json 里的原始 city_ids 派生结果：city_names 是解析后的城市名，
+    // 不是 UUID。放在 spread 之后，避免被 requirement 上的同名键（不存在，但防御）覆盖。
+    city_names: toCityNames(row.city_names),
     specification,
   };
 }
@@ -74,7 +117,7 @@ export async function getRequirementDetailByJobPostingId(
     SELECT
       p.job_posting_id,
       row_to_json(r.*) AS requirement_json,
-      row_to_json(s.*) AS specification_json
+      row_to_json(s.*) AS specification_json,${CITY_NAMES_SQL}
     FROM job_posting p
     JOIN job_requisition r
       ON r.job_requisition_id = p.job_requisition_id
@@ -87,12 +130,16 @@ export async function getRequirementDetailByJobPostingId(
     job_posting_id: string;
     requirement_json: JobRequisition;
     specification_json: JobRequisitionSpecification | null;
+    city_names: unknown;
   }>(sql, [jobPostingId]);
   const row = result.rows[0];
   if (!row) return null;
 
+  // 两个入口返回同一个 RequirementDetail 形状 —— 这里不一并解析 city_names,
+  // 类型上就会说谎（声明有、运行时没有）。
   return {
     ...row.requirement_json,
+    city_names: toCityNames(row.city_names),
     specification: row.specification_json,
     job_posting_id: row.job_posting_id,
   };

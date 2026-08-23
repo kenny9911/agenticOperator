@@ -732,7 +732,12 @@ export function buildPromptFromRequirement(
   //    内部职级黑话写进候选人可见 JD,而那套黑话本身就是可反推客户身份的强特征
   //    (规则 4-2 精神)。expected_level 仍照常回写 job_requisition 列(见 §5)。
   if (typeof r.headcount === 'number') push('招聘人数', String(r.headcount));
-  push('工作城市', r.city);
+  // 一条需求可覆盖多个办公城市(RAAS `city_ids`)。这里必须把**全部**城市名拼进去 ——
+  // generate-jd 只吃自由文本 prompt(没有结构化城市参数),所以 JD 正文里能不能出现
+  // 多城市,完全取决于这一行。此前只 push 兼容主城市 `r.city`,多城市需求生成出来的
+  // JD 永远只有一个城市。`city_names` 由 getRequirementDetail 读时解析(见 CITY_NAMES_SQL),
+  // 解析不出来(存量 city_ids=NULL / 字典查不到)时回落主城市,绝不出现 UUID。
+  push('工作城市', resolveCityNames(r).join(' / ') || r.city);
   push('工作地点', formatWorkAddress(r.work_address));
   push('薪资范围', r.salary_range);
   if (typeof r.work_years === 'number') push('工作年限', `${r.work_years} 年以上`);
@@ -846,15 +851,47 @@ function sanitize(s: string): string {
 }
 
 /**
- * city 取值优先级:
- *   1) requirement.city (raas 已知字段，最权威) — 字符串转 array
- *   2) jdData.location (RoboHire 从 prompt 抽出来的)
- *   3) undefined
+ * 需求的办公城市名数组(保序,首项 = 主城市)。
+ *
+ * `city_names` 由 getRequirementDetail 在 SQL 里 JOIN city_dict 读时解析(见
+ * lib/partner-pg/requirements.ts `CITY_NAMES_SQL`),所以这里拿到的一定是城市**名**,
+ * 不会是 `city_ids` 里的 UUID。存量行(city_ids=NULL)或字典全查不到时为空数组,
+ * 由调用方各自回落兼容主城市 `city`。
+ *
+ * 参数刻意收成 Record —— prompt 构造那边拿到的是 `r`(已 as Record<string, any>),
+ * 两个调用点共用同一份解析,避免口径分叉。
  */
-function pickCityFromBoth(
+export function resolveCityNames(requirement: Record<string, any>): string[] {
+  const raw = requirement?.city_names;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const v of raw) {
+    if (typeof v !== 'string') continue;
+    const name = v.trim();
+    // 去重但保序:同一城市被重复选进 city_ids 时不该在 JD 里出现两次。
+    if (name && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * city 取值优先级:
+ *   1) requirement.city_names (raas 办公城市多选,权威多值) — 保序全量
+ *   2) requirement.city (兼容主城市标量) — 存量行 city_ids=NULL 时的回落
+ *   3) jdData.location (RoboHire 从 prompt 抽出来的)
+ *   4) undefined
+ *
+ * 返回值此前恒为 1 元数组(直接 `[requirement.city]`),是「岗位 JD 只有一个城市」的
+ * 降级点之一。现在多城市需求会返回多项;下游 syncJdToPartnerPg 仍只把首项写进
+ * `job_posting.city` 单列(主城市),但 allmeta 的 Job_Posting.city 是 List<String>,
+ * 从此装的是真多城市。
+ */
+export function pickCityFromBoth(
   requirement: RaasRequirement,
   jdData: RobohireGenerateJdData,
 ): string[] | undefined {
+  const cityNames = resolveCityNames(requirement as unknown as Record<string, any>);
+  if (cityNames.length > 0) return cityNames;
   const reqCity = stringOrUndefined(requirement.city);
   if (reqCity) return [reqCity];
   if (typeof jdData.location === 'string' && jdData.location.trim()) {

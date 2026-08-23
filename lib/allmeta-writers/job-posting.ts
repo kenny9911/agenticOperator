@@ -52,9 +52,16 @@ export async function writeJobPostingInstance(
   const degreeRequirement =
     nonEmptyString(req.degree_requirement) ?? nonEmptyString(jd.education) ?? '';
   const educationRequirement = nonEmptyString(req.education_requirement) ?? '';
-  const cityList = asStringArray(req.city).length > 0
-    ? asStringArray(req.city)
-    : asStringArray(jd.location);
+  // ontology `Job_Posting.city` 本来就是 List<String>(见文件头 canonical schema),
+  // 但此前取的是兼容主城市标量 `req.city`,所以恒为 1 元素。改取读时解析出的
+  // `city_names`(保序,首项 = 主城市;见 lib/partner-pg/requirements.ts CITY_NAMES_SQL),
+  // 多城市需求从此在本体侧也是真多城市。
+  // 🔴 这里只接受城市**名** —— `city_ids` 的 UUID 绝不进 ontology / Allmeta payload。
+  const cityList = asStringArray(req.city_names).length > 0
+    ? asStringArray(req.city_names)
+    : asStringArray(req.city).length > 0
+      ? asStringArray(req.city)
+      : asStringArray(jd.location);
   const workAddress = asStringArray(req.work_address);
   const salaryRange = nonEmptyString(jd.salaryText) ?? nonEmptyString(req.salary_range) ?? '';
 

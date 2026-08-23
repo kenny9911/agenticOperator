@@ -20,6 +20,8 @@ import {
   resolveJdTitle,
   resolveSkillArray,
   buildPromptFromRequirement,
+  resolveCityNames,
+  pickCityFromBoth,
 } from './create-jd-agent';
 import { RobohireApiError } from '@/lib/robohire-client';
 
@@ -166,5 +168,101 @@ describe('buildPromptFromRequirement — 只拼候选人该看到的字段', () 
     expect(prompt).toContain('工作城市: 深圳');
     expect(prompt).toContain('负责 C 端页面研发。');
     expect(prompt).toContain('三年以上前端经验，熟悉 React。');
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// 办公城市多选 —— 回归锚。
+//
+// 生产缺陷:RAAS 2026-06-19 加了 `job_requisition.city_ids`(有序城市 UUID 数组,
+// 权威多值),但 AO 一直只读兼容主城市标量 `city`,于是多城市需求生成出来的岗位 JD
+// 永远只有一个城市。generate-jd 只吃自由文本 prompt(没有结构化城市参数),所以
+// 「JD 正文里有没有多城市」完全取决于 prompt 那一行 —— 这组测试就锁它。
+// ──────────────────────────────────────────────────────────────────────
+describe('办公城市多选进 prompt', () => {
+  const base = {
+    client_job_title: '前端工程师',
+    job_responsibility: '负责 C 端页面研发。',
+    job_requirement: '三年以上前端经验。',
+  };
+
+  it('多城市需求把全部城市名拼进 prompt(不再只有主城市)', () => {
+    const prompt = buildPromptFromRequirement(
+      { ...base, city: '北京', city_names: ['北京', '上海', '深圳'] } as never,
+      null,
+    );
+    expect(prompt).toContain('工作城市: 北京 / 上海 / 深圳');
+  });
+
+  it('保序:首项仍是主城市', () => {
+    const prompt = buildPromptFromRequirement(
+      { ...base, city: '上海', city_names: ['上海', '北京'] } as never,
+      null,
+    );
+    expect(prompt).toContain('工作城市: 上海 / 北京');
+    expect(prompt).not.toContain('工作城市: 北京 / 上海');
+  });
+
+  it('存量行(city_names 缺失)回落兼容主城市,行为与改动前一致', () => {
+    const prompt = buildPromptFromRequirement({ ...base, city: '深圳' } as never, null);
+    expect(prompt).toContain('工作城市: 深圳');
+  });
+
+  it('🔴 红线:city UUID 绝不出现在 prompt 里', () => {
+    // city_names 是读时 JOIN city_dict 解析出来的城市名。万一上游塞进 UUID 形状的
+    // 字符串,它也只会作为「名字」出现 —— 但真正的防线在 SQL 内 JOIN(解析不到就丢弃)。
+    // 这条测试锁的是:我们从不把 city_ids 原始列拼进 prompt。
+    const prompt = buildPromptFromRequirement(
+      {
+        ...base,
+        city: '北京',
+        city_names: ['北京', '上海'],
+        city_ids: ['3f2a1b4c-0000-4000-8000-000000000001', '3f2a1b4c-0000-4000-8000-000000000002'],
+        city_id: '3f2a1b4c-0000-4000-8000-000000000001',
+      } as never,
+      null,
+    );
+    expect(prompt).toContain('工作城市: 北京 / 上海');
+    expect(prompt).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  });
+});
+
+describe('resolveCityNames', () => {
+  it('保序去重(同城市被重复选进 city_ids 时 JD 里不出现两次)', () => {
+    expect(resolveCityNames({ city_names: ['北京', '上海', '北京'] })).toEqual(['北京', '上海']);
+  });
+
+  it('丢弃空串与非字符串项', () => {
+    expect(resolveCityNames({ city_names: ['北京', '', '  ', null, 42, '上海'] })).toEqual([
+      '北京',
+      '上海',
+    ]);
+  });
+
+  it('缺失 / 非数组 → 空数组(交给调用方回落主城市)', () => {
+    expect(resolveCityNames({})).toEqual([]);
+    expect(resolveCityNames({ city_names: null })).toEqual([]);
+    expect(resolveCityNames({ city_names: '北京' })).toEqual([]);
+  });
+});
+
+describe('pickCityFromBoth', () => {
+  it('多城市:返回全部城市名(此前恒为 1 元数组,是 JD 只有一个城市的降级点)', () => {
+    expect(pickCityFromBoth({ city: '北京', city_names: ['北京', '上海'] } as never, {} as never))
+      .toEqual(['北京', '上海']);
+  });
+
+  it('city_names 为空 → 回落兼容主城市', () => {
+    expect(pickCityFromBoth({ city: '深圳', city_names: [] } as never, {} as never)).toEqual([
+      '深圳',
+    ]);
+  });
+
+  it('需求侧完全没有城市 → 回落 RoboHire 抽出来的 location', () => {
+    expect(pickCityFromBoth({} as never, { location: ' 杭州 ' } as never)).toEqual(['杭州']);
+  });
+
+  it('两侧都没有 → undefined(调用方不写 city)', () => {
+    expect(pickCityFromBoth({} as never, {} as never)).toBeUndefined();
   });
 });
