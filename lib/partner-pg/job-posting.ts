@@ -75,6 +75,13 @@ function mapEnum(
 // 见 2026-06-03 JD 生成失败事故。
 export const SALARY_SANE_MAX = 100_000_000;
 
+// 月薪 sane 下限 — 1000 元/月。低于中国任何地区的最低工资标准,故 <1000 的值
+// 一律不是「已归一到元的月薪」,而是单位没乘开 (6 = 6 千) 或从噪声里抠出来的
+// 数字 (「社保*70%+公积金据实」→ 70)。写进去会污染一切按该列做的排序 / 统计,
+// 宁可留 NULL。见 2026-08-25 单位脏数据排查
+// (raas backend/scripts/audit-job-posting-salary-units.ts)。
+export const SALARY_SANE_MIN = 1_000;
+
 /** 解析单个薪资 token → 绝对金额。支持 8.2k / 8.5K / 1.5万 / 2w / 8000 / 12,000。 */
 export function parseSalaryToken(token: string | null | undefined): number | null {
   if (token == null) return null;
@@ -93,6 +100,40 @@ export function parseSalaryToken(token: string | null | undefined): number | nul
   return Math.round(n * mult);
 }
 
+const SALARY_SEP_SRC = String.raw`[-–—~～/／]|到|至`;
+const SALARY_NUM_SRC = String.raw`\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?`;
+const SALARY_UNIT_SRC = String.raw`[kK千万wW]`;
+/** 剥壳后必须**整串**命中,否则视为「不是薪资表达」。锚定 ^…$ 是这条闸的全部意义。 */
+const SALARY_SHAPE_RE = new RegExp(
+  `^(${SALARY_NUM_SRC})\\s*(${SALARY_UNIT_SRC})?` +
+    `\\s*(?:(?:${SALARY_SEP_SRC})\\s*(${SALARY_NUM_SRC})\\s*(${SALARY_UNIT_SRC})?)?$`,
+);
+const SALARY_UNIT_MULT: Record<string, number> = {
+  k: 1_000,
+  K: 1_000,
+  千: 1_000,
+  万: 10_000,
+  w: 10_000,
+  W: 10_000,
+};
+
+/**
+ * 剥壳 —— 去掉标签前缀 / 括号补充 / 计薪周期与「N 薪」后缀,只留纯区间表达。
+ *
+ * 「薪资范围: 7-11」这种带标签的文本是 Gohire 把 create-jd prompt 里
+ * `push('薪资范围', r.salary_range)` 那一行原样回显回来的,partner 库里确有 131 行。
+ */
+export function stripSalaryShell(raw: string): string {
+  let s = String(raw).normalize('NFKC').trim();
+  s = s.replace(/[（(][^）)]*[）)]?/g, ''); // "(3~8年)" / 未闭合的备注
+  s = s.replace(/^\s*(薪资范围|薪资|月薪|工资|薪酬|报价)\s*[:：]?\s*/, '');
+  s = s.replace(/\s*[*×xX]\s*\d+(?:\.\d+)?\s*薪\s*$/, ''); // "30-50k * 14薪"
+  s = s.replace(/\s*(以内|以下|左右|封顶|以上|起)\s*$/, '');
+  s = s.replace(/\s*(元|块|人民币)?\s*\/?\s*(月|每月)\s*$/, '');
+  s = s.replace(/\s*元\s*$/, '');
+  return s.trim();
+}
+
 /**
  * 解析薪资区间文本 → { min, max }。
  * 支持分隔符 - – — ~ ～ / ／ 到 至,以及 k/千/万/w 后缀与小数 (8.2k → 8200)。
@@ -100,27 +141,69 @@ export function parseSalaryToken(token: string | null | undefined): number | nul
  *
  * ⚠️ 旧实现用 `replace(/[kK]/g,'000')` 字面替换 + 删小数点,会把 "8.2k/8.5k"
  * 算成 8200085000 (应为 8200/8500),溢出 partner int4 列。务必走单 token 解析。
+ *
+ * ⚠️ 2026-08-25 —— 三条改动,依据是 raas
+ * `backend/scripts/audit-job-posting-salary-units.ts` 对 1782 行真实数据的分类盘点:
+ *
+ *  ① **共享单位继承**。中文薪资区间惯例只在右端写单位 ——「6-10K」。逐 token
+ *     独立判断得到 (6, 10000):同一行两个单位。实测 458 行栽在这一条,占全部
+ *     脏行一半以上。改为:区间里只要有一端带单位,另一端的裸数就继承它。
+ *     magnitude guard —— 裸数 ≥ 1000 时**不继承**(它本来就是绝对金额),
+ *     否则 "8000-12k" 会被算成 8,000,000-12,000(库里确有该行)。
+ *
+ *  ② **形态闸**。剥壳后不能整串命中「数字[单位][分隔符 数字[单位]]」的一律返回
+ *     { null, null },不再从散文里抠第一个数字 ——
+ *     「社保*70%+公积金据实：12k+200全勤」此前解析出 70,「中3: 8400」解析出 3。
+ *
+ *  ③ **裸区间不推断单位**。「7-12」两端都没单位,读成 7-12 千几乎必然正确,但库里
+ *     同时存在「单价上限660」这类按**日单价**录入的行 —— 把日单价 ×1000 就是
+ *     66 万/月的灾难性错值。所以这里只负责不写错:原样返回 (7, 12),由 saneSalary
+ *     按 SALARY_SANE_MIN 丢弃为 null。存量那 350 行的千元推断走 raas 审计脚本的
+ *     `--apply-inferred-thousands`,需人工签字,不在写入侧默默做。
  */
 export function parseSalaryRange(
   s: string | null | undefined,
 ): { min: number | null; max: number | null } {
   if (s == null) return { min: null, max: null };
-  const tokens = String(s)
-    .split(/[-–—~～\/／]|到|至/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-  const nums = tokens
-    .map(parseSalaryToken)
-    .filter((n): n is number => n != null);
-  if (nums.length >= 2) return { min: nums[0], max: nums[1] };
-  if (nums.length === 1) return { min: nums[0], max: null };
-  return { min: null, max: null };
+  const m = stripSalaryShell(String(s)).match(SALARY_SHAPE_RE);
+  if (!m) return { min: null, max: null };
+
+  const toNum = (x: string) => parseFloat(x.replace(/,/g, ''));
+  const unitMult = (u: string | undefined) =>
+    u ? SALARY_UNIT_MULT[u] ?? null : null;
+
+  const n1 = toNum(m[1]);
+  const n2 = m[3] != null ? toNum(m[3]) : null;
+  if (!Number.isFinite(n1) || (n2 != null && !Number.isFinite(n2))) {
+    return { min: null, max: null };
+  }
+
+  let mult1 = unitMult(m[2]);
+  let mult2 = n2 != null ? unitMult(m[4]) : null;
+  if (mult1 != null || mult2 != null) {
+    const declared = mult2 ?? mult1 ?? 1;
+    if (mult1 == null) mult1 = n1 < 1_000 ? declared : 1;
+    if (n2 != null && mult2 == null) mult2 = n2 < 1_000 ? mult1 : 1;
+  } else {
+    mult1 = 1;
+    if (n2 != null) mult2 = 1;
+  }
+
+  return {
+    min: Math.round(n1 * (mult1 as number)),
+    max: n2 != null ? Math.round(n2 * (mult2 as number)) : null,
+  };
 }
 
-/** 范围校验:非有限 / 负数 / 超 sane 上限 → null,否则原值。 */
+/**
+ * 范围校验:非有限 / 越出 [SALARY_SANE_MIN, SALARY_SANE_MAX] → null,否则原值。
+ *
+ * 下限守的是「单位没归一」与「从噪声里抠出的数字」两类脏值,并且它同时兜住了
+ * 结构化兜底那一路 —— Gohire 的 salaryMin/Max 也会给千元面值。
+ */
 export function saneSalary(n: number | null): number | null {
   if (n == null || !Number.isFinite(n)) return null;
-  if (n < 0 || n > SALARY_SANE_MAX) return null;
+  if (n < SALARY_SANE_MIN || n > SALARY_SANE_MAX) return null;
   return n;
 }
 
