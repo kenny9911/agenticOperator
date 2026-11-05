@@ -43,7 +43,7 @@ import {
   type RobohireGenerateJdData,
 } from '@/lib/robohire-client';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
-import { reportDependencyDegraded } from '@/lib/dependency-health/report';
+import { reportDependencyDegraded, recordDependencyOk } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import {
   writeJobPostingInstance,
@@ -326,6 +326,7 @@ export const createJdAgent = inngest.createFunction(
       // Silent degrade: 200 OK but no usable JD content.
       const oc = classifyRobohire('generateJd', r);
       if (!oc.ok) await reportDependencyDegraded(oc, depCtx);
+      await recordDependencyOk('robohire', 'generateJd', depCtx);
       logger.info(
         `[${AGENT_NAME}] RoboHire jobs/generate-jd OK · title="${r.data.title ?? '?'}" ` +
           `parse=${r.meta?.stages?.parse} generate=${r.meta?.stages?.generate} ` +

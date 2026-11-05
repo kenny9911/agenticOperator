@@ -81,6 +81,7 @@ vi.mock('@/lib/dependency-health/report', async (importOriginal) => {
     ...actual,
     recordDependencySignal: (o: never, ctx: never) => actual.recordDependencySignal(o, ctx, noopLog),
     reportDependencyDegraded: (o: never, ctx: never) => actual.reportDependencyDegraded(o, ctx, noopLog),
+    recordDependencyOk: async () => {},
   };
 });
 

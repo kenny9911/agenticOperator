@@ -63,7 +63,7 @@ vi.mock('@/lib/mappers/candidate-preferences', () => ({
   })),
 }));
 vi.mock('@/lib/dependency-health/classify', () => ({ classifyRobohire: vi.fn() }));
-vi.mock('@/lib/dependency-health/report', () => ({ reportDependencyDegraded: vi.fn() }));
+vi.mock('@/lib/dependency-health/report', () => ({ reportDependencyDegraded: vi.fn(), recordDependencyOk: vi.fn(async () => {}) }));
 vi.mock('@/lib/agent-logger', () => ({
   createAgentLogger: vi.fn(() => ({ event: vi.fn(), apiCall: vi.fn() })),
   runWithLogger: vi.fn(async (_logger: unknown, fn: () => Promise<unknown>) => fn()),

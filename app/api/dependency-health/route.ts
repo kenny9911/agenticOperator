@@ -8,9 +8,14 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/server/db';
 import { createPgReadPort } from '@/lib/monitor/pg-read-port';
 import { DEFAULT_THRESHOLDS } from '@/lib/monitor/monitor-types';
-import { buildDependencyHealth, parseFiringDepAlert } from '@/lib/dependency-health/build';
+import { buildDependencyHealth, parseFiringDepAlert, parseRecoveryRow } from '@/lib/dependency-health/build';
+import { DEP_RECOVERED_ANCHOR } from '@/lib/monitor/dependency';
+
 import type { DependencyHealthResponse, DependencyHealthRow } from '@/lib/dependency-health/contract';
 import type { DepProvider } from '@/lib/dependency-health/types';
+
+/** How long the card keeps showing 故障恢复 after an alert was resolved. */
+const RECOVERED_SHOW_MS = 30 * 60_000;
 
 export async function GET(): Promise<Response> {
   const windowMs = DEFAULT_THRESHOLDS.depFailWindowMs;
@@ -18,16 +23,28 @@ export async function GET(): Promise<Response> {
 
   try {
     const port = createPgReadPort();
-    const [failures, firingRows] = await Promise.all([
+    const [failures, firingRows, recoveryRows] = await Promise.all([
       port.dependencyFailures(windowMs),
       prisma.notification.findMany({
         where: { status: 'firing', dedupeKey: { startsWith: 'dep_down.' } },
         select: { id: true, dedupeKey: true, severity: true, count: true, firstSeenAt: true, anchorsJson: true },
       }),
+      // 故障恢复 messages posted when a dep_down alert was resolved.
+      prisma.notification.findMany({
+        where: {
+          kind: 'message',
+          ts: { gte: new Date(Date.now() - RECOVERED_SHOW_MS) },
+          anchorsJson: { contains: `"${DEP_RECOVERED_ANCHOR}"` },
+        },
+        select: { id: true, ts: true, anchorsJson: true },
+        orderBy: { ts: 'desc' },
+        take: 20,
+      }),
     ]);
 
     const firing = firingRows.map(parseFiringDepAlert).filter((a): a is NonNullable<typeof a> => a !== null);
-    const providers = buildDependencyHealth(failures, firing, DEFAULT_THRESHOLDS);
+    const recoveries = recoveryRows.map(parseRecoveryRow).filter((r): r is NonNullable<typeof r> => r !== null);
+    const providers = buildDependencyHealth(failures, firing, DEFAULT_THRESHOLDS, recoveries);
 
     const body: DependencyHealthResponse = {
       providers,

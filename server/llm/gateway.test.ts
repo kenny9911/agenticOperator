@@ -141,6 +141,66 @@ describe('chatComplete with tools', () => {
     expect(dispatcher).toHaveBeenCalledTimes(2);
   });
 
+  describe('finalizeOnLimit', () => {
+    const toolCallResponse = {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              { id: 'tc_x', type: 'function', function: { name: 'get_instance', arguments: '{}' } },
+            ],
+          },
+        },
+      ],
+    };
+    const schema = [
+      {
+        type: 'function' as const,
+        function: { name: 'get_instance', parameters: { type: 'object', properties: {} } },
+      },
+    ];
+
+    it('forces a tools-disabled final round instead of throwing', async () => {
+      createMock
+        .mockResolvedValueOnce(toolCallResponse)
+        .mockResolvedValueOnce(toolCallResponse)
+        .mockResolvedValueOnce({ choices: [{ message: { content: '{"rule_results":[]}' } }] });
+      const dispatcher = vi.fn().mockResolvedValue({});
+
+      const out = await chatComplete({
+        system: 'sys',
+        user: 'u',
+        tools: { schema, onToolCall: dispatcher, maxIterations: 2, finalizeOnLimit: 'NO MORE TOOLS' },
+      });
+
+      expect(out.text).toBe('{"rule_results":[]}');
+      expect(out.toolUseIterations).toBe(2);
+      expect(dispatcher).toHaveBeenCalledTimes(2);
+      expect(createMock).toHaveBeenCalledTimes(3);
+      const finalArgs = createMock.mock.calls[2][0];
+      expect(finalArgs.tool_choice).toBe('none');
+      const last = finalArgs.messages[finalArgs.messages.length - 1];
+      expect(last).toEqual({ role: 'user', content: 'NO MORE TOOLS' });
+    });
+
+    it('still throws if the final round returns tool_calls with no text', async () => {
+      createMock.mockResolvedValue(toolCallResponse);
+      const dispatcher = vi.fn().mockResolvedValue({});
+
+      await expect(
+        chatComplete({
+          system: 'sys',
+          user: 'u',
+          tools: { schema, onToolCall: dispatcher, maxIterations: 2, finalizeOnLimit: 'NO MORE TOOLS' },
+        }),
+      ).rejects.toThrow(/tool-use loop exceeded/);
+      // Tools from the ignored final round are NOT dispatched.
+      expect(dispatcher).toHaveBeenCalledTimes(2);
+      expect(createMock).toHaveBeenCalledTimes(3);
+    });
+  });
+
   it('returns text without tool_calls if model emits content first', async () => {
     createMock.mockResolvedValueOnce({
       choices: [{ message: { content: 'no tools needed' } }],

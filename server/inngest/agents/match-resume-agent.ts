@@ -20,7 +20,7 @@ import { resolveMatchPayload } from '@/lib/partner-pg/_robohire-normalize';
 import { writeCandidateMatchResultInstance } from '@/lib/allmeta-writers';
 import { matchResumeDirect } from '@/lib/robohire-client';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
-import { reportDependencyDegraded, isRecoverableReason } from '@/lib/dependency-health/report';
+import { reportDependencyDegraded, isRecoverableReason, recordDependencyOk } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import type { DepOutcome } from '@/lib/dependency-health/types';
 import { createAgentLogger, runWithLogger } from '@/lib/agent-logger';
@@ -257,6 +257,8 @@ export async function matchResumeAgentHandler({ event, step, logger, runId }: an
     if (!oc.ok) {
       return { ok: false as const, error: `${oc.reason}: ${oc.detail}`, degraded: oc };
     }
+    // Healthy call → recovery heartbeat (clears 故障预警/故障 on the fleet card).
+    await recordDependencyOk('robohire', 'matchResume', depCtx);
     logger.info(
       `[${AGENT_NAME}] RoboHire match OK · score=${r.data.matchScore} rec=${r.data.recommendation} requestId=${r.requestId}`,
     );

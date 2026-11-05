@@ -41,7 +41,7 @@ import {
 } from '@/lib/raas-v1/candidate-expectation';
 import { parseResumeProcessingContract } from '@/lib/raas-v1/resume-processing-contract';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
-import { reportDependencyDegraded } from '@/lib/dependency-health/report';
+import { reportDependencyDegraded, recordDependencyOk } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import { inngest, type ResumeProcessedData } from '@/server/inngest/client';
 import { skipIfRaasV1Paused } from '@/server/inngest/raas-v1';
@@ -339,6 +339,7 @@ export const resumeParserAgent = inngest.createFunction(
         // Silent degrade: 200 OK but RoboHire extracted nothing usable.
         const oc = classifyRobohire('parseResume', parseRes);
         if (!oc.ok) await reportDependencyDegraded(oc, depCtx);
+        await recordDependencyOk('robohire', 'parseResume', depCtx);
         logger.info(
           `[resume-persist] RoboHire parse-resume OK · cached=${parseRes.cached} ` +
             `requestId=${parseRes.requestId}`,

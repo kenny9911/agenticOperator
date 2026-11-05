@@ -75,6 +75,7 @@ vi.mock('@/lib/dependency-health/report', async (importOriginal) => {
     ...actual,
     recordDependencySignal: vi.fn((outcome: never, context: never) =>
       actual.recordDependencySignal(outcome, context, noopLog)),
+    recordDependencyOk: vi.fn(async () => {}),
     reportDependencyDegraded: vi.fn((outcome: never, context: never) =>
       actual.reportDependencyDegraded(outcome, context, noopLog)),
   };

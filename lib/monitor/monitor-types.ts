@@ -90,6 +90,7 @@ export interface MonitorThresholds {
   minVolume: number; // error-rate: suppress below this sample size
   depFailWindowMs: number; // dependency: lookback window for degraded-call signals
   depFailMinCount: number; // dependency: min failures before a fault/unknown fires (quota fires at 1)
+  depFaultConfirmCount: number; // dependency: clean faults 故障预警(warn) → 故障(critical) at/above this count
   depUnknownEscalateCount: number; // dependency: 'unknown' warn → critical at/above this count
   hitlStaleMs: number; // hitl: a needs_human alert older than this triggers the 催办 digest
 }
@@ -103,6 +104,7 @@ export const DEFAULT_THRESHOLDS: MonitorThresholds = {
   minVolume: 5,
   depFailWindowMs: 15 * 60_000,
   depFailMinCount: 2,
+  depFaultConfirmCount: 5,
   depUnknownEscalateCount: 6,
   hitlStaleMs: 48 * 3600_000,
 };

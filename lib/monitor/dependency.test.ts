@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { dependencyMonitor, judgeDependency } from './dependency';
+import { dependencyMonitor, judgeDependency, dependencyRecoveryFinding, DEP_RECOVERED_ANCHOR } from './dependency';
 import { DEFAULT_THRESHOLDS, type MonitorReadPort } from './monitor-types';
 import type { DepFailure } from '../dependency-health/types';
 
@@ -34,10 +34,16 @@ describe('judgeDependency', () => {
   it('any quota signal → out_of_funds / critical, even at N=1', () => {
     expect(judgeDependency([dep({ reason: 'quota' })], T)).toEqual({ label: 'out_of_funds', level: 'critical' });
   });
-  it('pure server/network, N≥min → fault / critical; below min → null', () => {
+  it('pure server/network: a few → 故障预警 (warn), not a confirmed fault; below min → null', () => {
     const two = [dep({ reason: 'server' }), dep({ reason: 'network' })];
-    expect(judgeDependency(two, T)).toEqual({ label: 'fault', level: 'critical' });
+    expect(judgeDependency(two, T)).toEqual({ label: 'fault_warning', level: 'warn' });
+    const almost = Array.from({ length: T.depFaultConfirmCount - 1 }, () => dep({ reason: 'server' }));
+    expect(judgeDependency(almost, T)).toEqual({ label: 'fault_warning', level: 'warn' });
     expect(judgeDependency([dep({ reason: 'server' })], T)).toBeNull();
+  });
+  it('pure server/network persisting past the confirm threshold → 故障 (critical)', () => {
+    const many = Array.from({ length: T.depFaultConfirmCount }, () => dep({ reason: 'network' }));
+    expect(judgeDependency(many, T)).toEqual({ label: 'fault', level: 'critical' });
   });
   it('ambiguous (auth/empty/rate_limit) → unknown / warn; escalates to critical when persistent', () => {
     const few = Array.from({ length: T.depFailMinCount }, () => dep({ reason: 'empty' }));
@@ -91,5 +97,25 @@ describe('dependencyMonitor', () => {
     const r = await dependencyMonitor(fakePort([]), T);
     expect(r.findings).toHaveLength(0);
     expect(r.activeKeys).toHaveLength(0);
+  });
+});
+
+describe('dependencyRecoveryFinding (故障恢复 message)', () => {
+  it('builds an info system message for a resolved dep_down key', () => {
+    const f = dependencyRecoveryFinding('dep_down.robohire.招聘-v1', 'RoboHire 故障预警 — …');
+    expect(f).not.toBeNull();
+    expect(f!.level).toBe('info');
+    expect(f!.category).toBe('system_lifecycle');
+    expect(f!.message).toContain('故障恢复');
+    expect(f!.message).toContain('RoboHire');
+    expect(f!.anchors).toMatchObject({ [DEP_RECOVERED_ANCHOR]: 'robohire', dep_domain: '招聘-v1' });
+  });
+  it('keeps dotted domains intact', () => {
+    expect(dependencyRecoveryFinding('dep_down.llm.a.b')!.anchors).toMatchObject({ dep_domain: 'a.b' });
+  });
+  it('ignores non-dependency / malformed keys', () => {
+    expect(dependencyRecoveryFinding('run_stalled.x')).toBeNull();
+    expect(dependencyRecoveryFinding('dep_down.robohire')).toBeNull();
+    expect(dependencyRecoveryFinding('dep_down.nope.招聘-v1')).toBeNull();
   });
 });

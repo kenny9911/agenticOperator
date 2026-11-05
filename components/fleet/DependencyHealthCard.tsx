@@ -81,7 +81,7 @@ export function DependencyHealthCard() {
 
   if (!data) return null;
 
-  const anyUnhealthy = data.providers.some((p) => p.label !== "healthy");
+  const anyUnhealthy = data.providers.some((p) => p.label !== "healthy" && p.label !== "recovered");
 
   return (
     <Card>
@@ -122,7 +122,8 @@ function ProviderLine({
   const hint = t(`dep_hint_${p.label}`);
   const ops = p.affectedOps.map((op) => t(`dep_op_${op}`) || op).join("、");
   const domains = p.affectedDomains.map(friendlyDomainName).join("、");
-  const unhealthy = p.label !== "healthy";
+  const unhealthy = p.label !== "healthy" && p.label !== "recovered";
+  const recovered = p.label === "recovered";
 
   return (
     <div className="flex items-start gap-3 px-4 py-2.5">
@@ -135,6 +136,11 @@ function ProviderLine({
           <Badge variant={BADGE[p.severity]} dot={p.severity === "critical"} pulse={p.severity === "critical"}>
             {labelText}
           </Badge>
+          {recovered && p.sinceTs && (
+            <span className="text-[11px] text-ink-3 tabular-nums">
+              {t("dep_recovered_ago").replace("{ago}", sinceLabel(p.sinceTs))}
+            </span>
+          )}
           {p.failureCount > 0 && (
             <span className="text-[11px] text-ink-3 tabular-nums">
               {t("dep_failures_n").replace("{n}", String(p.failureCount))}
@@ -162,7 +168,7 @@ function ProviderLine({
             className="inline-flex items-center gap-1 text-[11.5px] text-accent hover:underline"
           >
             <Ic.bell style={{ width: 12, height: 12 }} />
-            {t("dep_view_alert")}
+            {recovered ? t("dep_view_recovery") : t("dep_view_alert")}
           </a>
         )}
         {unhealthy && (

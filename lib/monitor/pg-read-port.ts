@@ -15,6 +15,10 @@ import type {
 } from './monitor-types';
 import { parseDependencyRow } from '../dependency-health/parse-signal';
 import { parseResetRow, applyResets, type DepReset } from '../dependency-health/reset';
+import { parseOkRow, applyRecoveries } from '../dependency-health/recovery';
+import type { DepSuccess } from '../dependency-health/types';
+import { dependencyRecoveryFinding } from './dependency';
+import { recordNotification } from '../../server/notifications/ingest';
 import { notifyResolvedExternally } from '../../server/notifications/resolve';
 import type { ResolveDeps } from './resolve';
 
@@ -126,7 +130,7 @@ export function createPgReadPort(): MonitorReadPort {
 
     async dependencyFailures(windowMs: number): Promise<DepFailure[]> {
       const cutoff = new Date(Date.now() - windowMs);
-      const [failRows, resetRows] = await Promise.all([
+      const [failRows, resetRows, okRows] = await Promise.all([
         prisma.logEvent.findMany({
           where: { category: 'dependency', ts: { gte: cutoff } },
           select: { runId: true, ts: true, payloadJson: true },
@@ -134,6 +138,11 @@ export function createPgReadPort(): MonitorReadPort {
         }),
         prisma.logEvent.findMany({
           where: { category: 'dependency_reset', ts: { gte: cutoff } },
+          select: { ts: true, payloadJson: true },
+          orderBy: { ts: 'asc' },
+        }),
+        prisma.logEvent.findMany({
+          where: { category: 'dependency_ok', ts: { gte: cutoff } },
           select: { ts: true, payloadJson: true },
           orderBy: { ts: 'asc' },
         }),
@@ -148,8 +157,14 @@ export function createPgReadPort(): MonitorReadPort {
         const reset = parseResetRow(r);
         if (reset) resets.push(reset);
       }
-      // Drop signals the operator already reset away ("I topped up").
-      return applyResets(failures, resets);
+      const successes: DepSuccess[] = [];
+      for (const r of okRows) {
+        const ok = parseOkRow(r);
+        if (ok) successes.push(ok);
+      }
+      // Drop signals the operator already reset away ("I topped up"), and
+      // signals followed by a later successful call (the vendor recovered).
+      return applyRecoveries(applyResets(failures, resets), successes);
     },
     async staleNeedsHuman(olderThanMs: number) {
       const cutoff = new Date(Date.now() - olderThanMs);
@@ -209,6 +224,15 @@ export function createPgResolveDeps(): ResolveDeps {
       });
       // 报警也报平安:critical 解除推一条企微恢复消息(通道侧把关)。
       if (r.count > 0) notifyResolvedExternally(firing);
+      // 依赖故障解除 → 站内也发一条「故障恢复」消息(预警/故障都发),
+      // 让消息通知与舰队健康卡都能看到恢复,而不是告警悄悄消失。
+      if (r.count > 0) {
+        for (const row of firing) {
+          if (!row.dedupeKey) continue;
+          const finding = dependencyRecoveryFinding(row.dedupeKey, row.title);
+          if (finding) await recordNotification(finding).catch(() => null);
+        }
+      }
     },
   };
 }

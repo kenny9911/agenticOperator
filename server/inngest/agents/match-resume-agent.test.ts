@@ -49,6 +49,7 @@ vi.mock('@/lib/dependency-health/report', async (importOriginal) => {
   return {
     ...actual,
     reportDependencyDegraded: vi.fn(async () => {}),
+    recordDependencyOk: vi.fn(async () => {}),
   };
 });
 

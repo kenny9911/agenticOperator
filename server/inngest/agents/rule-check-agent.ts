@@ -31,7 +31,7 @@ import { isInfraFailure, friendlyInfraReason } from '@/lib/rule-check/infra-fail
 import { recordNotification } from '@/server/notifications/ingest';
 import { resolveAlertsByPrefix } from '@/server/notifications/resolve';
 import { classifyLlm } from '@/lib/dependency-health/classify';
-import { recordDependencySignal } from '@/lib/dependency-health/report';
+import { recordDependencySignal, recordDependencyOk } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
 import { isPartnerPgConfigured } from '@/lib/partner-pg/client';
@@ -476,6 +476,22 @@ export async function ruleCheckAgentHandler({
       // the LLM — and on retry exhaustion park the run for replay. It runs BEFORE
       // the audit / Neo4j CMR / partner-pg writes + emit below, so an infra outage
       // never writes 未通过 to the partner main table or emits MATCH_RULE_CHECK_FAILED.
+      // LLM gateway answered (any non-gateway outcome with a measured LLM call)
+      // → recovery heartbeat, so an AI 网关 故障预警/故障 clears on the fleet card
+      // as soon as calls succeed again.
+      if (
+        r.audit.fail_reason !== 'llm-call-error' &&
+        r.audit.fail_reason !== 'gateway-unavailable' &&
+        (r.audit.llm_duration_ms ?? 0) > 0
+      ) {
+        await recordDependencyOk('llm', 'ruleCheck', {
+          agent: 'RuleCheck',
+          runId: runId ?? null,
+          traceId: traceId ?? null,
+          domain: RECRUITMENT_DOMAIN_ID,
+        });
+      }
+
       if (r.decision === 'FAIL' && isInfraFailure(r.audit.fail_reason)) {
         const reason = r.audit.fail_reason;
         logger.error(
