@@ -13,10 +13,9 @@
 // AO's RESUME_PROCESSED event.
 //
 // All persistence below is in one transaction:
-//   1. UPSERT candidate     — dedup by (mobile_normalized, name) when available;
-//                              otherwise use input candidate_id
+//   1. UPSERT candidate     — dedup ONLY by a strong mainland mobile
 //   2. UPSERT CandidateExpectation when RESUME_DOWNLOADED carries expectation_payload
-//   3. UPSERT resume        — dedup by (candidate_id, source_etag)
+//   3. UPSERT resume        — exact upload / (bucket_name, object_key) idempotency
 //   4. SELECT application   — RAAS owns creation; AO only returns an existing id
 //   5. UPDATE resume_upload_runtime to completed
 //
@@ -26,11 +25,21 @@
 
 import { randomUUID } from 'node:crypto';
 import { withTx } from './client';
-import { dedupKey, toE164 } from '@/lib/phone/normalize-e164';
+import { currentLogger } from '@/lib/agent-logger';
+import {
+  resolveCandidateMobile,
+  type CandidateMobileStatus,
+} from '@/lib/phone/normalize-e164';
+import { canonicalGender, isDroppedGender } from '@/lib/gender/canonical-gender';
 import {
   normalizeCandidateExpectationPayload,
   type CandidateExpectationPatch,
 } from '@/lib/raas-v1/candidate-expectation';
+import { parseRmhrLockTime } from '@/lib/rmhr/lock-time';
+import {
+  RMHR_MANUAL_IDENTITY_SOURCE,
+  type RmhrManualCandidateIdentity,
+} from '@/lib/raas-v1/resume-candidate-identity';
 
 // ──────────────────────────────────────────────────────────────────────
 // Input mirrors lib/raas-api-client.ts SaveCandidateInput so callers
@@ -49,16 +58,25 @@ export type SaveCandidateInput = {
    * RMHR 锁持有人工号 — RESUME_DOWNLOADED 的 locked_by_employee_id 透传
    * (raas 2026-05-27 起发送)。非空时是归属权威 (per raas ADR-0041
    * "锁在他人则同步真实归属"): INSERT 直接用它做 candidate.employee_id,
-   * dedup 命中走 UPDATE 时无条件覆盖既有归属。为空时回落 employee_id
-   * (上传者) 走原 COALESCE 仅填空语义。
+   * dedup 命中时按锁时间防旧写。为空表示没有锁的正证据，不能回落上传者
+   * 伪造 Candidate 归属，也不能解释为解锁命令。
    */
   locked_by_employee_id?: string | null;
+  /** RMHR lockTime. Beijing wall-clock strings are normalized explicitly. */
+  locked_at?: string | number | null;
+  /** Event receive time used only when a positive lock omitted locked_at. */
+  lock_observed_at?: string | number | null;
   hr_folder?: string | null;
   job_requisition_id?: string | null;
   client_id?: string | null;
   sourcing_channel_id?: string | null;
   /** RAAS RESUME_DOWNLOADED.payload.expectation_payload (partial, non-empty fields only). */
   expectation_payload?: CandidateExpectationPatch | null;
+  /**
+   * RMHR-accepted operator refill. This is Candidate identity input only;
+   * `parsed` remains the untouched RoboHire evidence stored on Resume.
+   */
+  authoritative_identity?: RmhrManualCandidateIdentity | null;
   /** RoboHire parse-resume output (data field). */
   parsed?: {
     data?: {
@@ -75,11 +93,6 @@ export type SaveCandidateInput = {
       [key: string]: unknown;
     } | null;
   };
-  /** Optional explicit candidate_id (force use this instead of dedup). */
-  candidate_id?: string;
-  /** 查重(9-15)判出的"老人"candidate_id —— 同一人时强制复用此行(UPDATE 挂新简历到老
-   *  Candidate,1:N),优先级仅次于显式 candidate_id、高于 phone/email dedup。null → 走兜底 dedup。 */
-  same_as_candidate_id?: string | null;
 };
 
 export type SaveCandidateResult = {
@@ -89,7 +102,68 @@ export type SaveCandidateResult = {
   application_id: string | null;
   candidate_created: boolean;
   resume_created: boolean;
+  /** Strong mainland 11-digit mobile persisted to both candidate phone columns. */
+  mobile_normalized: string | null;
+  mobile_review_status: CandidateMobileStatus;
+  /** True when upload/object identity reused an already persisted candidate/resume. */
+  idempotent_replay: boolean;
+  /** Final partner-PG Candidate values for inserts, phone hits, and transport
+   * replays. Allmeta uses this snapshot where parser identity must not win. */
+  candidate_snapshot: PersistedCandidateSnapshot | null;
+  /** Exact lock tuple read from or committed to partner PG. */
+  candidate_lock_snapshot: CandidateLockSnapshot | null;
 };
+
+export type CandidateLockSnapshot = {
+  employee_id: string | null;
+  is_locked: boolean;
+  lock_start_time: Date | string | null;
+};
+
+export type PersistedCandidateSnapshot = {
+  name: string;
+  mobile: string | null;
+  mobile_normalized: string | null;
+  email: string | null;
+  gender: string | null;
+  birth_date: Date | string | null;
+  current_location: string | null;
+  highest_acquired_degree: string | null;
+  work_years: number | null;
+  employee_id: string | null;
+  is_locked: boolean;
+  lock_start_time: Date | string | null;
+};
+
+/** Historical duplicate rows must be reconciled explicitly, never resolved by
+ * silently choosing the oldest candidate. */
+export class CandidateMobileConflictError extends Error {
+  readonly code = 'CANDIDATE_MOBILE_CONFLICT';
+  readonly candidateIds: string[];
+
+  constructor(mobile: string, candidateIds: string[]) {
+    const masked = `${mobile.slice(0, 3)}****${mobile.slice(-4)}`;
+    super(
+      `[partner-pg/candidates] ${masked} maps to multiple candidates: ${candidateIds.join(', ')}`,
+    );
+    this.name = 'CandidateMobileConflictError';
+    this.candidateIds = candidateIds;
+  }
+}
+
+/** One transport object must never resolve to multiple historical resumes. */
+export class CandidateTransportConflictError extends Error {
+  readonly code = 'CANDIDATE_TRANSPORT_CONFLICT';
+  readonly resumeIds: string[];
+
+  constructor(bucket: string, objectKey: string, resumeIds: string[]) {
+    super(
+      `[partner-pg/candidates] transport key ${bucket}/${objectKey} maps to multiple resumes: ${resumeIds.join(', ')}`,
+    );
+    this.name = 'CandidateTransportConflictError';
+    this.resumeIds = resumeIds;
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // 业务默认值 (2026-06-12, partner-pg c5f48e3)
@@ -106,22 +180,6 @@ const DEFAULT_SOURCING_CHANNEL_ID = '02001034';
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────
-
-/**
- * Dedup key for the stored `mobile_normalized` column. Delegates to the shared
- * phone normalizer (lib/phone/normalize-e164 `dedupKey`), which is byte-identical
- * to this function's former inline logic:
- *   Default (flag off): >=7 digits, all digits kept (legacy behavior — unchanged).
- *   DEDUP_PHONE_PRIMARY=1: require >=11 digits and return the LAST 11, so
- *     country-code / OCR variants collapse to one identity (matching RMHR).
- * ⚠️ The stored value FORMAT is deliberately unchanged: it is co-owned with the
- * live RAAS partner DB and matched via suffix LIKE, so the E.164 upgrade of this
- * column is deferred to a coordinated migration (see 2026-07-21 old-repo design §3).
- * Enabling DEDUP_PHONE_PRIMARY still changes the stored key and needs a backfill.
- */
-function normalizeMobile(s: string | null | undefined): string | null {
-  return dedupKey(s, { phonePrimary: process.env.DEDUP_PHONE_PRIMARY === '1' });
-}
 
 function nonEmpty(s: unknown): string | null {
   return typeof s === 'string' && s.trim() ? s.trim() : null;
@@ -261,26 +319,57 @@ export async function saveCandidateToPartnerPg(
   const sourcingChannelId =
     nonEmpty(input.sourcing_channel_id) ?? DEFAULT_SOURCING_CHANNEL_ID;
   const uploadedBy = nonEmpty(input.employee_id);
-  // 2026-06-11 (c200efd) — RMHR 锁持有人是候选人归属权威 (锁权威覆盖)。被他人
-  // 锁定时 raas 仍发 RESUME_DOWNLOADED 并透传 locked_by_*, 候选人应归锁持有人而
-  // 非上传者。lockedBy 非空 → employee_id 写锁持有人且 UPDATE 无条件覆盖; 为空
-  // → 沿用上传者 + COALESCE 仅填空 (公共池) 的历史语义。resume.uploaded_by 不受
-  // 影响 — 那是"谁上传了文件", 始终记上传者。
-  // ⚠️ 运维红线: 勿从 Inngest dashboard 直接 replay 旧 RESUME_DOWNLOADED — 陈旧
-  // locked_by 会无条件覆盖较新归属 (这里不做 locked_at 新旧比较, 跨系统时区口径
-  // 不可靠)。
+  // Candidate 的三个 RMHR 锁字段是一个原子事实。只有持锁人非空才是锁定正证据；
+  // 上传者属于 resume.uploaded_by 的文件级语义，不能拿来填 Candidate.employee_id。
+  // locked_at 优先；RMHR 旧响应缺时间时用事件 received_at，最后才以本次处理时刻
+  // 为新 Candidate 建立非空锁时间。dedup UPDATE 对有效时间做防旧写。
   const lockedBy = nonEmpty(input.locked_by_employee_id);
-  const ownerEmployeeId = lockedBy ?? uploadedBy;
+  const hasIncomingLock = lockedBy !== null;
+  const incomingLockStartTime = hasIncomingLock
+    ? parseRmhrLockTime(input.locked_at) ?? parseRmhrLockTime(input.lock_observed_at)
+    : null;
+  const newCandidateLockStartTime = hasIncomingLock
+    ? incomingLockStartTime ?? new Date()
+    : null;
 
   const parsed = input.parsed?.data ?? {};
-  const name = nonEmpty(parsed.name) ?? '未命名候选人';
-  // 手机号(2026-07-21 决策):存进 `mobile` 列的是 E.164 规范形(号码有效时),无效号
-  // 退回原始串(绝不丢号)。去重键 `mobile_normalized` 仍从【原始号】计算,逐字节不变
-  // —— 保证共享库去重零回归(见 lib/phone/normalize-e164 dedupKey 的逐字节复刻)。
-  const rawMobile = nonEmpty(parsed.mobile) ?? nonEmpty(parsed.phone);
-  const mobile_normalized = normalizeMobile(rawMobile);
-  const mobile = toE164(rawMobile) ?? rawMobile;
+  const authoritativeIdentity =
+    input.authoritative_identity?.source === RMHR_MANUAL_IDENTITY_SOURCE
+      ? input.authoritative_identity
+      : null;
+  const authoritativeName = nonEmpty(authoritativeIdentity?.name);
+  const authoritativePhone = nonEmpty(authoritativeIdentity?.phone);
+  const name = authoritativeName ?? nonEmpty(parsed.name) ?? '未命名候选人';
+  // Candidate identity accepts exactly one strong mainland mobile. All aliases
+  // are resolved together so Postgres / Allmeta cannot silently choose different
+  // fields. Unusable raw values stay in resume.raw_parse_result only.
+  const mobileResolution = authoritativePhone
+    ? resolveCandidateMobile(authoritativePhone)
+    : resolveCandidateMobile([
+        parsed.mobile,
+        parsed.phone,
+        (parsed as Record<string, unknown>).phoneNumber,
+      ]);
+  const mobile = mobileResolution.mobile;
+  const mobile_normalized = mobileResolution.mobile;
+  const needsMobileReview = mobileResolution.status !== 'valid';
   const email = nonEmpty(parsed.email);
+  // Partner constrains the column to 'male' | 'female' | NULL
+  // (candidate_gender_canonical_check). The parser reports whatever the résumé
+  // says — '男', '⼥', '♂', '性别：邱杰' — and one unmapped string would abort the
+  // whole ingest transaction, losing Candidate + Resume over a cosmetic field.
+  // Unmappable values become NULL; the raw string survives in raw_parse_result.
+  const genderRaw = parsed.gender;
+  const gender = canonicalGender(genderRaw);
+  if (isDroppedGender(genderRaw)) {
+    // Value-free log — a junk gender is sometimes a misplaced name ('性别：邱杰').
+    // upload_id is enough to pull the literal from resume.raw_parse_result and
+    // decide whether the token table in lib/gender/canonical-gender.ts needs it.
+    currentLogger()?.event('partner_pg.gender_dropped', {
+      upload_id: input.upload_id,
+      raw_length: String(genderRaw).length,
+    });
+  }
 
   // Structured-column derivations from the RoboHire parse-resume output.
   // These map 1:1 to partner Postgres `resume.*` columns so RAAS readers
@@ -306,48 +395,147 @@ export async function saveCandidateToPartnerPg(
   const expectationPatch = normalizeCandidateExpectationPayload(input.expectation_payload);
 
   return withTx<SaveCandidateResult>(async (c) => {
-    // ── Step 1: UPSERT candidate ──
-    // Dedup strategy:
-    //   - If input.candidate_id explicit → use that (force)
-    //   - Else if mobile_normalized present → look up by (mobile_normalized, name)
-    //   - Else if email present → look up by email
-    //   - Else → create new
-    // dedup 档序:① 显式 candidate_id ② 查重(9-15)判出的 same_as_candidate_id ③ 手机号 ④ 邮箱+名字 ⑤ 建新。
-    // 查重前移后 same_as_candidate_id 是权威归属源;phone/email 仅在查重未命中时兜底。
-    let candidate_id = input.candidate_id ?? input.same_as_candidate_id ?? null;
-    let candidate_created = false;
+    // Processing idempotency is deliberately separate from identity dedup:
+    // serialize one upload first, then reuse its already-written target. A pending
+    // or absent runtime row falls back to the stable transport key. Neither route
+    // grants permission to alter Candidate identity fields from replayed parse data.
+    await c.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`upload:${input.upload_id}`],
+    );
+    const runtimeTarget = await c.query<{
+      candidate_id: string | null;
+      resume_id: string | null;
+      status: string | null;
+    }>(
+      `SELECT candidate_id, resume_id, status
+         FROM resume_upload_runtime
+        WHERE upload_id = $1
+        FOR UPDATE`,
+      [input.upload_id],
+    );
+    const runtime = runtimeTarget.rows[0] ?? null;
+    let idempotentCandidateId = nonEmpty(runtime?.candidate_id);
+    let idempotentResumeId = nonEmpty(runtime?.resume_id);
 
-    if (!candidate_id && mobile_normalized) {
-      // DEDUP_PHONE_PRIMARY=1 → phone is the sole identity key (drop `AND name`),
-      // matching RMHR's phone-only dedup so its returned lock owner maps 1:1 onto
-      // one AO candidate row. Flag off → legacy (mobile + exact name). The
-      // email+name fallback tier below is left UNTOUCHED (it closed the
-      // 2026-05-26 placeholder/test-email merge bug).
-      const phonePrimary = process.env.DEDUP_PHONE_PRIMARY === '1';
-      const existing = await c.query<{ candidate_id: string }>(
-        phonePrimary
-          ? `SELECT candidate_id FROM candidate
-              WHERE mobile_normalized = $1
-              ORDER BY created_at ASC LIMIT 1`
-          : `SELECT candidate_id FROM candidate
-              WHERE mobile_normalized = $1 AND name = $2
-              ORDER BY created_at ASC LIMIT 1`,
-        phonePrimary ? [mobile_normalized] : [mobile_normalized, name],
+    if (runtime?.status === 'completed' && (!idempotentCandidateId || !idempotentResumeId)) {
+      throw new Error(
+        `[partner-pg/candidates] completed upload ${input.upload_id} has incomplete candidate/resume anchors`,
       );
-      candidate_id = existing.rows[0]?.candidate_id ?? null;
     }
-    // 2026-05-26 — email-dedup 加 name 联合约束.
-    // 原来"仅 email 匹配"在测试场景会把不同人合并: RAAS 测试用同一个测试邮箱
-    // (zyjjust@gmail.com) 上传 4 份不同候选人 PDF, 都被 dedup 到陈昊那行,
-    // 后续 RoboHire 正解的姓名(周婧雯/林佳琪/陈思颖)走 UPDATE 分支后被丢弃,
-    // 陈昊那行 name='性别' 永远 stuck. 生产场景同人换简历不会改姓名,
-    // 同时要求 name 匹配才合并是安全的.
-    if (!candidate_id && email && name && name !== '未命名候选人') {
+
+    if (!runtime || runtime.status !== 'completed') {
+      await c.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [`transport:${JSON.stringify([input.bucket, input.object_key])}`],
+      );
+      const transported = await c.query<{ resume_id: string; candidate_id: string }>(
+        `SELECT resume_id, candidate_id
+           FROM resume
+          WHERE bucket_name = $1 AND object_key = $2
+          ORDER BY created_at ASC
+          LIMIT 2
+          FOR UPDATE`,
+        [input.bucket, input.object_key],
+      );
+      if (transported.rows.length > 1) {
+        throw new CandidateTransportConflictError(
+          input.bucket,
+          input.object_key,
+          transported.rows.map((row) => row.resume_id),
+        );
+      }
+      const transportTarget = transported.rows[0] ?? null;
+      if (
+        transportTarget &&
+        idempotentCandidateId &&
+        idempotentCandidateId !== transportTarget.candidate_id
+      ) {
+        throw new Error(
+          `[partner-pg/candidates] upload ${input.upload_id} candidate anchor conflicts with its transport resume`,
+        );
+      }
+      if (
+        transportTarget &&
+        idempotentResumeId &&
+        idempotentResumeId !== transportTarget.resume_id
+      ) {
+        throw new Error(
+          `[partner-pg/candidates] upload ${input.upload_id} resume anchor conflicts with its transport key`,
+        );
+      }
+      if (!transportTarget && (idempotentCandidateId || idempotentResumeId)) {
+        throw new Error(
+          `[partner-pg/candidates] unfinished upload ${input.upload_id} carries unproven candidate/resume anchors`,
+        );
+      }
+      idempotentCandidateId ??= transportTarget?.candidate_id ?? null;
+      idempotentResumeId ??= transportTarget?.resume_id ?? null;
+    }
+
+    // ── Step 1: UPSERT candidate ──
+    // Identity contract:
+    //   - one strong mainland mobile is the ONLY dedup signal;
+    //   - missing/invalid/placeholder/ambiguous phone always creates a new row.
+    // Email, name and Candidate Identity Agent judgments are never candidate keys.
+    let candidate_id: string | null = idempotentCandidateId;
+    let candidate_created = false;
+    const idempotentReplay = candidate_id !== null;
+    let savedMobileResolution = mobileResolution;
+    let candidateSnapshot: PersistedCandidateSnapshot | null = null;
+    let candidateLockSnapshot: CandidateLockSnapshot | null = null;
+
+    if (candidate_id) {
+      const target = await c.query<PersistedCandidateSnapshot>(
+        `SELECT name, mobile, mobile_normalized, email, gender, birth_date,
+                current_location, highest_acquired_degree, work_years,
+                employee_id, is_locked,
+                lock_start_time AT TIME ZONE 'UTC' AS lock_start_time
+           FROM candidate
+          WHERE candidate_id = $1
+          FOR UPDATE`,
+        [candidate_id],
+      );
+      if (target.rows.length !== 1) {
+        throw new Error(
+          `[partner-pg/candidates] idempotency target candidate ${candidate_id} does not exist`,
+        );
+      }
+      savedMobileResolution = resolveCandidateMobile([
+        target.rows[0].mobile,
+        target.rows[0].mobile_normalized,
+      ]);
+      // A transport/upload replay must not rewrite Candidate, but it still
+      // returns the exact persisted row so an Allmeta mirror can be repaired
+      // safely when the event is delivered again.
+      candidateSnapshot = target.rows[0];
+      candidateLockSnapshot = {
+        employee_id: candidateSnapshot.employee_id,
+        is_locked: candidateSnapshot.is_locked,
+        lock_start_time: candidateSnapshot.lock_start_time,
+      };
+    }
+
+    if (!idempotentReplay && mobile_normalized) {
+      // Serialize AO writers for the same phone inside the transaction. This
+      // closes the local SELECT→INSERT race; a partner-wide UNIQUE index is still
+      // required before multiple independent RAAS writers can share the invariant.
+      await c.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [mobile_normalized],
+      );
       const existing = await c.query<{ candidate_id: string }>(
         `SELECT candidate_id FROM candidate
-          WHERE email = $1 AND name = $2 LIMIT 1`,
-        [email, name],
+          WHERE mobile_normalized = $1
+          ORDER BY created_at ASC LIMIT 2`,
+        [mobile_normalized],
       );
+      if (existing.rows.length > 1) {
+        throw new CandidateMobileConflictError(
+          mobile_normalized,
+          existing.rows.map((row) => row.candidate_id),
+        );
+      }
       candidate_id = existing.rows[0]?.candidate_id ?? null;
     }
 
@@ -360,12 +548,14 @@ export async function saveCandidateToPartnerPg(
             current_location, current_company, current_title,
             skills, languages,
             sourcing_channel_id, employee_id, data_source, status,
+            needs_mobile_review, is_locked, lock_start_time,
             created_at, updated_at
           ) VALUES (
             $1, $2, $3, $4, $5, $6,
             $7, $8, $9,
             $10::text[], $11::text[],
             $12, $13, $14, $15,
+            $16, $17, ($18::timestamptz AT TIME ZONE 'UTC'),
             NOW(), NOW()
           )`,
         [
@@ -374,33 +564,55 @@ export async function saveCandidateToPartnerPg(
           mobile,
           mobile_normalized,
           email,
-          nonEmpty(parsed.gender),
+          gender,
           currentLocation,
           currentCompany,
           currentTitle,
           skillsExtracted,
           languagesList,
           sourcingChannelId,
-          ownerEmployeeId,
+          lockedBy,
           'agentic_operator',
           DEFAULT_CANDIDATE_STATUS,
+          needsMobileReview,
+          hasIncomingLock,
+          newCandidateLockStartTime,
         ],
       );
-    } else {
-      // dedup 命中 — 同一候选人换简历, patch 联系信息 + skills + 当前公司/职位 + name.
-      // name 字段也跟着 RoboHire `parsed.name` 走 — 老 row 卡在错值时, 同人重传
-      // 让新 RoboHire 输出能覆盖. RoboHire 返空(置 '未命名候选人' 占位)则不
-      // 覆盖, 用 COALESCE 保留原值. 不在 AO 这层做姓名校验/过滤 — 上游 RoboHire
-      // 是 source of truth, RoboHire 输出不对要上游修.
+      candidateLockSnapshot = {
+        employee_id: lockedBy,
+        is_locked: hasIncomingLock,
+        lock_start_time: newCandidateLockStartTime,
+      };
+      candidateSnapshot = {
+        name,
+        mobile,
+        mobile_normalized,
+        email,
+        gender,
+        birth_date: null,
+        current_location: currentLocation,
+        highest_acquired_degree: null,
+        work_years: null,
+        employee_id: lockedBy,
+        is_locked: hasIncomingLock,
+        lock_start_time: newCandidateLockStartTime,
+      };
+    } else if (!idempotentReplay) {
+      // This branch is reachable only through a valid canonical-phone hit. Write
+      // both phone columns directly so historical formatting drift cannot survive.
+      // Phone-only dedup must not let a parser variation overwrite an established
+      // real name. Only fill an empty / placeholder name automatically.
       //
-      // employee_id (归属): $13 标记"事件带 RMHR 锁持有人"。带锁 → 无条件覆盖为
-      // $11 (= 锁持有人, 锁权威校正归属); 不带锁 → 原 COALESCE 仅填空语义
-      // ($11 = 上传者)。status: COALESCE 仅填空, 不覆盖招聘手动维护的状态。
+      // $13 标记"事件带 RMHR 锁持有人"，$15 是规范化的锁时间。三字段共用同一
+      // freshness gate，避免旧锁覆盖较新的现役锁；无持锁人只代表无正证据，保持
+      // Candidate 既有锁三元组。status 仍只填空，不覆盖招聘手工状态。
       const incomingNameForUpdate = name === '未命名候选人' ? null : name;
-      await c.query(
+      const updated = await c.query<PersistedCandidateSnapshot>(
         `UPDATE candidate SET
-            mobile = COALESCE($2, mobile),
-            mobile_normalized = COALESCE($3, mobile_normalized),
+            mobile = $2,
+            mobile_normalized = $3,
+            needs_mobile_review = false,
             email = COALESCE($4, email),
             current_location = COALESCE($5, current_location),
             current_company = COALESCE($6, current_company),
@@ -410,13 +622,49 @@ export async function saveCandidateToPartnerPg(
             languages = CASE WHEN COALESCE(array_length(languages, 1), 0) = 0
                              THEN $9::text[] ELSE languages END,
             sourcing_channel_id = COALESCE(sourcing_channel_id, $10),
-            employee_id = CASE WHEN $13::boolean THEN $11
-                               ELSE COALESCE(employee_id, $11) END,
+            employee_id = CASE
+              WHEN $13::boolean AND (
+                (($15::timestamptz AT TIME ZONE 'UTC') IS NOT NULL AND (
+                  lock_start_time IS NULL OR
+                  lock_start_time <= ($15::timestamptz AT TIME ZONE 'UTC')
+                )) OR
+                ($15::timestamptz IS NULL AND is_locked IS DISTINCT FROM true)
+              ) THEN $11
+              ELSE employee_id
+            END,
+            is_locked = CASE
+              WHEN $13::boolean AND (
+                (($15::timestamptz AT TIME ZONE 'UTC') IS NOT NULL AND (
+                  lock_start_time IS NULL OR
+                  lock_start_time <= ($15::timestamptz AT TIME ZONE 'UTC')
+                )) OR
+                ($15::timestamptz IS NULL AND is_locked IS DISTINCT FROM true)
+              ) THEN true
+              ELSE is_locked
+            END,
+            lock_start_time = CASE
+              WHEN $13::boolean AND (
+                (($15::timestamptz AT TIME ZONE 'UTC') IS NOT NULL AND (
+                  lock_start_time IS NULL OR
+                  lock_start_time <= ($15::timestamptz AT TIME ZONE 'UTC')
+                )) OR
+                ($15::timestamptz IS NULL AND is_locked IS DISTINCT FROM true)
+              ) THEN COALESCE(
+                ($15::timestamptz AT TIME ZONE 'UTC'),
+                NOW()
+              )
+              ELSE lock_start_time
+            END,
             data_source = COALESCE(data_source, 'agentic_operator'),
-            name = COALESCE($12, name),
+            name = CASE WHEN name = '未命名候选人' OR name IS NULL
+                        THEN COALESCE($12, name) ELSE name END,
             status = COALESCE(status, $14),
             updated_at = NOW()
-         WHERE candidate_id = $1`,
+         WHERE candidate_id = $1
+         RETURNING name, mobile, mobile_normalized, email, gender, birth_date,
+                   current_location, highest_acquired_degree, work_years,
+                   employee_id, is_locked,
+                   lock_start_time AT TIME ZONE 'UTC' AS lock_start_time`,
         [
           candidate_id,
           mobile,
@@ -428,12 +676,24 @@ export async function saveCandidateToPartnerPg(
           skillsExtracted,
           languagesList,
           sourcingChannelId,
-          ownerEmployeeId,
+          lockedBy,
           incomingNameForUpdate,
-          lockedBy !== null,
+          hasIncomingLock,
           DEFAULT_CANDIDATE_STATUS,
+          incomingLockStartTime,
         ],
       );
+      if (updated.rows.length !== 1) {
+        throw new Error(
+          `[partner-pg/candidates] canonical-phone target ${candidate_id} disappeared before update`,
+        );
+      }
+      candidateSnapshot = updated.rows[0];
+      candidateLockSnapshot = {
+        employee_id: candidateSnapshot.employee_id,
+        is_locked: candidateSnapshot.is_locked,
+        lock_start_time: candidateSnapshot.lock_start_time,
+      };
     }
 
     // ── Step 2: UPSERT candidate_expectation from RAAS upload payload ──
@@ -446,7 +706,7 @@ export async function saveCandidateToPartnerPg(
     // SELECT ... FOR UPDATE serializes two concurrent uploads for the same
     // candidate so they cannot create two "first" expectation rows.
     let candidate_expectation_id: string | null = null;
-    if (expectationPatch) {
+    if (expectationPatch && !idempotentReplay) {
       const linked = await c.query<{ candidate_expectation_id: unknown }>(
         `SELECT candidate_expectation_id
            FROM candidate
@@ -502,108 +762,59 @@ export async function saveCandidateToPartnerPg(
       }
     }
 
-    // ── Step 3: UPSERT resume by (candidate_id, etag) ──
+    // ── Step 3: insert once or refresh the exact idempotency-target resume ──
     let resume_id: string;
     let resume_created = false;
-    const sourceEtag = nonEmpty(input.etag);
-
-    if (sourceEtag) {
-      const existing = await c.query<{ resume_id: string }>(
-        `SELECT r.resume_id
-           FROM resume r
-          WHERE r.candidate_id = $1
-            AND r.object_key = $2
-          LIMIT 1`,
-        [candidate_id, input.object_key],
+    if (idempotentResumeId) {
+      resume_id = idempotentResumeId;
+      const refreshed = await c.query<{ resume_id: string }>(
+        `UPDATE resume SET
+            raw_parse_result      = $2::jsonb,
+            parsed_content        = $3,
+            summary               = $4,
+            skills_extracted      = $5::text[],
+            languages             = $6::text[],
+            certifications        = $7::text[],
+            work_history          = $8::jsonb,
+            education_history     = $9::jsonb,
+            project_history       = $10::jsonb,
+            awards                = $11::jsonb,
+            skills_detail         = $12::jsonb,
+            certifications_detail = $13::jsonb,
+            languages_detail      = $14::jsonb,
+            uploaded_by           = COALESCE(uploaded_by, $15),
+            parse_status          = 'completed',
+            parse_error           = NULL,
+            updated_at            = NOW()
+         WHERE resume_id = $1
+           AND candidate_id = $16
+           AND bucket_name = $17
+           AND object_key = $18
+         RETURNING resume_id`,
+        [
+          resume_id,
+          JSON.stringify(input.parsed?.data ?? null),
+          rawText,
+          summaryText,
+          skillsExtracted,
+          languagesList,
+          certificationsList,
+          JSON.stringify(workHistory),
+          JSON.stringify(educationHistory),
+          JSON.stringify(projectHistory),
+          JSON.stringify(awardsJson),
+          JSON.stringify(skillsDetailJson),
+          JSON.stringify(certificationsDetailJson),
+          JSON.stringify(languagesDetailJson),
+          uploadedBy,
+          candidate_id,
+          input.bucket,
+          input.object_key,
+        ],
       );
-      if (existing.rows[0]) {
-        resume_id = existing.rows[0].resume_id;
-        // Refresh parsed_data + parse_status + every RAAS-structured column
-        await c.query(
-          `UPDATE resume SET
-              raw_parse_result      = $2::jsonb,
-              parsed_content        = $3,
-              summary               = $4,
-              skills_extracted      = $5::text[],
-              languages             = $6::text[],
-              certifications        = $7::text[],
-              work_history          = $8::jsonb,
-              education_history     = $9::jsonb,
-              project_history       = $10::jsonb,
-              awards                = $11::jsonb,
-              skills_detail         = $12::jsonb,
-              certifications_detail = $13::jsonb,
-              languages_detail      = $14::jsonb,
-              uploaded_by           = COALESCE(uploaded_by, $15),
-              parse_status          = 'completed',
-              parse_error           = NULL,
-              updated_at            = NOW()
-           WHERE resume_id = $1`,
-          [
-            resume_id,
-            JSON.stringify(input.parsed?.data ?? null),
-            rawText,
-            summaryText,
-            skillsExtracted,
-            languagesList,
-            certificationsList,
-            JSON.stringify(workHistory),
-            JSON.stringify(educationHistory),
-            JSON.stringify(projectHistory),
-            JSON.stringify(awardsJson),
-            JSON.stringify(skillsDetailJson),
-            JSON.stringify(certificationsDetailJson),
-            JSON.stringify(languagesDetailJson),
-            uploadedBy,
-          ],
-        );
-      } else {
-        resume_id = randomUUID();
-        resume_created = true;
-        await c.query(
-          `INSERT INTO resume (
-              resume_id, candidate_id,
-              file_name, file_size,
-              bucket_name, object_key,
-              raw_parse_result, parsed_content, summary,
-              skills_extracted, languages, certifications,
-              work_history, education_history, project_history,
-              awards, skills_detail, certifications_detail, languages_detail,
-              uploaded_by, parse_status,
-              uploaded_at, created_at, updated_at
-            ) VALUES (
-              $1, $2,
-              $3, $4,
-              $5, $6,
-              $7::jsonb, $8, $9,
-              $10::text[], $11::text[], $12::text[],
-              $13::jsonb, $14::jsonb, $15::jsonb,
-              $16::jsonb, $17::jsonb, $18::jsonb, $19::jsonb,
-              $20, 'completed',
-              NOW(), NOW(), NOW()
-            )`,
-          [
-            resume_id,
-            candidate_id,
-            nonEmpty(input.filename),
-            typeof input.size === 'number' ? input.size : null,
-            input.bucket,
-            input.object_key,
-            JSON.stringify(input.parsed?.data ?? null),
-            rawText,
-            summaryText,
-            skillsExtracted,
-            languagesList,
-            certificationsList,
-            JSON.stringify(workHistory),
-            JSON.stringify(educationHistory),
-            JSON.stringify(projectHistory),
-            JSON.stringify(awardsJson),
-            JSON.stringify(skillsDetailJson),
-            JSON.stringify(certificationsDetailJson),
-            JSON.stringify(languagesDetailJson),
-            uploadedBy,
-          ],
+      if (refreshed.rows.length !== 1) {
+        throw new Error(
+          `[partner-pg/candidates] idempotency resume ${resume_id} no longer matches candidate/transport anchors`,
         );
       }
     } else {
@@ -656,11 +867,14 @@ export async function saveCandidateToPartnerPg(
       );
     }
 
-    // Update candidate.latest_resume_id to point at this resume
-    await c.query(
-      `UPDATE candidate SET latest_resume_id = $2, updated_at = NOW() WHERE candidate_id = $1`,
-      [candidate_id, resume_id],
-    );
+    // A replay may refresh only its proven Resume/runtime rows; it must not write
+    // any Candidate column (including relationship pointers).
+    if (!idempotentReplay) {
+      await c.query(
+        `UPDATE candidate SET latest_resume_id = $2, updated_at = NOW() WHERE candidate_id = $1`,
+        [candidate_id, resume_id],
+      );
+    }
 
     // ── Step 4: look up existing application (RAAS owns creation) ──
     // 2026-05-21: AO no longer creates Application rows — RAAS does that on
@@ -715,6 +929,11 @@ export async function saveCandidateToPartnerPg(
       application_id,
       candidate_created,
       resume_created,
+      mobile_normalized: savedMobileResolution.mobile,
+      mobile_review_status: savedMobileResolution.status,
+      idempotent_replay: idempotentReplay,
+      candidate_snapshot: candidateSnapshot,
+      candidate_lock_snapshot: candidateLockSnapshot,
     };
   });
 }
@@ -722,7 +941,8 @@ export async function saveCandidateToPartnerPg(
 /**
  * Mark a resume_upload_runtime row as failed so partner / RAAS UI sees the
  * upload as terminal-error instead of stuck in 'pending'. Non-transactional,
- * called from the agent's catch path. No-op if the row doesn't exist.
+ * called from the agent's catch path. No-op if the row doesn't exist or a prior
+ * successful attempt already completed it with durable anchors.
  */
 export async function markResumeUploadFailed(
   uploadId: string,
@@ -735,7 +955,8 @@ export async function markResumeUploadFailed(
         status        = 'failed',
         error_message = $2,
         updated_at    = NOW()
-     WHERE upload_id = $1`,
+     WHERE upload_id = $1
+       AND status IS DISTINCT FROM 'completed'`,
     [uploadId, errorMessage.slice(0, 1000)],
   );
 }

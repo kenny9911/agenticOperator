@@ -1,7 +1,7 @@
 [
   {
-    "name": "JD_GENERATION_REQUESTED",
-    "description": "招聘需求澄清完成后,触发 Create JD Agent 自动生成职位描述。本事件是 JD 分支的起点,由需求侧(人工/外部系统)产出,不在本 6-agent 子图内由 Agent 生成。",
+    "name": "CLARIFICATION_READY",
+    "description": "招聘需求澄清完成后,触发 Create JD Agent 自动生成职位描述。本事件是 JD 分支的唯一起点,由需求澄清闸产出。",
     "payload": {
       "source_action": "",
       "event_data": [
@@ -13,7 +13,7 @@
   },
   {
     "name": "JD_REJECTED",
-    "description": "JD 初稿经人工评审被驳回,携带驳回原因,触发 Create JD Agent 重新生成。",
+    "description": "JD 初稿经人工评审被驳回,携带驳回原因;记录审核结果并停止自动生成,等待人工处理。",
     "payload": {
       "source_action": "",
       "event_data": [
@@ -43,7 +43,7 @@
   },
   {
     "name": "RESUME_DOWNLOADED",
-    "description": "渠道侧已收集并下载到候选人简历原件(PDF 等),触发 Candidate Dedup Agent 做候选人查重与归属锁定。本事件由人工收简/外部渠道产出,是简历分支的起点。",
+    "description": "渠道侧已收集并下载到候选人简历原件(PDF 等),触发 Candidate Dedup Agent 按规范中国大陆 11 位手机号做确定性查重,并独立查询 RMHR 归属锁结论。本事件由人工收简/外部渠道产出,是简历分支的起点。",
     "payload": {
       "source_action": "",
       "event_data": [
@@ -56,7 +56,7 @@
   },
   {
     "name": "CANDIDATE_DEDUP_PASSED",
-    "description": "Candidate Dedup Agent 完成三级去重(手机号 / 证件号 / employee_id)并成功锁定候选人归属(locked_by == 当前 employee_id 或无锁状态),允许进入简历解析。携带去重命中的 candidate_id 以便复用既有候选人记录。",
+    "description": "Candidate Dedup Agent 已完成手机号确定性去重且独立 RMHR 归属结论允许继续,进入简历解析。仅唯一规范中国大陆 11 位手机号精确命中时复用既有 candidate_id;未命中则新建,手机号缺失、无效、非中国大陆国际号码、多号码或占位号时新建待人工复核且不得自动合并。",
     "payload": {
       "source_action": "deduplicateCandidate",
       "event_data": [
@@ -76,7 +76,7 @@
   },
   {
     "name": "RESUME_LOCKED_CONFLICT",
-    "description": "Candidate Dedup Agent 发现候选人已被他人(locked_by != 当前 employee_id)锁定,仅执行 lock-only 不再推进解析与匹配,并通知招聘专员归属冲突。本事件为终态分支。",
+    "description": "RMHR 独立归属查询判定候选人存在归属冲突,Candidate Dedup Agent 不自行覆盖锁或推进解析与匹配,并通知招聘专员。本事件为终态分支;归属锁结论与手机号去重命中与否相互独立。",
     "payload": {
       "source_action": "deduplicateCandidate",
       "event_data": [

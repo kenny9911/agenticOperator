@@ -34,10 +34,15 @@ export function judgeDependency(failures: DepFailure[], t: MonitorThresholds): J
   if (reasons.includes('quota')) return { label: 'out_of_funds', level: 'critical' };
 
   const count = failures.length;
-  // 2. Only clean infra faults (5xx / timeout / unreachable) → 故障, once it's
-  //    more than a one-off blip.
+  // 2. Only clean infra faults (5xx / timeout / unreachable). A few in a row is
+  //    usually a transient blip → 故障预警 (warn). Only once they persist past
+  //    the confirm threshold (still no successful call in between — successes
+  //    clear the window, see recovery.ts) is it a confirmed 故障 (critical).
   if (reasons.every((r) => CLEAN_FAULT.has(r))) {
-    return count >= t.depFailMinCount ? { label: 'fault', level: 'critical' } : null;
+    if (count < t.depFailMinCount) return null;
+    return count >= t.depFaultConfirmCount
+      ? { label: 'fault', level: 'critical' }
+      : { label: 'fault_warning', level: 'warn' };
   }
 
   // 3. Anything ambiguous in the mix (auth / empty-200 / rate-limit) → 说不准.
@@ -81,8 +86,10 @@ function bodyFor(label: DepLabel, provider: DepFailure['provider'], failures: De
   switch (label) {
     case 'out_of_funds':
       return `${name} 额度不足 — 近 ${windowMin} 分钟 ${ops} 共 ${n} 次调用失败,判定为额度耗尽(没钱了)。影响:${dom}域。建议:充值后受影响任务将自动续跑。`;
+    case 'fault_warning':
+      return `${name} 故障预警 — 近 ${windowMin} 分钟 ${ops} 连续 ${n} 次服务端错误/超时,尚未确认为故障(可能是短暂抖动)。影响:${dom}域。建议:继续观察;若持续失败将升级为故障告警,调用恢复成功后自动解除。`;
     case 'fault':
-      return `${name} 疑似故障 — 近 ${windowMin} 分钟 ${ops} 共 ${n} 次服务端错误/超时,判定为厂商故障(通常自愈)。影响:${dom}域。建议:持续未恢复请联系厂商;任务排队重试中。`;
+      return `${name} 故障 — 近 ${windowMin} 分钟 ${ops} 共 ${n} 次服务端错误/超时,判定为厂商故障(通常自愈)。影响:${dom}域。建议:持续未恢复请联系厂商;任务排队重试中,调用恢复成功后自动解除。`;
     case 'unknown':
       return `${name} 持续异常 — 近 ${windowMin} 分钟 ${ops} 共 ${n} 次返回异常/空结果,无法区分欠费还是故障(说不准)。影响:${dom}域。建议:人工核查账户余额与服务状态。`;
   }
@@ -137,4 +144,35 @@ export async function dependencyMonitor(
   }
 
   return { prefix: PREFIX, findings, activeKeys };
+}
+
+/** Notification anchor stamped on 故障恢复 messages; the health card reads it. */
+export const DEP_RECOVERED_ANCHOR = 'dep_recovered';
+
+/**
+ * The 故障恢复 message posted when a firing `dep_down.<provider>.<domain>` alert
+ * is resolved (the sweeper saw a successful call / no more failures, or the
+ * operator reset it). Returns null for keys that are not dependency alerts.
+ * Info-level system message — it lands in 消息通知 next to the alert it closes.
+ */
+export function dependencyRecoveryFinding(dedupeKey: string, title?: string): CaptureInput | null {
+  if (!dedupeKey.startsWith(PREFIX)) return null;
+  const rest = dedupeKey.slice(PREFIX.length);
+  const dot = rest.indexOf('.');
+  if (dot < 0) return null;
+  const provider = rest.slice(0, dot) as DepFailure['provider'];
+  const domain = rest.slice(dot + 1);
+  const name = PROVIDER_LABEL[provider];
+  if (!name || !domain) return null;
+  const was = title ? `(原告警:${title})` : '';
+  return {
+    level: 'info',
+    // system_lifecycle = info "message" lane; source '系统' keeps it in the
+    // always-visible 系统 tab next to the alert it closes.
+    category: 'system_lifecycle',
+    source: '系统',
+    message: `✅ ${name} 故障恢复 — 调用已恢复正常,告警已自动解除${was}。影响:${friendlyDomainName(domain)}域。排队重试中的任务将继续执行。`,
+    domain,
+    anchors: { [DEP_RECOVERED_ANCHOR]: provider, dep_domain: domain },
+  };
 }

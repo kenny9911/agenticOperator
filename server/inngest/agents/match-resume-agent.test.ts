@@ -49,6 +49,7 @@ vi.mock('@/lib/dependency-health/report', async (importOriginal) => {
   return {
     ...actual,
     reportDependencyDegraded: vi.fn(async () => {}),
+    recordDependencyOk: vi.fn(async () => {}),
   };
 });
 
@@ -63,6 +64,7 @@ vi.mock('@/server/notifications/ingest', () => ({
 }));
 
 import {
+  appendExpectedCitiesToResume,
   buildResumeTextFromParsed,
   matchResumeAgentHandler,
   verifyRuleCheckPassedForMatch,
@@ -236,6 +238,34 @@ describe('matchResumeAgentHandler — pre-RoboHire rule-check gate', () => {
     expect(payload.jd).toContain('系统注入,非岗位 JD 原文');
     expect(payload.jd).toContain('10-25 学历底线:通过');
   });
+
+  it('propagates rmhr_deferred contract and job anchors to the terminal MATCH event', async () => {
+    const { calls } = await runHandler(
+      passedData({
+        employee_id: 'EMP-OPERATOR',
+        operator_id: 'EMP-OPERATOR',
+        contract_version: 2,
+        processing_mode: 'rmhr_deferred',
+        processing_reason: 'rmhr_email_not_found',
+        job_posting_id: 'JP1',
+      }),
+    );
+
+    const terminal = calls.events.find(({ payload }) =>
+      payload.name === 'MATCH_PASSED_NEED_INTERVIEW' || payload.name === 'MATCH_FAILED',
+    );
+    expect(terminal?.payload.data).toMatchObject({
+      job_requisition_id: 'JR1',
+      job_posting_id: 'JP1',
+      operator_id: 'EMP-OPERATOR',
+      contract_version: 2,
+      processing_mode: 'rmhr_deferred',
+      processing_reason: 'rmhr_email_not_found',
+    });
+    expect(
+      calls.events.some(({ payload }) => payload.name.startsWith('INTERVIEW_INVITATION_')),
+    ).toBe(false);
+  });
 });
 
 describe('matchResumeAgentHandler — 候选人期望接入 candidatePreferences', () => {
@@ -283,6 +313,86 @@ describe('matchResumeAgentHandler — 候选人期望接入 candidatePreferences
       { candidatePreferences?: string },
     ];
     expect(payload.candidatePreferences).toBeUndefined();
+  });
+});
+
+describe('matchResumeAgentHandler — 期望城市拼进 resume 参数(2026-08-20)', () => {
+  it('事件带 candidate_expectation.expected_cities 时,resume 末尾追加求职期望城市', async () => {
+    // 事件形状取自真实 MATCH_RULE_CHECK_PASSED payload
+    await runHandler(
+      passedData({
+        candidate_expectation: {
+          expected_cities: ['北京'],
+          expected_industries: [],
+          expected_roles: ['国内电商运营'],
+          expected_salary_monthly_max: 8000,
+          expected_salary_monthly_min: 7000,
+          expected_work_mode: null,
+        },
+      }),
+    );
+    const [payload] = mockMatchResumeDirect.mock.calls[0] as [
+      { resume: string; candidatePreferences?: string },
+    ];
+    expect(payload.resume).toContain('张三'); // 原简历正文仍在
+    expect(payload.resume).toContain('求职期望:');
+    expect(payload.resume).toContain('期望城市: 北京');
+    expect(payload.resume.indexOf('张三')).toBeLessThan(payload.resume.indexOf('期望城市'));
+    // candidatePreferences 旁路不受影响,继续照传
+    expect(payload.candidatePreferences).toContain('北京');
+  });
+
+  it('rawText 回退路径(结构化简历为空)同样拼接期望城市', async () => {
+    await runHandler(
+      passedData({
+        parsed_resume: {},
+        parsed_content: '李四 简历纯文本兜底\n期望城市：上海、杭州',
+      }),
+    );
+    const [payload] = mockMatchResumeDirect.mock.calls[0] as [{ resume: string }];
+    expect(payload.resume).toContain('李四 简历纯文本兜底');
+    expect(payload.resume).toContain('期望城市: 上海、杭州');
+  });
+
+  it('无期望城市时 resume 与旧行为逐字一致(零回归)', async () => {
+    await runHandler(
+      passedData({
+        candidate_expectation: {
+          expected_cities: [],
+          expected_industries: [],
+          expected_roles: ['架构师'],
+          expected_salary_monthly_max: 40000,
+          expected_salary_monthly_min: 30000,
+          expected_work_mode: null,
+        },
+      }),
+    );
+    const [payload] = mockMatchResumeDirect.mock.calls[0] as [{ resume: string }];
+    expect(payload.resume).toBe(buildResumeTextFromParsed(passedData().parsed_resume as never));
+    expect(payload.resume).not.toContain('求职期望');
+  });
+});
+
+describe('appendExpectedCitiesToResume — 纯函数行为', () => {
+  it('多城市用「、」连接并追加在简历末尾', () => {
+    expect(appendExpectedCitiesToResume('简历正文', { expected_cities: ['北京', '上海'] })).toBe(
+      '简历正文\n\n求职期望:\n期望城市: 北京、上海',
+    );
+  });
+
+  it('城市数组含空串/非字符串时过滤后再拼', () => {
+    expect(
+      appendExpectedCitiesToResume('简历正文', {
+        expected_cities: ['  ', '深圳', 42 as never, ''],
+      }),
+    ).toBe('简历正文\n\n求职期望:\n期望城市: 深圳');
+  });
+
+  it('无城市 / 期望缺失 / 简历为空时原样返回', () => {
+    expect(appendExpectedCitiesToResume('简历正文', { expected_cities: [] })).toBe('简历正文');
+    expect(appendExpectedCitiesToResume('简历正文', {})).toBe('简历正文');
+    expect(appendExpectedCitiesToResume('简历正文', null)).toBe('简历正文');
+    expect(appendExpectedCitiesToResume('', { expected_cities: ['北京'] })).toBe('');
   });
 });
 

@@ -808,6 +808,9 @@ CREATE TABLE "job_requisition" (
     "education_requirement" TEXT,
     "city" TEXT,
     "city_id" UUID,
+    -- RAAS 2026-06-19 办公城市多选（有序城市 UUID 数组，权威多值；city/city_id 存首项）。
+    -- 本镜像生成于该列之前，补齐后 getRequirementDetail 的 city_names 子查询才能在本地跑通。
+    "city_ids" JSONB,
     "work_address" JSONB,
     "salary_range" TEXT,
     "must_have_skills" JSONB,

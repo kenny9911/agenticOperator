@@ -232,7 +232,21 @@ function DeterministicRules({
   );
 }
 
-/** 查重专用:三级判定阶梯(命中即停)+ 结论 + 关联候选人。 */
+type IdentityConclusionKey =
+  | "rc_id_concl_phone_match"
+  | "rc_id_concl_review"
+  | "rc_id_concl_no_match"
+  | "rc_id_concl_unknown";
+
+/** Candidate Identity 只产出审计/复核结论，不代表系统已经关联或合并候选人。 */
+export function identityConclusionKey(dedupAction: unknown): IdentityConclusionKey {
+  if (dedupAction === "phone-match") return "rc_id_concl_phone_match";
+  if (dedupAction === "pending-review") return "rc_id_concl_review";
+  if (dedupAction === "no-match") return "rc_id_concl_no_match";
+  return "rc_id_concl_unknown";
+}
+
+/** 身份审计专用:三级判定阶梯(命中即停)+ 审计结论 + 参考候选人。 */
 function IdentityLadder({ sel }: { sel: Record<string, unknown> }) {
   const { t } = useApp();
   const TIERS = [t("rc_id_tier1"), t("rc_id_tier2"), t("rc_id_tier3")];
@@ -241,16 +255,14 @@ function IdentityLadder({ sel }: { sel: Record<string, unknown> }) {
   const dedup = typeof sel.dedupAction === "string" ? sel.dedupAction : "";
   const name = typeof sel.matchedCandidateName === "string" ? sel.matchedCandidateName : null;
   const cid = typeof sel.matchedCandidateId === "string" ? sel.matchedCandidateId : null;
-  const conclusion =
-    dedup === "auto-merged"
-      ? t("rc_id_concl_merged")
-      : dedup === "pending-review"
-        ? t("rc_id_concl_review")
-        : t("rc_id_concl_new");
+  const conclusion = t(identityConclusionKey(dedup));
   return (
     <div style={{ padding: 12, borderBottom: "1px solid var(--c-line)" }}>
       <div className="text-ink-1" style={{ fontSize: 13, fontWeight: 600 }}>
         {t("rc_id_conclusion")}：{conclusion}
+      </div>
+      <div className="text-ink-3" style={{ fontSize: 11.5, lineHeight: 1.55, marginTop: 4 }}>
+        {t("rc_id_audit_only_hint")}
       </div>
       {name && cid ? (
         <div className="text-ink-2" style={{ fontSize: 12, marginTop: 4 }}>

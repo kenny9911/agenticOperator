@@ -60,15 +60,27 @@ describe('classifyRobohire — empty-200 predicates', () => {
     ).toMatchObject({ ok: false, reason: 'empty' });
   });
   it('generateJd: no title/description → empty; description present → ok', () => {
-    expect(classifyRobohire('generateJd', { data: {} })).toMatchObject({ ok: false, reason: 'empty' });
-    expect(classifyRobohire('generateJd', { data: { description: 'We are hiring…' } })).toEqual({ ok: true });
+    const stages = { parse: 'success', generate: 'success' };
+    expect(classifyRobohire('generateJd', { data: {}, meta: { stages } }))
+      .toMatchObject({ ok: false, reason: 'empty' });
+    expect(classifyRobohire('generateJd', {
+      data: { description: 'We are hiring…' },
+      meta: { stages },
+    })).toEqual({ ok: true });
   });
   it('generateJd: 仅 benefits / interviewRequirements 有内容 → ok(判空口径必须与 assembleJdContent 一致)', () => {
     // Regression: assembleJdContent 消费 benefits + interviewRequirements,但旧
     // 判空白名单只认 5 个字段,导致这类"薄但可用"的 JD 被误判空 → false FAILED。
-    expect(classifyRobohire('generateJd', { data: { benefits: '五险一金 + 年度期权' } })).toEqual({ ok: true });
+    const meta = { stages: { parse: 'success', generate: 'success' } };
+    expect(classifyRobohire('generateJd', {
+      data: { benefits: '五险一金 + 年度期权' },
+      meta,
+    })).toEqual({ ok: true });
     expect(
-      classifyRobohire('generateJd', { data: { interviewRequirements: '两轮技术面 + 一轮 HR 面' } }),
+      classifyRobohire('generateJd', {
+        data: { interviewRequirements: '两轮技术面 + 一轮 HR 面' },
+        meta,
+      }),
     ).toEqual({ ok: true });
   });
   it('generateJd: placeholder title "Untitled" with empty content → empty (title is "Untitled" on success too, so it is never a content signal)', () => {
@@ -85,6 +97,7 @@ describe('classifyRobohire — empty-200 predicates', () => {
           niceToHave: '',
           evaluationRules: '',
         },
+        meta: { stages: { parse: 'success', generate: 'success' } },
       }),
     ).toMatchObject({ ok: false, reason: 'empty' });
   });
@@ -111,26 +124,25 @@ describe('classifyRobohire — empty-200 predicates', () => {
       }),
     ).toEqual({ ok: true });
   });
-  it('generateJd: parse="failed" but generate="success" with real content → ok (stages are NON-FATAL; content decides — Gohire contract)', () => {
-    // THE bug being fixed: a parse-stage failure still yields a usable JD — generate
-    // ran off the raw prompt and produced real body content. The old classifier gated
-    // on stage STATUS and folded this to `server` → create-jd discarded a good JD and
-    // failed the run. Per the Gohire contract ("each stage is non-fatal; check
-    // meta.stages to see which succeeded"), CONTENT decides usability, not stage status.
+  it('generateJd: parse="failed" + generate="success" is rejected even with real content', () => {
     expect(
       classifyRobohire('generateJd', {
         data: { description: '岗位职责:负责……', qualifications: '任职要求:本科……' },
         meta: { stages: { parse: 'failed', generate: 'success' } },
       }),
-    ).toEqual({ ok: true });
-  });
-  it('generateJd: parse="failed" + empty content → server (recoverable; a retry may recover the degraded stage)', () => {
-    expect(
-      classifyRobohire('generateJd', {
-        data: {},
-        meta: { stages: { parse: 'failed', generate: 'skipped' } },
-      }),
     ).toMatchObject({ ok: false, reason: 'server' });
+  });
+  it.each([
+    ['generate failed', { parse: 'success', generate: 'failed' }],
+    ['skipped/unknown', { parse: 'skipped', generate: 'unknown' }],
+    ['wrong casing', { parse: 'Success', generate: 'success' }],
+    ['missing generate', { parse: 'success' }],
+    ['missing stages', undefined],
+  ])('generateJd: %s fails closed before content usability', (_label, stages) => {
+    expect(classifyRobohire('generateJd', {
+      data: { description: '看似可用的正文' },
+      ...(stages === undefined ? {} : { meta: { stages } }),
+    })).toMatchObject({ ok: false, reason: 'server' });
   });
   it('inviteCandidate: no entry fields → empty; login_url/reused present → ok', () => {
     expect(classifyRobohire('inviteCandidate', { data: {} })).toMatchObject({ ok: false, reason: 'empty' });

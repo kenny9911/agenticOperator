@@ -2,8 +2,8 @@
   {
     "id": "DD-1",
     "name": "deduplicateCandidate",
-    "description": "候选人查重 Agent。简历下载后第一道闸:对候选人做三级去重(Tier1 仅手机号 / Tier2 证件号 / Tier3 姓名+生日等弱标识),命中则复用既有 Candidate 记录,并按归属规则锁定候选人。归属规则:employee_id 无条件覆盖既有锁;若 locked_by 与当前 employee_id 不一致则仅 lock-only,不向下游发 CANDIDATE_DEDUP_PASSED,改发 RESUME_LOCKED_CONFLICT 并通知招聘专员。",
-    "submission_criteria": "1. RESUME_DOWNLOADED 事件已送达\n2. 简历原件可读取(file_path 有效)\n3. 携带发起人 employee_id 用于归属判定",
+    "description": "候选人查重 Agent。简历下载后第一道闸:仅当联系方式经归一化后唯一得到规范中国大陆 11 位手机号时,才按该手机号做确定性去重;精确命中才复用既有 Candidate,未命中则新建。手机号缺失、无效、非中国大陆国际号码、包含多个号码或属于占位号时一律新建待人工复核,不得用证件号、姓名、生日、邮箱、性别、学校、专业、学历或毕业时间自动复用/合并。候选人归属锁不由去重推断或覆盖,只消费独立的 RMHR 归属结论。",
+    "submission_criteria": "1. RESUME_DOWNLOADED 事件已送达\n2. 简历原件可读取(file_path 有效)\n3. 携带发起人 employee_id 供 RMHR 独立归属查询使用,不参与候选人去重",
     "object_type": "action",
     "category": "候选人查重",
     "actor": ["Agent"],
@@ -12,50 +12,50 @@
     "inputs": [
       { "name": "resume_file_path", "type": "String", "description": "候选人简历原件路径,用于抽取去重标识。", "source_object": "Resume.file_path", "required": true },
       { "name": "job_requisition_id", "type": "String", "description": "目标岗位编号,用于建立 Application 归属。", "source_object": "Job_Requisition.job_requisition_id", "required": true },
-      { "name": "employee_id", "type": "String", "description": "发起本次收简的招聘专员编号,用于候选人锁定归属判定。", "source_object": "Employee.employee_id", "required": true }
+      { "name": "employee_id", "type": "String", "description": "发起本次收简的招聘专员编号,仅作为 RMHR 独立归属查询上下文,不作为去重键。", "source_object": "Employee.employee_id", "required": true }
     ],
     "outputs": [
-      { "name": "candidate_id", "type": "String", "description": "去重后唯一的候选人编号(命中则复用,未命中则新建)。" },
-      { "name": "dedup_result", "type": "String", "description": "去重与锁定结论,可选值为'通过'或'归属冲突'。" }
+      { "name": "candidate_id", "type": "String", "description": "候选人编号:规范大陆手机号精确命中时复用,未命中或需复核时新建。" },
+      { "name": "dedup_result", "type": "String", "description": "去重与独立 RMHR 归属结论,包括手机号命中、新建、新建待复核或归属冲突。" }
     ],
     "action_steps": [
       {
         "order": "1",
         "name": "extractIdentityKeys",
-        "description": "从简历原件抽取去重标识:手机号(归一化)、证件号、姓名+出生日期。RoboHire 解析不一定返回所有字段,缺失项从 rawText 兜底抽取。",
+        "description": "从简历联系方式提取全部手机号候选并归一化,判定是否唯一得到规范中国大陆 11 位手机号,同时识别缺失、无效、非中国大陆国际号码、多号码和占位号。其他身份或履历字段不得作为去重键。",
         "object_type": "logic",
         "condition": "已收到 RESUME_DOWNLOADED 事件",
         "rules": [],
         "inputs": [ { "name": "resume_file_path", "type": "String", "description": "简历原件路径。", "source_object": "Resume.file_path" } ],
-        "outputs": [ { "name": "identity_keys", "type": "Object", "description": "归一化后的去重标识集合。" } ]
+        "outputs": [ { "name": "identity_keys", "type": "Object", "description": "手机号归一化与可确定性匹配状态;仅唯一规范大陆 11 位手机号可用于自动去重。" } ]
       },
       {
         "order": "2",
         "name": "tierMatch",
-        "description": "三级去重匹配:Tier1 仅以手机号匹配既有 Candidate;未命中则 Tier2 以证件号匹配;再未命中则 Tier3 以姓名+生日等弱标识匹配。命中则复用 candidate_id,未命中则新建。",
+        "description": "确定性手机号去重:仅当唯一规范中国大陆 11 位手机号与既有 Candidate 的规范手机号精确相同时复用 candidate_id;合法手机号未命中则新建。手机号缺失、无效、非中国大陆国际号码、多号码或占位号时直接新建并标记待人工复核,禁止使用任何其他字段兜底自动复用或合并。",
         "object_type": "logic",
-        "condition": "已抽取去重标识",
+        "condition": "已完成手机号归一化与可确定性匹配判断",
         "rules": [],
-        "inputs": [ { "name": "identity_keys", "type": "Object", "description": "去重标识集合。", "source_object": null } ],
-        "outputs": [ { "name": "candidate_id", "type": "String", "description": "命中或新建的候选人编号。" } ]
+        "inputs": [ { "name": "identity_keys", "type": "Object", "description": "手机号归一化与匹配资格状态。", "source_object": null } ],
+        "outputs": [ { "name": "candidate_id", "type": "String", "description": "规范手机号精确命中时复用,其余情况新建的候选人编号。" } ]
       },
       {
         "order": "3",
         "name": "resolveOwnershipLock",
-        "description": "归属与锁定:若候选人无锁或 locked_by 为空,则以当前 employee_id 锁定并发 CANDIDATE_DEDUP_PASSED;若 locked_by == 当前 employee_id,正常续行;若 locked_by != 当前 employee_id,仅 lock-only(写锁信息但不覆盖归属),发 RESUME_LOCKED_CONFLICT 并通知招聘专员。employee_id 显式提供时无条件覆盖既有锁。",
+        "description": "独立消费 RMHR 返回的候选人归属/锁定结论,不得根据手机号去重结果、employee_id 或本地 locked_by 自行推断或覆盖归属。RMHR 允许继续时发 CANDIDATE_DEDUP_PASSED;RMHR 判定归属冲突时发 RESUME_LOCKED_CONFLICT 并通知招聘专员。",
         "object_type": "logic",
-        "condition": "已确定 candidate_id",
+        "condition": "已确定 candidate_id,并取得 RMHR 独立归属结论",
         "rules": [],
         "inputs": [
           { "name": "candidate_id", "type": "String", "description": "候选人编号。", "source_object": "Candidate.candidate_id" },
           { "name": "employee_id", "type": "String", "description": "发起人编号。", "source_object": "Employee.employee_id" }
         ],
-        "outputs": [ { "name": "dedup_result", "type": "String", "description": "通过或归属冲突。" } ]
+        "outputs": [ { "name": "dedup_result", "type": "String", "description": "手机号去重状态与 RMHR 允许继续或归属冲突结论。" } ]
       }
     ],
     "side_effects": {
       "data_changes": [
-        { "object_type": "Candidate", "action": "CREATE_OR_MODIFY", "property_impacted": ["candidate_id", "is_locked", "locked_by", "lock_start_time"], "description": "新建或更新候选人并写入锁定归属信息。" }
+        { "object_type": "Candidate", "action": "CREATE_OR_MODIFY", "property_impacted": ["candidate_id", "is_locked", "locked_by", "lock_start_time"], "description": "按规范大陆手机号确定性命中或新建候选人;锁定字段仅写入 RMHR 独立返回的归属事实。" }
       ],
       "notifications": [
         { "recipient": "招聘专员", "channel": "InApp", "condition": "归属冲突", "message": "{{candidate.name}} 已被 {{locked_by}} 锁定,本次仅登记不进入解析。", "triggered_event": "RESUME_LOCKED_CONFLICT" }
@@ -339,12 +339,12 @@
   {
     "id": "4",
     "name": "createJD",
-    "description": "Create JD Agent。依据招聘需求生成职位描述(JD)。调用 RoboHire generateJdDirect 产出硬性要求 hardRequirements 与加分项 niceToHave 的散文;因 generate-jd 不返回结构化技能数组,再经 proseToSkillArray 将散文拆为 must_have_skills / nice_to_have_skills 数组(jsonb 写入)。建立/映射岗位需求后发 JD_GENERATED。被人工评审驳回(JD_REJECTED)的需求也回到本节点重生成。retries=1。",
-    "submission_criteria": "1. JD_GENERATION_REQUESTED 或 JD_REJECTED 事件已送达\n2. 招聘需求(Job_Requisition)记录存在\n3. 客户信息可用",
+    "description": "Create JD Agent。依据已澄清的招聘需求生成职位描述(JD)。调用 RoboHire generateJdDirect 产出硬性要求 hardRequirements 与加分项 niceToHave 的散文;因 generate-jd 不返回结构化技能数组,再经 proseToSkillArray 将散文拆为 must_have_skills / nice_to_have_skills 数组(jsonb 写入)。建立/映射岗位需求后发 JD_GENERATED。JD_REJECTED 只记录审核驳回结果,不自动重生成。retries=1。",
+    "submission_criteria": "1. CLARIFICATION_READY 事件已送达\n2. 招聘需求(Job_Requisition)记录存在\n3. 客户信息可用",
     "object_type": "action",
     "category": "JD创建与更新",
     "actor": ["Agent"],
-    "trigger": ["JD_GENERATION_REQUESTED", "JD_REJECTED"],
+    "trigger": ["CLARIFICATION_READY"],
     "target_objects": ["Job_Posting", "Job_Requisition", "Job_Requisition_Specification", "Client", "Sourcing_Channel"],
     "inputs": [
       { "name": "job_requisition_id", "type": "String", "description": "招聘需求编号。", "source_object": "Job_Requisition.job_requisition_id", "required": true },

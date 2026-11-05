@@ -333,12 +333,18 @@ export const RECRUITMENT_TOOLS: ToolDescriptor[] = [
   },
   {
     name: "candidateLock.runLockCheck",
-    title: "候选人锁定/去重",
-    description: "对候选人做三级去重 + 归属锁定判定。LOCK_CHECK_ENFORCE=1 时对不可恢复故障会抛错(Inngest 挂起)。",
+    title: "候选人归属锁定检查",
+    description: "调用 RMHR 获取候选人当前锁定与归属结论。该工具不判定候选人身份、不返回候选人合并目标；候选人身份仅由规范化后的中国大陆手机号决定。LOCK_CHECK_ENFORCE=1 时故障会抛错并挂起 Inngest 运行。",
     domain: RECRUIT,
     sideEffect: "write",
     parameters: obj({ candidate: { type: "object" }, employee_id: str("发起人 id") }, ["candidate"]),
-    returns: obj({ decision: str("锁定决策"), same_as_candidate_id: str("命中的既有候选人") }),
+    returns: obj({
+      decision: str("锁定决策: proceed 或 lock-only"),
+      reason: str("锁定决策原因"),
+      lockOwnerEmployeeId: str("RMHR 返回的锁持有人工号"),
+      lockByEmail: str("RMHR 返回的锁持有人邮箱"),
+      rmhrResumeId: str("RMHR 简历编号"),
+    }),
     execute: async (args, ctx) => {
       if (ctx?.dryRun) return { __mock: true, tool: "candidateLock.runLockCheck", decision: "proceed" };
       const mod: any = await import("@/lib/candidate-lock");

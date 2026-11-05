@@ -6,7 +6,11 @@
 // with nothing usable is `empty` (the silent-degrade case). The 没钱/故障/说不准
 // *judgment* is NOT here — that's windowed and lives in lib/monitor/dependency.ts.
 
-import { RobohireApiError } from '../robohire-client';
+import {
+  generateJdStagesSucceeded,
+  RobohireApiError,
+  type RobohireGenerateJdStages,
+} from '../robohire-client';
 import type { DepOutcome, DepReason } from './types';
 
 function fail(provider: 'robohire' | 'llm', op: string, reason: DepReason, detail: string): DepOutcome {
@@ -98,35 +102,26 @@ export function classifyRobohire(op: string, errOrResponse: unknown): DepOutcome
     return fail('robohire', op, 'network', errOrResponse.message);
   }
   const resp = errOrResponse as
-    | { data?: Record<string, unknown>; meta?: { stages?: { parse?: string; generate?: string } } }
+    | { data?: Record<string, unknown>; meta?: { stages?: RobohireGenerateJdStages } }
     | null
     | undefined;
   const data = resp?.data;
   const stages = resp?.meta?.stages;
-  const stageFailed = !!stages && (stages.parse === 'failed' || stages.generate === 'failed');
 
-  // Gohire generate-jd contract: the two internal stages (parse, generate) are
-  // NON-FATAL. A degraded stage still returns a usable response — parse-fail →
-  // generate ran off the raw prompt (real body, raw-prompt title); generate-fail →
-  // parse's structured fields are still returned. So usability is decided by
-  // CONTENT, not by stage status: a degraded stage that still carried real content
-  // is a usable (if imperfect) result we must KEEP, not discard as a fault. (Docs:
-  // "check meta.stages to see which succeeded" — read it, don't gate the call on it.)
-  if (!isEmptyRobohirePayload(op, data)) {
-    return { ok: true };
-  }
-  // Content is empty → not usable. When a stage failed, the vendor pipeline
-  // degraded and a retry may recover it (parse success means the input was
-  // readable, so a generate failure is a transient vendor-side fault) → `server`
-  // (recoverable: park + retry). Otherwise it's a plain empty 200 → `empty`
-  // (non-retriable; retrying yields the same nothing).
-  if (stageFailed) {
+  // Defense in depth for callers/tests that hand a parsed response directly to the
+  // classifier instead of going through generateJdDirect. A partial/degraded JD is
+  // never usable, even when it contains plausible body text.
+  if (op === 'generateJd' && !generateJdStagesSucceeded(stages)) {
     return fail(
       'robohire',
       op,
       'server',
-      `${op} stage failed + empty content: parse=${stages?.parse ?? '—'} generate=${stages?.generate ?? '—'}`,
+      `${op} stage gate failed: parse=${stages?.parse ?? 'missing'} generate=${stages?.generate ?? 'missing'}; both must equal success`,
     );
+  }
+
+  if (!isEmptyRobohirePayload(op, data)) {
+    return { ok: true };
   }
   return fail('robohire', op, 'empty', `${op} 返回 200 但内容为空`);
 }

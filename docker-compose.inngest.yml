@@ -36,7 +36,7 @@ services:
       # 启动时主动 sync 本仓的 Next.js SDK:
       #   AO main (端口 3002) 现在包含全部 agent runtime:
       #     - resumeParserAgent  (RESUME_DOWNLOADED → RESUME_PROCESSED)
-      #     - createJdAgent      (REQUIREMENT_LOGGED → JD_GENERATED)
+      #     - createJdAgent      (CLARIFICATION_READY → JD_GENERATED)
       #     - matchResumeAgent   (RESUME_PROCESSED → MATCH_*)
       # (p4 合并前 resume-parser-agent 在端口 3020 独立跑,合并后已删除)
       # partner / 其他 SDK 不自动 sync — 用各自的 Inngest client 启动时

@@ -2,19 +2,19 @@
 //
 // Direct SQL replacement for RAAS API POST /api/v1/jd/sync-generated.
 // Mirrors raas_v4/.../jd-sync.service.ts:syncJdGenerated steps 1-3.
-// Steps 4-5 (HSM notification + jd_review HitlTask) EXPLICITLY SKIPPED —
-// per 2026-05-20 architecture decision, partner subscribes to AO's
-// JD_GENERATED event to perform those side effects.
+// HSM notification + jd_review HitlTask are created by RAAS after it consumes
+// the JD_GENERATED event persisted below.
 //
-// Three writes per call, all in one transaction:
+// Writes per call, all in one transaction:
 //   1. UPDATE job_requisition       — patch 17 matching/enrichment fields (non-null only)
 //   2. UPSERT job_posting           — by job_requisition_id, publish_status='pending'
-//   3. UPDATE spec.status           — draft → pending_publish (compare-and-set)
+//   3. INSERT event_outbox          — durable JD_GENERATED delivery
 //
 // Partner source of truth (DO NOT EDIT):
 //   raas_v4/backend/apps/api/src/modules/jd/jd-sync.service.ts:21-242
 
 import { randomUUID } from 'node:crypto';
+import type { PoolClient } from 'pg';
 import { withTx } from './client';
 
 // ──────────────────────────────────────────────────────────────────────
@@ -75,6 +75,13 @@ function mapEnum(
 // 见 2026-06-03 JD 生成失败事故。
 export const SALARY_SANE_MAX = 100_000_000;
 
+// 月薪 sane 下限 — 1000 元/月。低于中国任何地区的最低工资标准,故 <1000 的值
+// 一律不是「已归一到元的月薪」,而是单位没乘开 (6 = 6 千) 或从噪声里抠出来的
+// 数字 (「社保*70%+公积金据实」→ 70)。写进去会污染一切按该列做的排序 / 统计,
+// 宁可留 NULL。见 2026-08-25 单位脏数据排查
+// (raas backend/scripts/audit-job-posting-salary-units.ts)。
+export const SALARY_SANE_MIN = 1_000;
+
 /** 解析单个薪资 token → 绝对金额。支持 8.2k / 8.5K / 1.5万 / 2w / 8000 / 12,000。 */
 export function parseSalaryToken(token: string | null | undefined): number | null {
   if (token == null) return null;
@@ -93,6 +100,40 @@ export function parseSalaryToken(token: string | null | undefined): number | nul
   return Math.round(n * mult);
 }
 
+const SALARY_SEP_SRC = String.raw`[-–—~～/／]|到|至`;
+const SALARY_NUM_SRC = String.raw`\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?`;
+const SALARY_UNIT_SRC = String.raw`[kK千万wW]`;
+/** 剥壳后必须**整串**命中,否则视为「不是薪资表达」。锚定 ^…$ 是这条闸的全部意义。 */
+const SALARY_SHAPE_RE = new RegExp(
+  `^(${SALARY_NUM_SRC})\\s*(${SALARY_UNIT_SRC})?` +
+    `\\s*(?:(?:${SALARY_SEP_SRC})\\s*(${SALARY_NUM_SRC})\\s*(${SALARY_UNIT_SRC})?)?$`,
+);
+const SALARY_UNIT_MULT: Record<string, number> = {
+  k: 1_000,
+  K: 1_000,
+  千: 1_000,
+  万: 10_000,
+  w: 10_000,
+  W: 10_000,
+};
+
+/**
+ * 剥壳 —— 去掉标签前缀 / 括号补充 / 计薪周期与「N 薪」后缀,只留纯区间表达。
+ *
+ * 「薪资范围: 7-11」这种带标签的文本是 Gohire 把 create-jd prompt 里
+ * `push('薪资范围', r.salary_range)` 那一行原样回显回来的,partner 库里确有 131 行。
+ */
+export function stripSalaryShell(raw: string): string {
+  let s = String(raw).normalize('NFKC').trim();
+  s = s.replace(/[（(][^）)]*[）)]?/g, ''); // "(3~8年)" / 未闭合的备注
+  s = s.replace(/^\s*(薪资范围|薪资|月薪|工资|薪酬|报价)\s*[:：]?\s*/, '');
+  s = s.replace(/\s*[*×xX]\s*\d+(?:\.\d+)?\s*薪\s*$/, ''); // "30-50k * 14薪"
+  s = s.replace(/\s*(以内|以下|左右|封顶|以上|起)\s*$/, '');
+  s = s.replace(/\s*(元|块|人民币)?\s*\/?\s*(月|每月)\s*$/, '');
+  s = s.replace(/\s*元\s*$/, '');
+  return s.trim();
+}
+
 /**
  * 解析薪资区间文本 → { min, max }。
  * 支持分隔符 - – — ~ ～ / ／ 到 至,以及 k/千/万/w 后缀与小数 (8.2k → 8200)。
@@ -100,27 +141,69 @@ export function parseSalaryToken(token: string | null | undefined): number | nul
  *
  * ⚠️ 旧实现用 `replace(/[kK]/g,'000')` 字面替换 + 删小数点,会把 "8.2k/8.5k"
  * 算成 8200085000 (应为 8200/8500),溢出 partner int4 列。务必走单 token 解析。
+ *
+ * ⚠️ 2026-08-25 —— 三条改动,依据是 raas
+ * `backend/scripts/audit-job-posting-salary-units.ts` 对 1782 行真实数据的分类盘点:
+ *
+ *  ① **共享单位继承**。中文薪资区间惯例只在右端写单位 ——「6-10K」。逐 token
+ *     独立判断得到 (6, 10000):同一行两个单位。实测 458 行栽在这一条,占全部
+ *     脏行一半以上。改为:区间里只要有一端带单位,另一端的裸数就继承它。
+ *     magnitude guard —— 裸数 ≥ 1000 时**不继承**(它本来就是绝对金额),
+ *     否则 "8000-12k" 会被算成 8,000,000-12,000(库里确有该行)。
+ *
+ *  ② **形态闸**。剥壳后不能整串命中「数字[单位][分隔符 数字[单位]]」的一律返回
+ *     { null, null },不再从散文里抠第一个数字 ——
+ *     「社保*70%+公积金据实：12k+200全勤」此前解析出 70,「中3: 8400」解析出 3。
+ *
+ *  ③ **裸区间不推断单位**。「7-12」两端都没单位,读成 7-12 千几乎必然正确,但库里
+ *     同时存在「单价上限660」这类按**日单价**录入的行 —— 把日单价 ×1000 就是
+ *     66 万/月的灾难性错值。所以这里只负责不写错:原样返回 (7, 12),由 saneSalary
+ *     按 SALARY_SANE_MIN 丢弃为 null。存量那 350 行的千元推断走 raas 审计脚本的
+ *     `--apply-inferred-thousands`,需人工签字,不在写入侧默默做。
  */
 export function parseSalaryRange(
   s: string | null | undefined,
 ): { min: number | null; max: number | null } {
   if (s == null) return { min: null, max: null };
-  const tokens = String(s)
-    .split(/[-–—~～\/／]|到|至/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-  const nums = tokens
-    .map(parseSalaryToken)
-    .filter((n): n is number => n != null);
-  if (nums.length >= 2) return { min: nums[0], max: nums[1] };
-  if (nums.length === 1) return { min: nums[0], max: null };
-  return { min: null, max: null };
+  const m = stripSalaryShell(String(s)).match(SALARY_SHAPE_RE);
+  if (!m) return { min: null, max: null };
+
+  const toNum = (x: string) => parseFloat(x.replace(/,/g, ''));
+  const unitMult = (u: string | undefined) =>
+    u ? SALARY_UNIT_MULT[u] ?? null : null;
+
+  const n1 = toNum(m[1]);
+  const n2 = m[3] != null ? toNum(m[3]) : null;
+  if (!Number.isFinite(n1) || (n2 != null && !Number.isFinite(n2))) {
+    return { min: null, max: null };
+  }
+
+  let mult1 = unitMult(m[2]);
+  let mult2 = n2 != null ? unitMult(m[4]) : null;
+  if (mult1 != null || mult2 != null) {
+    const declared = mult2 ?? mult1 ?? 1;
+    if (mult1 == null) mult1 = n1 < 1_000 ? declared : 1;
+    if (n2 != null && mult2 == null) mult2 = n2 < 1_000 ? mult1 : 1;
+  } else {
+    mult1 = 1;
+    if (n2 != null) mult2 = 1;
+  }
+
+  return {
+    min: Math.round(n1 * (mult1 as number)),
+    max: n2 != null ? Math.round(n2 * (mult2 as number)) : null,
+  };
 }
 
-/** 范围校验:非有限 / 负数 / 超 sane 上限 → null,否则原值。 */
+/**
+ * 范围校验:非有限 / 越出 [SALARY_SANE_MIN, SALARY_SANE_MAX] → null,否则原值。
+ *
+ * 下限守的是「单位没归一」与「从噪声里抠出的数字」两类脏值,并且它同时兜住了
+ * 结构化兜底那一路 —— Gohire 的 salaryMin/Max 也会给千元面值。
+ */
 export function saneSalary(n: number | null): number | null {
   if (n == null || !Number.isFinite(n)) return null;
-  if (n < 0 || n > SALARY_SANE_MAX) return null;
+  if (n < SALARY_SANE_MIN || n > SALARY_SANE_MAX) return null;
   return n;
 }
 
@@ -149,6 +232,14 @@ function pickField<T = unknown>(
 // Public input — mirrors SyncJdInput from lib/raas-api-client.ts so
 // createJdAgent's existing payload composition keeps working unchanged.
 // ──────────────────────────────────────────────────────────────────────
+
+type JdGeneratedOutboxTrace = {
+  trace_id?: string | null;
+  request_id?: string | null;
+  workflow_id?: string | null;
+  parent_trace_id?: string | null;
+  [key: string]: unknown;
+};
 
 export type SyncJdInput = {
   job_requisition_id: string;
@@ -188,6 +279,31 @@ export type SyncJdInput = {
   salary_range?: string;
   search_keywords?: string[];
   jd_content?: { title?: string; salaryBenefits?: string };
+  /**
+   * RAAS ADR-0154 — 显式「重新生成岗位库」放行既有岗位保护闸。
+   *
+   * 只有 RAAS 端用户在需求详情页勾选「覆盖已发布岗位」时，
+   * `CLARIFICATION_READY.payload.force_regenerate` 才为 true；createJdAgent
+   * 原样透传到这里。放行后覆盖既有 JobPosting 正文并把它强制写回未发布态
+   * (`status='draft'` / `publish_status='pending'` / `published_at=NULL`)，
+   * 由 RAAS 重新建 jd_review 待办走人工复审。
+   *
+   * `closed_at` 非空的岗位**不在放行范围**：closed 是终态，复活走 RAAS
+   * ADR-0069 的 reopenJD 路径，从这里放行会绕过它的守卫。
+   */
+  force_regenerate?: boolean;
+  /**
+   * Durable event written in the same Partner PG transaction as JobPosting.
+   * The source event id scopes replay idempotency. Revising an existing
+   * posting requires `force_regenerate` above (ADR-0154); JD_REJECTED itself
+   * never re-enters generation.
+   */
+  jd_generated_outbox?: {
+    source_event_id: string;
+    jd_content: string;
+    source_action?: string;
+    trace?: JdGeneratedOutboxTrace | null;
+  };
   // 允许其他字段透传
   [key: string]: unknown;
 };
@@ -196,8 +312,45 @@ export type SyncJdResult = {
   synced: boolean;
   job_posting_id: string;
   job_requisition_id: string;
+  jd_generated_event_id?: string;
+  jd_generated_idempotency_key?: string;
   reason?: string;
+  /** ADR-0154 — 本次覆盖的是一条本来受保护的岗位（已审核 / 已发布）。 */
+  regenerated?: boolean;
 };
+
+type ExistingJobPostingRow = {
+  job_posting_id: string;
+  status: string | null;
+  publish_status: string | null;
+  closed_at: Date | string | null;
+};
+
+type ExistingOutboxRow = {
+  event_id: string;
+  event_name: string;
+  source_action: string | null;
+  entity_type: string | null;
+  entity_id: string | null;
+  payload: unknown;
+};
+
+/**
+ * 可被重新生成覆盖的 `publish_status` 集合（未走完 HSM 审核 → 发布的岗位）。
+ *
+ * ⚠️ 跨仓库共享判据：RAAS 侧 `isRegeneratableJobPosting()`
+ * (backend/apps/api/src/modules/requirements/requirement.service.ts) 保存了
+ * 逐字相同的一份，用于在发事件前预检并给用户明确提示。两处必须同步修改，
+ * 否则 RAAS 说「能重新生成」而 AO 这里 skip（或反之），用户看到的是静默失败。
+ * 两边各有测试锁死这个集合。
+ */
+const REGENERATABLE_PUBLISH_STATUSES = new Set([
+  '',
+  'draft',
+  'pending',
+  'modified',
+  'rejected',
+]);
 
 // ──────────────────────────────────────────────────────────────────────
 // Main entry — replaces RAAS POST /api/v1/jd/sync-generated
@@ -219,6 +372,8 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
     jd_content,
     search_keywords,
   } = input;
+  // ADR-0154 — RAAS 用户显式勾选「覆盖已发布岗位」才为 true。
+  const forceRegenerate = input.force_regenerate === true;
 
   const degree_requirement = mapEnum(
     pickField<string>(body, 'degree_requirement', 'education'),
@@ -235,6 +390,7 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
 
   const job_requisition_id = input.job_requisition_id;
   const client_id = input.client_id;
+  const outboxInput = input.jd_generated_outbox;
 
   if (!job_requisition_id) {
     throw new Error('[partner-pg/job-posting] missing job_requisition_id');
@@ -246,6 +402,14 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
       job_requisition_id,
       reason: 'skipped_no_client_id',
     };
+  }
+  if (outboxInput) {
+    if (!outboxInput.source_event_id?.trim()) {
+      throw new Error('[partner-pg/job-posting] missing jd_generated_outbox.source_event_id');
+    }
+    if (!outboxInput.jd_content?.trim()) {
+      throw new Error('[partner-pg/job-posting] missing jd_generated_outbox.jd_content');
+    }
   }
 
   const postingTitleField =
@@ -286,9 +450,93 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
   const salaryMax = saneSalary(textSalaryMax ?? toInt(salaryMaxRaw));
   const cityFirst = Array.isArray(city) && city.length > 0 ? city[0] : null;
 
-  // Run all 3 writes in one transaction
+  // Run JobPosting and its durable JD_GENERATED event in one transaction.
   return withTx<SyncJdResult>(async (c) => {
-    // ── Step 1: patch job_requisition matching fields (only set non-null) ──
+    // Serialize every revision of one JR across Inngest runs/workers. The table
+    // has no unique constraint on job_requisition_id, so SELECT → INSERT alone
+    // has a TOCTOU window even when function-level concurrency is configured.
+    await c.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`job_posting:${job_requisition_id}`],
+    );
+
+    const existing = await c.query<ExistingJobPostingRow>(
+      `SELECT job_posting_id, status, publish_status, closed_at
+         FROM job_posting
+        WHERE job_requisition_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE`,
+      [job_requisition_id],
+    );
+
+    const existingPosting = existing.rows[0];
+    if (
+      existingPosting &&
+      isProtectedExistingPosting(existingPosting, { forceRegenerate })
+    ) {
+      return {
+        synced: false,
+        job_posting_id: existingPosting.job_posting_id,
+        job_requisition_id,
+        reason: 'skipped_protected_existing_posting',
+      };
+    }
+    // 只有真的覆盖了一条「本来受保护」的岗位才算重新生成 —— RAAS 侧据此重置
+    // per-recruiter 发布生命周期并改用复审文案；首次生成/覆盖草稿都不算。
+    const regeneratedProtectedPosting =
+      forceRegenerate === true &&
+      existingPosting != null &&
+      isProtectedExistingPosting(existingPosting);
+
+    const replayIdempotencyKey = outboxInput
+      ? jdGeneratedIdempotencyKey(
+          job_requisition_id,
+          outboxInput.source_event_id.trim(),
+        )
+      : null;
+    if (replayIdempotencyKey && outboxInput) {
+      const replay = await findJdGeneratedOutbox(c, replayIdempotencyKey);
+      if (replay) {
+        if (!existingPosting) {
+          throw new Error(
+            `[partner-pg/job-posting] JD_GENERATED outbox exists without JobPosting: ${replayIdempotencyKey}`,
+          );
+        }
+        const replayPayload = buildJdGeneratedPayload({
+          job_posting_id: existingPosting.job_posting_id,
+          job_requisition_id,
+          client_id,
+          jd_content: outboxInput.jd_content,
+        });
+        if (
+          !sameJdGeneratedOutbox(
+            replay,
+            {
+              job_posting_id: existingPosting.job_posting_id,
+              source_action: outboxInput.source_action ?? 'createJD',
+            },
+            replayPayload,
+          )
+        ) {
+          throw new Error(
+            `[partner-pg/job-posting] JD_GENERATED outbox idempotency collision: ${replayIdempotencyKey}`,
+          );
+        }
+        return {
+          synced: false,
+          job_posting_id: existingPosting.job_posting_id,
+          job_requisition_id,
+          jd_generated_event_id: replay.event_id,
+          jd_generated_idempotency_key: replayIdempotencyKey,
+          reason: 'replayed_existing_outbox',
+        };
+      }
+    }
+
+    // Prepare the JobRequisition patch now, but apply it only after the guarded
+    // JobPosting write succeeds. That keeps a late terminal-state detection a
+    // true no-op for the whole transaction.
     const patchPairs: Array<[string, unknown]> = [];
     // must_have_skills / nice_to_have_skills 在 partner 库是 jsonb 列:必须传 JSON 文本。
     // 直接传 JS 数组会被 pg 转成 Postgres 数组字面量 {…},jsonb 解析报
@@ -317,28 +565,7 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
     if (benefits != null) patchPairs.push(['benefits', benefits]);
     if (headcountInt != null) patchPairs.push(['headcount', headcountInt]);
 
-    if (patchPairs.length > 0) {
-      // Build dynamic SET clause: col1 = $2, col2 = $3, ...
-      const setClause = patchPairs
-        .map(([col], idx) => `${col} = $${idx + 2}`)
-        .join(', ');
-      const values = patchPairs.map(([, v]) => v);
-      // updated_at handled by DB trigger / Prisma @updatedAt; we touch it explicitly.
-      await c.query(
-        `UPDATE job_requisition SET ${setClause}, updated_at = NOW() WHERE job_requisition_id = $1`,
-        [job_requisition_id, ...values],
-      );
-    }
-
-    // ── Step 2: upsert job_posting (publish_status='pending' for HSM review) ──
-    const existing = await c.query<{ job_posting_id: string }>(
-      `SELECT job_posting_id FROM job_posting
-        WHERE job_requisition_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1`,
-      [job_requisition_id],
-    );
-
+    // ── Step 1: guarded upsert job_posting (publish_status='pending') ──
     let job_posting_id: string;
     const sharedCols = [
       'posting_title',
@@ -371,13 +598,57 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
       'pending', // force HSM review
     ];
 
-    if (existing.rows.length > 0) {
-      job_posting_id = existing.rows[0]!.job_posting_id;
+    if (existingPosting) {
+      job_posting_id = existingPosting.job_posting_id;
       const setClause = sharedCols.map((col, i) => `${col} = $${i + 2}`).join(', ');
-      await c.query(
-        `UPDATE job_posting SET ${setClause}, updated_at = NOW() WHERE job_posting_id = $1`,
+      // ADR-0154 — 强制重新生成时把岗位一并写回未发布态：`publish_status`
+      // 已在 sharedVals 里恒为 'pending'，但 `status` 与 `published_at` 不在
+      // sharedCols 中（只有 INSERT 写 status='draft'）。不补这两列，覆盖一条
+      // 已发布岗位后 status 仍是 'published'，下一次重新生成又会被同一条闸
+      // 拦住，而且 RAAS 岗位库会显示「已发布」却挂着待审 JD。
+      const forcedResetClause = regeneratedProtectedPosting
+        ? `, status = 'draft', published_at = NULL`
+        : '';
+      // 守卫 WHERE 与本次放行口径一致：非 force 时保持原白名单（防并发期间
+      // 岗位被人推进到已发布后仍被静默覆盖）；force 时只保留 closed 一条。
+      const guardClause = forceRegenerate
+        ? ''
+        : `
+            AND BTRIM(COALESCE(status::text, '')) IN ('', 'draft')
+            AND BTRIM(COALESCE(publish_status::text, '')) IN (
+              '', 'draft', 'pending', 'modified', 'rejected'
+            )`;
+      const updated = await c.query(
+        `UPDATE job_posting
+            SET ${setClause}${forcedResetClause}, updated_at = NOW()
+          WHERE job_posting_id = $1
+            AND closed_at IS NULL${guardClause}`,
         [job_posting_id, ...sharedVals],
       );
+      if (updated.rowCount !== 1) {
+        const refreshed = await c.query<ExistingJobPostingRow>(
+          `SELECT job_posting_id, status, publish_status, closed_at
+             FROM job_posting
+            WHERE job_posting_id = $1
+            LIMIT 1
+            FOR UPDATE`,
+          [job_posting_id],
+        );
+        if (
+          refreshed.rows[0] &&
+          isProtectedExistingPosting(refreshed.rows[0], { forceRegenerate })
+        ) {
+          return {
+            synced: false,
+            job_posting_id,
+            job_requisition_id,
+            reason: 'skipped_protected_existing_posting',
+          };
+        }
+        throw new Error(
+          `[partner-pg/job-posting] guarded JobPosting update affected ${updated.rowCount ?? 0} rows: ${job_posting_id}`,
+        );
+      }
     } else {
       job_posting_id = randomUUID();
       // INSERT with job_posting_id + job_requisition_id + client_id + status='draft' + shared
@@ -391,28 +662,203 @@ export async function syncJdToPartnerPg(input: SyncJdInput): Promise<SyncJdResul
       );
     }
 
-    // ── Step 3: advance spec.status draft → pending_publish (compare-and-set) ──
-    const jrRow = await c.query<{ job_requisition_specification_id: string | null }>(
-      `SELECT job_requisition_specification_id FROM job_requisition
-        WHERE job_requisition_id = $1
-        LIMIT 1`,
-      [job_requisition_id],
-    );
-    const specId = jrRow.rows[0]?.job_requisition_specification_id ?? null;
-    if (specId) {
+    // ── Step 2: patch job_requisition matching fields (only set non-null) ──
+    if (patchPairs.length > 0) {
+      const setClause = patchPairs
+        .map(([col], idx) => `${col} = $${idx + 2}`)
+        .join(', ');
+      const values = patchPairs.map(([, v]) => v);
       await c.query(
-        `UPDATE job_requisition_specification
-            SET status = 'pending_publish', updated_at = NOW()
-          WHERE job_requisition_specification_id = $1
-            AND status = 'draft'`,
-        [specId],
+        `UPDATE job_requisition SET ${setClause}, updated_at = NOW() WHERE job_requisition_id = $1`,
+        [job_requisition_id, ...values],
       );
     }
+
+    // Per RAAS ADR-0021, generation does not advance the requirement spec.
+    // It stays draft until CHANNEL_PUBLISHED promotes it to recruiting.
+
+    const outbox = outboxInput
+      ? await appendJdGeneratedOutbox(c, {
+          job_posting_id,
+          job_requisition_id,
+          client_id,
+          source_event_id: outboxInput.source_event_id.trim(),
+          jd_content: outboxInput.jd_content,
+          source_action: outboxInput.source_action ?? 'createJD',
+          trace: outboxInput.trace ?? null,
+          regenerated: regeneratedProtectedPosting,
+        })
+      : null;
 
     return {
       synced: true,
       job_posting_id,
       job_requisition_id,
+      ...(regeneratedProtectedPosting ? { regenerated: true } : {}),
+      ...(outbox
+        ? {
+            jd_generated_event_id: outbox.event_id,
+            jd_generated_idempotency_key: outbox.idempotency_key,
+          }
+        : {}),
     };
-  });
+  }, { allowMirrorFallback: false });
+}
+
+/**
+ * 既有岗位是否受保护（= 本次生成必须跳过，不覆盖正文）。
+ *
+ * `forceRegenerate`(ADR-0154) 是 RAAS 用户显式勾选「覆盖已发布岗位」的结果：
+ * 它只放开「已越过审核/已发布」这一层保护，**closed 岗位在任何情况下都保护**
+ * —— 那是终态，复活走 RAAS ADR-0069 的 reopenJD，从生成侧放行会绕过守卫。
+ */
+function isProtectedExistingPosting(
+  row: ExistingJobPostingRow,
+  opts: { forceRegenerate?: boolean } = {},
+): boolean {
+  if (row.closed_at != null) return true;
+  if (opts.forceRegenerate === true) return false;
+  const status = String(row.status ?? '').trim().toLowerCase();
+  if (status && status !== 'draft') return true;
+  return !REGENERATABLE_PUBLISH_STATUSES.has(
+    String(row.publish_status ?? '').trim().toLowerCase(),
+  );
+}
+
+function jdGeneratedIdempotencyKey(
+  jobRequisitionId: string,
+  sourceEventId: string,
+): string {
+  return `JD_GENERATED:createJD:${jobRequisitionId}:${sourceEventId}`;
+}
+
+function buildJdGeneratedPayload(input: {
+  job_posting_id: string;
+  job_requisition_id: string;
+  client_id: string;
+  jd_content: string;
+  /**
+   * ADR-0154 — 本次覆盖的是一条「本来受保护」的岗位（已审核 / 已发布）。
+   * RAAS 侧据此重置 per-recruiter 发布生命周期并改用复审文案。
+   * 首次生成与覆盖草稿都不带该字段（replay 比对是子集比对，缺省不影响幂等）。
+   */
+  regenerated?: boolean;
+}): Record<string, unknown> {
+  return {
+    job_posting_id: input.job_posting_id,
+    job_requisition_id: input.job_requisition_id,
+    client_id: input.client_id,
+    jd_content: input.jd_content,
+    ...(input.regenerated === true ? { regenerated: true } : {}),
+  };
+}
+
+async function findJdGeneratedOutbox(
+  c: PoolClient,
+  idempotencyKey: string,
+): Promise<ExistingOutboxRow | null> {
+  const result = await c.query<ExistingOutboxRow>(
+    `SELECT event_id, event_name, source_action, entity_type, entity_id, payload
+       FROM event_outbox
+      WHERE idempotency_key = $1
+      LIMIT 1`,
+    [idempotencyKey],
+  );
+  return result.rows[0] ?? null;
+}
+
+async function appendJdGeneratedOutbox(
+  c: PoolClient,
+  input: {
+    job_posting_id: string;
+    job_requisition_id: string;
+    client_id: string;
+    source_event_id: string;
+    jd_content: string;
+    source_action: string;
+    trace: JdGeneratedOutboxTrace | null;
+    regenerated?: boolean;
+  },
+): Promise<{ event_id: string; idempotency_key: string }> {
+  const eventId = randomUUID();
+  const idempotencyKey = jdGeneratedIdempotencyKey(
+    input.job_requisition_id,
+    input.source_event_id,
+  );
+  const trace = input.trace ?? null;
+  const payload = buildJdGeneratedPayload(input);
+
+  const inserted = await c.query<{ event_id: string }>(
+    `INSERT INTO event_outbox (
+       id, event_id, event_name, source_action, topic,
+       trace_id, request_id, workflow_id, parent_trace_id,
+       entity_type, entity_id, trace_payload, idempotency_key, payload,
+       status, retry_count, next_retry_at, created_at, updated_at
+     ) VALUES (
+       $1, $1, 'JD_GENERATED', $2, 'raas.events',
+       $3, $4, $5, $6,
+       'Job_Posting', $7, $8::jsonb, $9, $10::jsonb,
+       'pending', 0, NOW(), NOW(), NOW()
+     )
+     ON CONFLICT (idempotency_key) DO NOTHING
+     RETURNING event_id`,
+    [
+      eventId,
+      input.source_action,
+      trace?.trace_id ?? null,
+      trace?.request_id ?? null,
+      trace?.workflow_id ?? null,
+      trace?.parent_trace_id ?? null,
+      input.job_posting_id,
+      JSON.stringify(trace),
+      idempotencyKey,
+      JSON.stringify(payload),
+    ],
+  );
+
+  if (inserted.rows[0]?.event_id) {
+    return { event_id: inserted.rows[0].event_id, idempotency_key: idempotencyKey };
+  }
+
+  const existing = await findJdGeneratedOutbox(c, idempotencyKey);
+  if (!existing || !sameJdGeneratedOutbox(existing, input, payload)) {
+    throw new Error(
+      `[partner-pg/job-posting] JD_GENERATED outbox idempotency collision: ${idempotencyKey}`,
+    );
+  }
+  return { event_id: existing.event_id, idempotency_key: idempotencyKey };
+}
+
+function sameJdGeneratedOutbox(
+  existing: ExistingOutboxRow,
+  input: {
+    job_posting_id: string;
+    source_action: string;
+  },
+  expectedPayload: Record<string, unknown>,
+): boolean {
+  const actualPayload =
+    typeof existing.payload === 'string'
+      ? safeParseJson(existing.payload)
+      : existing.payload;
+  return (
+    existing.event_name === 'JD_GENERATED' &&
+    existing.source_action === input.source_action &&
+    existing.entity_type === 'Job_Posting' &&
+    existing.entity_id === input.job_posting_id &&
+    isRecord(actualPayload) &&
+    Object.entries(expectedPayload).every(([key, value]) => actualPayload[key] === value)
+  );
+}
+
+function safeParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
 }

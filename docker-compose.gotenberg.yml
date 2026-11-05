@@ -1,0 +1,33 @@
+name: agentic-operator-converter
+
+services:
+  gotenberg:
+    image: ${GOTENBERG_IMAGE:-gotenberg/gotenberg:8.34.0-libreoffice}
+    environment:
+      API_TIMEOUT: ${GOTENBERG_API_TIMEOUT:-120s}
+      API_BODY_LIMIT: ${GOTENBERG_API_BODY_LIMIT:-12MB}
+      API_DISABLE_DOWNLOAD_FROM: "true"
+      WEBHOOK_DISABLE: "true"
+      LIBREOFFICE_AUTO_START: "true"
+      LIBREOFFICE_MAX_QUEUE_SIZE: ${GOTENBERG_MAX_QUEUE_SIZE:-8}
+      LIBREOFFICE_DENY_PRIVATE_IPS: "true"
+      LIBREOFFICE_DENY_PUBLIC_IPS: "true"
+      LOG_STD_FORMAT: json
+    ports:
+      - "${GOTENBERG_BIND_ADDRESS:-127.0.0.1}:${GOTENBERG_PORT:-3009}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: ${GOTENBERG_CPUS:-1.0}
+          memory: ${GOTENBERG_MEMORY_LIMIT:-1G}
+          pids: ${GOTENBERG_PIDS_LIMIT:-256}

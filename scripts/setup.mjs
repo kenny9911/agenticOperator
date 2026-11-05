@@ -11,7 +11,8 @@
 //   3. Load .env.local into process.env via dotenv.
 //   4. Run env preflight (warn on placeholders, fail on missing required).
 //   5. Ensure ./data and ./logs directories exist (agent-logger + migration src).
-//   6. Provision local Postgres (Docker), then `prisma generate` + `db push`.
+//   6. Start the local document converter when its configured URL is loopback.
+//   7. Provision local Postgres (Docker), then `prisma generate` + `db push`.
 //
 // Idempotent — safe to re-run after editing .env.local.
 
@@ -20,6 +21,7 @@ import { execSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { ensureLocalDocumentConverter } from "./local-converter-bootstrap.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -91,7 +93,25 @@ for (const dir of ["data", "logs"]) {
   }
 }
 
-// 6. Local Postgres (Docker) — best-effort, then prisma generate + db push.
+const dockerUp = (() => {
+  try {
+    execSync("docker info", { cwd: ROOT, stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+// 6. Local Gotenberg/LibreOffice converter — best-effort and local-only.
+ensureLocalDocumentConverter({
+  env: process.env,
+  dockerAvailable: dockerUp,
+  root: ROOT,
+  log,
+  warn,
+});
+
+// 7. Local Postgres (Docker) — best-effort, then prisma generate + db push.
 const usingPostgres = (process.env.DATABASE_URL ?? "").startsWith("postgres");
 if (usingPostgres) {
   try {

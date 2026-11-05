@@ -25,7 +25,7 @@ import {
 } from '@/lib/allmeta-writers';
 import { inviteCandidateDirect, RobohireApiError } from '@/lib/robohire-client';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
-import { reportDependencyDegraded, isRecoverableReason } from '@/lib/dependency-health/report';
+import { reportDependencyDegraded, isRecoverableReason, recordDependencyOk } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import type { DepOutcome } from '@/lib/dependency-health/types';
 import { getParsedResume } from '@/lib/partner-pg/parsed-resume';
@@ -234,6 +234,7 @@ export async function interviewInviterAgentHandler({ event, step, logger, runId 
           traceId: traceId ?? undefined,
           logger: fileLogger,
         });
+        await recordDependencyOk('robohire', 'inviteCandidate', depCtx);
         logger.info(
           `[${AGENT_NAME}] RoboHire invite OK · requestId=${r.requestId} reused=${r.data?.reused ?? false}`,
         );

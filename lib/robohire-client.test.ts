@@ -1,4 +1,8 @@
+// @vitest-environment node
+
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   parseResumeDirect,
   matchResumeDirect,
@@ -6,15 +10,53 @@ import {
   inviteCandidateDirect,
   RobohireApiError,
 } from './robohire-client';
+import type { AgentLogger } from './agent-logger';
+import { SYNTHETIC_JPEG, SYNTHETIC_PNG } from './resume-convert/image-test-fixtures';
+
+const logApiCall = vi.hoisted(() => vi.fn());
+vi.mock('./external-api-log', () => ({ logApiCall }));
 
 const env = {
   ROBOHIRE_API_BASE_URL: 'https://api.robohire.io',
   ROBOHIRE_API_KEY: 'rh_test_key',
   ROBOHIRE_TIMEOUT_MS: '120000',
 };
+function classicPdf(): Buffer {
+  const body = Buffer.from(
+    '%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n',
+    'ascii',
+  );
+  const xref = Buffer.from(
+    'xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n' +
+      'trailer\n<< /Size 2 /Root 1 0 R >>\n',
+    'ascii',
+  );
+  return Buffer.concat([
+    body,
+    xref,
+    Buffer.from(`startxref\n${body.length}\n%%EOF\n`, 'ascii'),
+  ]);
+}
+
+const VALID_PDF = classicPdf();
+const REAL_DOCX = readFileSync(
+  join(process.cwd(), 'lib', 'resume-convert', 'fixtures', 'synthetic-resume.docx'),
+);
+
+function capturingLogger(apiCall: AgentLogger['apiCall']): AgentLogger {
+  return {
+    ctx: { agent: 'test', runId: 'run-test', traceId: 'trace-test' },
+    step: async <T>(_stepId: string, fn: () => Promise<T>) => fn(),
+    event: vi.fn(),
+    apiCall,
+    currentLogFile: () => 'test.log',
+  };
+}
 
 beforeEach(() => {
   Object.assign(process.env, env);
+  delete process.env.DOCUMENT_CONVERTER_URL;
+  logApiCall.mockClear();
   vi.restoreAllMocks();
 });
 
@@ -31,7 +73,7 @@ describe('parseResumeDirect', () => {
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    const r = await parseResumeDirect(Buffer.from('%PDF-1.4'), 'r.pdf');
+    const r = await parseResumeDirect(VALID_PDF, 'r.pdf');
     expect(r.data.name).toBe('John');
     expect(r.requestId).toBe('req_abc');
     expect(r.cached).toBe(false);
@@ -44,7 +86,7 @@ describe('parseResumeDirect', () => {
         { status: 400, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from(''), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       httpStatus: 400,
       code: 'CLIENT',
       requestId: 'req_xyz',
@@ -55,7 +97,7 @@ describe('parseResumeDirect', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ success: false, error: 'rate limited' }), { status: 429 }),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       httpStatus: 429,
       code: 'RATE_LIMITED',
     });
@@ -65,7 +107,7 @@ describe('parseResumeDirect', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ success: false, error: 'quota exhausted' }), { status: 402 }),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       code: 'QUOTA_EXHAUSTED',
     });
   });
@@ -74,7 +116,7 @@ describe('parseResumeDirect', () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(JSON.stringify({ success: true, data: {}, cached: true, requestId: 'r' })));
-    await parseResumeDirect(Buffer.from('%PDF'), 'r.pdf', { traceId: 'trace-123' });
+    await parseResumeDirect(VALID_PDF, 'r.pdf', { traceId: 'trace-123' });
     const init = (fetchSpy.mock.calls[0][1] ?? {}) as RequestInit;
     expect((init.headers as Record<string, string>)['X-Trace-Id']).toBe('trace-123');
   });
@@ -84,19 +126,27 @@ describe('parseResumeDirect', () => {
   // problem, not a vendor outage — it must NOT be coded SERVER (which the
   // dependency-health classifier treats as a recoverable RoboHire degradation).
   it('throws UNPARSEABLE when RoboHire reports no extractable text (200 success:false)', async () => {
+    const vendorError =
+      'PDF extraction failed: no text for 张三候选人.pdf / 19999990001 / private resume body';
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
           success: false,
-          error: 'PDF extraction failed: no text could be extracted by any method',
+          error: vendorError,
           requestId: 'req_np',
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'scan.pdf')).rejects.toMatchObject({
+    const error = await parseResumeDirect(VALID_PDF, 'scan.pdf').catch((caught) => caught);
+    expect(error).toMatchObject({
       code: 'UNPARSEABLE',
       requestId: 'req_np',
+      message: 'parse-resume returned success=false (UNPARSEABLE)',
+    });
+    expect(JSON.stringify(logApiCall.mock.calls)).not.toContain(vendorError);
+    expect(logApiCall.mock.calls.at(-1)?.[0]?.response).toMatchObject({
+      error_category: 'UNPARSEABLE',
     });
   });
 
@@ -107,7 +157,7 @@ describe('parseResumeDirect', () => {
         { status: 500, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       code: 'UNPARSEABLE',
     });
   });
@@ -119,9 +169,159 @@ describe('parseResumeDirect', () => {
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    await expect(parseResumeDirect(Buffer.from('%PDF'), 'r.pdf')).rejects.toMatchObject({
+    await expect(parseResumeDirect(VALID_PDF, 'r.pdf')).rejects.toMatchObject({
       code: 'SERVER',
     });
+  });
+
+  it('converts DOCX first and sends only the verified PDF bytes to RoboHire', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const convertedPdf = VALID_PDF;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(new Uint8Array(convertedPdf), {
+        status: 200,
+        headers: { 'content-type': 'application/pdf' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        data: { name: 'Converted Candidate' },
+        cached: false,
+        requestId: 'req_converted',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const result = await parseResumeDirect(REAL_DOCX, 'candidate.docx');
+
+    expect(result.requestId).toBe('req_converted');
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy.mock.calls[0][0]).toBe('http://gotenberg:3000/forms/libreoffice/convert');
+    const robohireBody = fetchSpy.mock.calls[1][1]?.body as FormData;
+    const uploadedPdf = robohireBody.get('file') as File;
+    expect(uploadedPdf.name).toBe('resume.pdf');
+    expect(uploadedPdf.type).toBe('application/pdf');
+    expect(Buffer.from(await uploadedPdf.arrayBuffer())).toEqual(convertedPdf);
+  });
+
+  it('converts an image first and never sends or logs the original image bytes/filename to RoboHire', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const convertedPdf = VALID_PDF;
+    const apiCall = vi.fn<AgentLogger['apiCall']>();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(new Uint8Array(convertedPdf), {
+        status: 200,
+        headers: { 'content-type': 'application/pdf' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        data: {
+          name: 'Image Candidate',
+          email: 'image.candidate@example.invalid',
+          phone: '19999990001',
+          rawText: 'PRIVATE SYNTHETIC RESUME BODY',
+          experience: [{ company: 'Private Example Company' }],
+          education: [{ institution: 'Private Example University' }],
+          skills: { technical: ['TypeScript', 'Testing'] },
+        },
+        cached: false,
+        requestId: 'req_image_converted',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const result = await parseResumeDirect(SYNTHETIC_JPEG, '张三候选人.JPG', {
+      logger: capturingLogger(apiCall),
+    });
+
+    expect(result.requestId).toBe('req_image_converted');
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const converterBody = fetchSpy.mock.calls[0][1]?.body as FormData;
+    const converterImage = converterBody.get('files') as File;
+    expect(converterImage.name).toBe('resume.jpeg');
+    expect(converterImage.type).toBe('image/jpeg');
+    expect(Buffer.from(await converterImage.arrayBuffer())).toEqual(SYNTHETIC_JPEG);
+
+    const robohireBody = fetchSpy.mock.calls[1][1]?.body as FormData;
+    const uploadedPdf = robohireBody.get('file') as File;
+    const uploadedBytes = Buffer.from(await uploadedPdf.arrayBuffer());
+    expect(uploadedPdf.name).toBe('resume.pdf');
+    expect(uploadedPdf.type).toBe('application/pdf');
+    expect(uploadedBytes).toEqual(convertedPdf);
+    expect(uploadedBytes).not.toEqual(SYNTHETIC_JPEG);
+
+    const parseCall = apiCall.mock.calls.find(([label]) => label === 'RoboHire.parseResume');
+    expect(parseCall?.[1]?.request).toMatchObject({
+      filename: 'resume.pdf',
+      source_format: 'jpeg',
+      converted: true,
+    });
+    expect(parseCall?.[1]?.response).toEqual({
+      http_status: 200,
+      success: true,
+      cached: false,
+      request_id: 'req_image_converted',
+      data_present: true,
+      data_field_count: 7,
+      experience_count: 1,
+      education_count: 1,
+      skill_count: 2,
+      error_category: null,
+    });
+
+    const durableCall = logApiCall.mock.calls.find(([entry]) =>
+      entry?.label === 'RoboHire.parseResume');
+    expect(durableCall?.[0]?.response).toEqual(parseCall?.[1]?.response);
+    const auditJson = JSON.stringify({ parseCall, durableCall });
+    for (const forbidden of [
+      '张三候选人',
+      'Image Candidate',
+      'image.candidate@example.invalid',
+      '19999990001',
+      'PRIVATE SYNTHETIC RESUME BODY',
+      'Private Example Company',
+      'Private Example University',
+    ]) {
+      expect(auditJson).not.toContain(forbidden);
+    }
+  });
+
+  it('keeps image-only converted PDFs UNPARSEABLE when RoboHire extracts no text', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(new Uint8Array(VALID_PDF), {
+        status: 200,
+        headers: { 'content-type': 'application/pdf' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: false,
+        error: 'PDF extraction failed: no text could be extracted by any method',
+        requestId: 'req_image_no_text',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    await expect(parseResumeDirect(SYNTHETIC_PNG, 'scan.png')).rejects.toMatchObject({
+      code: 'UNPARSEABLE',
+      requestId: 'req_image_no_text',
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('never calls RoboHire when Office conversion fails', async () => {
+    process.env.DOCUMENT_CONVERTER_URL = 'http://gotenberg:3000';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('converter unavailable', { status: 503 }),
+    );
+
+    await expect(parseResumeDirect(REAL_DOCX, 'candidate.docx')).rejects.toMatchObject({
+      code: 'CONVERTER_UNAVAILABLE',
+      category: 'dependency',
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects non-PDF/non-Office bytes before any external request', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    await expect(parseResumeDirect(Buffer.from('not a document'), 'candidate.pdf')).rejects.toMatchObject({
+      code: 'UNSUPPORTED_FORMAT',
+      category: 'document',
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -142,28 +342,39 @@ describe('matchResumeDirect', () => {
     expect(r.data.recommendation).toBe('STRONG_MATCH');
   });
 
-  it('serializes resume + jd as JSON body and defaults locale to zh', async () => {
+  it('serializes resume + jd as JSON body and defaults locale and employmentType', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(JSON.stringify({ success: true, data: { matchScore: 50, recommendation: 'PARTIAL_MATCH' }, requestId: 'r' })));
     await matchResumeDirect({ resume: 'R', jd: 'J' });
     const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
-    expect(body).toEqual({ resume: 'R', jd: 'J', locale: 'zh' });
+    expect(body).toEqual({
+      resume: 'R',
+      jd: 'J',
+      employmentType: 'outsourcing',
+      locale: 'zh',
+    });
   });
 
-  it('honors an explicit locale override', async () => {
+  it('honors explicit locale and employmentType overrides', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(JSON.stringify({ success: true, data: { matchScore: 50, recommendation: 'PARTIAL_MATCH' }, requestId: 'r' })));
-    await matchResumeDirect({ resume: 'R', jd: 'J', locale: 'en' });
+    await matchResumeDirect({
+      resume: 'R',
+      jd: 'J',
+      locale: 'en',
+      employmentType: 'permanent',
+    });
     const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
     expect(body.locale).toBe('en');
+    expect(body.employmentType).toBe('permanent');
   });
 });
 
 describe('generateJdDirect', () => {
   it('returns generate-jd data on 200', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
           success: true,
@@ -186,6 +397,32 @@ describe('generateJdDirect', () => {
     expect(r.data.title).toBe('Senior FE');
     expect(r.meta?.stages?.parse).toBe('success');
     expect(r.requestId).toBe('req_jd_xyz');
+    const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
+    expect(body).toEqual({
+      prompt: 'Senior Frontend, React, 5 years, Shenzhen',
+      employmentType: 'outsourcing',
+    });
+  });
+
+  it('honors an explicit employmentType override', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: { title: 'Contract FE' },
+          meta: { stages: { parse: 'success', generate: 'success' } },
+          requestId: 'req_jd_override',
+        }),
+      ),
+    );
+
+    await generateJdDirect({
+      prompt: 'Contract frontend role with sufficient detail',
+      employmentType: 'contract',
+    });
+
+    const body = JSON.parse(((fetchSpy.mock.calls[0][1]?.body as string) ?? '{}'));
+    expect(body.employmentType).toBe('contract');
   });
 
   it('throws RobohireApiError on 400', async () => {
@@ -195,47 +432,37 @@ describe('generateJdDirect', () => {
     await expect(generateJdDirect({ prompt: 'x' })).rejects.toMatchObject({ httpStatus: 400, code: 'CLIENT' });
   });
 
-  it('does NOT throw when meta.stages.generate="failed" — stages are non-fatal; the transport client returns the response and the caller (classifyRobohire) judges content', async () => {
-    // Gohire contract: generate-jd always returns 200 / success:true; a failed
-    // generate stage still returns the response (with meta.stages). The transport
-    // client must NOT throw on stage status — emptiness/usability is judged downstream
-    // by classifyRobohire (single source of truth), which fails the run on empty content.
+  it.each([
+    ['parse failed', { stages: { parse: 'failed', generate: 'success' } }, 'parse=failed generate=success'],
+    ['generate failed', { stages: { parse: 'success', generate: 'failed' } }, 'parse=success generate=failed'],
+    ['stage skipped/unknown', { stages: { parse: 'skipped', generate: 'unknown' } }, 'parse=skipped generate=unknown'],
+    ['wrong casing', { stages: { parse: 'SUCCESS', generate: 'success' } }, 'parse=SUCCESS generate=success'],
+    ['missing generate', { stages: { parse: 'success' } }, 'parse=success generate=missing'],
+    ['missing stages', undefined, 'parse=missing generate=missing'],
+  ])('rejects a 200 response when %s', async (_label, meta, expectedDetail) => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
           success: true,
-          data: { title: 'Untitled', qualifications: '', hardRequirements: '', description: '', evaluationRules: '' },
-          meta: { stages: { parse: 'success', generate: 'failed' } },
-          requestId: 'req_jd_degraded',
+          data: { title: 'Looks usable', description: 'real body from a partial pipeline' },
+          ...(meta === undefined ? {} : { meta }),
+          requestId: 'req_jd_stage_gate',
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       ),
     );
-    const r = await generateJdDirect({ prompt: 'a valid prompt long enough to pass' });
-    expect(r.requestId).toBe('req_jd_degraded');
-    expect(r.meta?.stages?.generate).toBe('failed');
+
+    await expect(
+      generateJdDirect({ prompt: 'a valid prompt long enough to pass' }),
+    ).rejects.toMatchObject({
+      httpStatus: 502,
+      code: 'SERVER',
+      requestId: 'req_jd_stage_gate',
+      message: expect.stringContaining(expectedDetail),
+    });
   });
 
-  it('does NOT throw when meta.stages.parse="failed" but generate produced usable content — returns the salvageable JD (this used to be discarded)', async () => {
-    // The headline bug: parse-fail + generate-ok is a fully usable JD. The client
-    // must return it (raw-prompt title and all) so the agent can salvage it.
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          success: true,
-          data: { title: 'raw prompt echoed as title', description: 'real body from generate', qualifications: 'real quals' },
-          meta: { stages: { parse: 'failed', generate: 'success' } },
-          requestId: 'req_jd_parsefail',
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    );
-    const r = await generateJdDirect({ prompt: 'a valid prompt long enough to pass' });
-    expect(r.data.description).toBe('real body from generate');
-    expect(r.meta?.stages?.parse).toBe('failed');
-  });
-
-  it('does NOT throw on a fully-successful generate-jd (both stages success)', async () => {
+  it('accepts a fully-successful generate-jd (both stages strictly equal success)', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -251,23 +478,17 @@ describe('generateJdDirect', () => {
     expect(r.requestId).toBe('req_ok');
   });
 
-  it('does NOT throw when meta is absent (older response shape)', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({ success: true, data: { description: 'body' }, requestId: 'req_nometa' }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    );
-    const r = await generateJdDirect({ prompt: 'a valid prompt long enough to pass' });
-    expect(r.requestId).toBe('req_nometa');
-  });
-
   it('passes X-Trace-Id header', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(
         new Response(
-          JSON.stringify({ success: true, data: {}, requestId: 'r' }),
+          JSON.stringify({
+            success: true,
+            data: {},
+            meta: { stages: { parse: 'success', generate: 'success' } },
+            requestId: 'r',
+          }),
         ),
       );
     await generateJdDirect({ prompt: 'test prompt that is long enough to be valid' }, { traceId: 'trace-jd' });

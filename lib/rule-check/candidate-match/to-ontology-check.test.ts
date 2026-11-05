@@ -52,12 +52,12 @@ describe('identityToCheck', () => {
     const check = identityToCheck(res, RULES.length, {
       matchedCandidateId: 'cand_old',
       matchedCandidateName: '张三',
-      dedupAction: 'auto-merged',
+      dedupAction: 'phone-match',
     });
     const e1 = check.evals.find((e) => e.ruleId === 'IDENTITY-1')!;
     expect(e1.checkPoint).toContain('cand_old');
     expect(e1.checkPoint).toContain('张三');
-    expect(e1.checkPoint).toContain('auto-merged');
+    expect(e1.checkPoint).toContain('phone-match');
     // un-matched rules carry no link suffix
     const na = check.evals.find((e) => e.result === 'NA');
     if (na) expect(na.checkPoint).not.toContain('关联');
@@ -69,7 +69,7 @@ describe('identityToCheck', () => {
     const check = identityToCheck(
       res,
       RULES.length,
-      { matchedCandidateId: 'cand_old', matchedCandidateName: '张三', dedupAction: 'auto-merged' },
+      { matchedCandidateId: 'cand_old', matchedCandidateName: '张三', dedupAction: 'phone-match' },
       { id: '9-15', name: '同一候选人判定规则' },
     );
     // 单条 eval = 本体原规则 9-15(三级是它的子判定,折进 checkPoint)。
@@ -95,15 +95,38 @@ describe('identityToCheck', () => {
     expect(check.evals[0].result).toBe('NA');
   });
 
-  it('ontologyRule + llmRationale(大模型生成依据)→ checkPoint 用大模型文案,机械文案进 evidence', async () => {
+  it('ontologyRule + pending-review → soft FAIL，展示疑似候选人但不标成关联', async () => {
+    const b = { ...base, candidate_id: 'cand-suspect', phone: '13900139000' };
+    const res = await applyIdentityRules(base, b, RULES);
+    const check = identityToCheck(
+      res,
+      RULES.length,
+      {
+        matchedCandidateId: 'cand-suspect',
+        matchedCandidateName: '张三',
+        dedupAction: 'pending-review',
+      },
+      { id: '9-15', name: '同一候选人判定规则' },
+    );
+    expect(res.samePerson).toBe(false);
+    expect(res.needsHumanReview).toBe(true);
+    expect(check.decision).toBe('VIOLATED');
+    expect(check.evals[0].result).toBe('FAIL');
+    expect(check.evals[0].hardSoft).toBe('soft');
+    expect(check.evals[0].checkPoint).toContain('待复核疑似候选人');
+    expect(check.evals[0].checkPoint).not.toContain('关联到候选人');
+  });
+
+  it('ontologyRule + 安全的 llmRationale → checkPoint 用审计文案,机械文案进 evidence', async () => {
     const b = { ...base, candidate_id: 'cand_old', name: 'x', email: 'y@z.com' };
     const res = await applyIdentityRules(base, b, RULES);
-    const llm = '手机号与已有候选人完全一致,依据同一候选人判定规则判为同一人,自动关联老档不重复建档';
+    const llm = '规范中国大陆手机号一致,依据同一候选人判定规则记录为同一人审计结论';
     const check = identityToCheck(
-      res, RULES.length, { matchedCandidateId: 'cand_old', matchedCandidateName: '张三', dedupAction: 'auto-merged' },
+      res, RULES.length, { matchedCandidateId: 'cand_old', matchedCandidateName: '张三', dedupAction: 'phone-match' },
       { id: '9-15', name: '同一候选人判定规则' }, llm,
     );
     expect(check.evals[0].checkPoint).toBe(llm);
+    expect(check.evals[0].checkPoint).not.toMatch(/自动关联|自动合并|复用旧档|不重复建档/);
     // 机械文案不丢失:进 evidence,留可审计的结构化命中依据
     expect(check.evals[0].evidence).toContain('phone');
   });

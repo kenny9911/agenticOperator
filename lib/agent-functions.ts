@@ -95,7 +95,7 @@ export const AGENT_FUNCTIONS: AgentFunctionMeta[] = [
       "Template.render",
       "Compliance.lint",
     ],
-    inputs: ["CLARIFICATION_READY", "JD_REJECTED"],
+    inputs: ["CLARIFICATION_READY"],
     outputs: ["JD_GENERATED"],
     failureModes: ["LLM JSON schema 不符", "合规拦截"],
   },

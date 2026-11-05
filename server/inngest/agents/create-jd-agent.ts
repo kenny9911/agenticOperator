@@ -1,8 +1,7 @@
 // createJD agent — Workflow node 4.
 //
-// Subscribes REQUIREMENT_LOGGED → 拼一段 prompt → 调 RAAS API
-// /api/v1/generate-jd → 调 /api/v1/jd/sync-generated 持久化 → emit
-// JD_GENERATED 事件供下游 cascade.
+// Subscribes CLARIFICATION_READY → 生成 JD → 在 Partner PG
+// 同一事务写 JobPosting + JD_GENERATED outbox，由 RAAS dispatcher 可靠投递。
 //
 // Workflow A (per agentic-operator-onboarding(3).md, 2026-05-08;
 //   F4 direct-RoboHire migration 2026-05-19):
@@ -10,13 +9,11 @@
 //   ❌ 不再自己组装 partner-canonical 15 字段 payload (RAAS 处理)
 //   ❌ 不再走 RAAS /api/v1/generate-jd 透传 (PR-4 删除)
 //   ✅ 调 robohire-client.generateJdDirect (直连 RoboHire /api/v1/jobs/generate-jd)
-//   ✅ 调 raas-api-client.syncJdGenerated 持久化到 RAAS DB (写 JobPosting +
-//       回填 JobRequisition + 推进 spec.status → pending_publish)
+//   ✅ 直写 Partner PG (JobPosting + JobRequisition enrichment + event_outbox)
 //
-// Inbound:  REQUIREMENT_LOGGED { entity_type, payload: { raw_input_data: {...28} } }
+// Inbound:  CLARIFICATION_READY
 // Outbound: JD_GENERATED       JD content + bookkeeping (cascade only)
 
-import { randomUUID } from 'node:crypto';
 import { NonRetriableError } from 'inngest';
 import { isPartnerPgConfigured } from '@/lib/partner-pg/client';
 import {
@@ -46,16 +43,13 @@ import {
   type RobohireGenerateJdData,
 } from '@/lib/robohire-client';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
-import {
-  reportDependencyDegraded,
-  recordDependencySignal,
-} from '@/lib/dependency-health/report';
+import { reportDependencyDegraded, recordDependencyOk } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import {
   writeJobPostingInstance,
   writeJobRequisitionInstance,
 } from '@/lib/allmeta-writers';
-import { inngest, type JdGeneratedEnvelope } from '@/server/inngest/client';
+import { inngest } from '@/server/inngest/client';
 import { skipIfRaasV1Paused } from '@/server/inngest/raas-v1';
 import { createAgentLogger, runWithLogger } from '@/lib/agent-logger';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
@@ -74,7 +68,13 @@ type RaasRequirementPayload = {
   client_id?: string;
   is_urgent?: boolean;
   requirement_id?: string;
+  job_requisition_id?: string;
   source_channel?: string | null;
+  /**
+   * RAAS ADR-0154 — 用户在需求详情页显式勾选「覆盖已发布岗位」。
+   * 放行 partner-pg 的既有岗位保护闸；覆盖后岗位强制写回未发布态重审。
+   */
+  force_regenerate?: boolean;
   /** Free-text 简报 (新格式优先；如缺则从 raw_input_data 拼). */
   requirement_brief?: string;
   raw_input_data?: {
@@ -106,7 +106,7 @@ type RaasRequirementPayload = {
   };
 };
 
-type RequirementLoggedEnvelope = {
+type ClarificationReadyEnvelope = {
   entity_type?: string;
   entity_id?: string | null;
   event_id?: string;
@@ -128,11 +128,14 @@ export const createJdAgent = inngest.createFunction(
     // bug 无法区分。给瞬时厂商故障 3 次带退避的机会;真·终态(auth/empty/AO 侧
     // bad-request)走 NonRetriableError → 依旧 0 重试、立刻失败,不受影响。
     retries: 3,
-    triggers: [
-      { event: 'REQUIREMENT_LOGGED' },
-      { event: 'CLARIFICATION_READY' },
-      { event: 'JD_REJECTED' },
-    ],
+    idempotency: 'event.data.event_id',
+    concurrency: {
+      key:
+        'has(event.data.payload.job_requisition_id) ? ' +
+        'event.data.payload.job_requisition_id : event.data.entity_id',
+      limit: 1,
+    },
+    triggers: [{ event: 'CLARIFICATION_READY' }],
   },
   async ({ event, step, logger, runId }) => {
     const paused = await skipIfRaasV1Paused(AGENT_ID, logger);
@@ -144,9 +147,11 @@ export const createJdAgent = inngest.createFunction(
       );
     }
 
-    const envelope = (event.data ?? {}) as RequirementLoggedEnvelope;
+    const envelope = (event.data ?? {}) as ClarificationReadyEnvelope;
     const traceId = getTraceId(event.data);
     const requisitionIdCandidate = pickRequisitionIdFromEnvelope(envelope);
+    // ADR-0154 — 只认 payload 里的显式 true；缺省 / 非布尔一律按 false 走原保护闸。
+    const forceRegenerate = envelope.payload?.force_regenerate === true;
     const fileLogger = createAgentLogger({
       agent: 'createJD',
       runId: runId ?? `local-${Date.now()}`,
@@ -160,8 +165,8 @@ export const createJdAgent = inngest.createFunction(
     });
 
     // ── 1. 从事件取 entity_id (= job_requisition_id) ──
-    // 新流程: RAAS 在事件里只放 entity_id，agent 主动调
-    // GET /api/v1/requirements/:id 拉详情。entity_id 缺失时兼容老格式
+    // RAAS 闸门事件可只放 entity_id，agent 直读 Partner PG 拉详情。
+    // entity_id 缺失时兼容旧 payload 形状
     // (payload.raw_input_data.job_requisition_id / payload.requirement_id)。
     const requisitionId = requisitionIdCandidate;
     if (!requisitionId) {
@@ -170,7 +175,13 @@ export const createJdAgent = inngest.createFunction(
         event_name: event.name,
       });
       throw new NonRetriableError(
-        `[${AGENT_NAME}] ${event.name} 缺 entity_id / requisition_id —— 无法调 GET /requirements/:id`,
+        `[${AGENT_NAME}] ${event.name} 缺 entity_id / requisition_id —— 无法读取需求详情`,
+      );
+    }
+    const sourceEventId = pickSourceEventId(envelope, event.id);
+    if (!sourceEventId) {
+      throw new NonRetriableError(
+        `[${AGENT_NAME}] ${event.name} 缺 event_id —— 无法建立 JD_GENERATED 幂等 outbox`,
       );
     }
 
@@ -315,6 +326,7 @@ export const createJdAgent = inngest.createFunction(
       // Silent degrade: 200 OK but no usable JD content.
       const oc = classifyRobohire('generateJd', r);
       if (!oc.ok) await reportDependencyDegraded(oc, depCtx);
+      await recordDependencyOk('robohire', 'generateJd', depCtx);
       logger.info(
         `[${AGENT_NAME}] RoboHire jobs/generate-jd OK · title="${r.data.title ?? '?'}" ` +
           `parse=${r.meta?.stages?.parse} generate=${r.meta?.stages?.generate} ` +
@@ -323,16 +335,21 @@ export const createJdAgent = inngest.createFunction(
       return r;
     });
 
-    const jdData = generated.data;
-    const stages = generated.meta?.stages;
+    // Replay-safe fail-closed boundary: Inngest may return a memoized output for a
+    // generate step completed by an older deployment without executing the callback
+    // above. Re-check outside step.run so a historical partial-stage response can
+    // never cross into the first write or JD_GENERATED emission after an upgrade.
+    const generatedOutcome = classifyRobohire('generateJd', generated);
+    if (!generatedOutcome.ok) {
+      await reportDependencyDegraded(generatedOutcome, depCtx);
+    }
 
-    // ── 4a. 处理 generate-jd 的非致命 stage 退化(Gohire 契约)──
-    // 契约:parse/generate 两个 stage 非致命。parse 失败时 RoboHire 会把「原始
-    // prompt」当 title 回传(整段 4000 字需求文本),直接拿来当 JD 标题不可用 —
-    // generate 仍用原始 prompt 产出了正文。把 title 兜底回需求侧已知岗位名。
+    const jdData = generated.data;
+
+    // generateJdDirect + classifyRobohire 已通过严格 stage 门禁；到这里可知
+    // parse/generate 均严格等于 success。标题缺失时才回退需求侧岗位名。
     jdData.title = resolveJdTitle(
       jdData.title,
-      stages,
       pickStringField(requirement, ['client_job_title', 'sd_org_name']),
     );
 
@@ -372,41 +389,21 @@ export const createJdAgent = inngest.createFunction(
       }
     }
 
-    // 到这里说明内容可用(空内容已在 generate step 里被 classifyRobohire →
-    // reportDependencyDegraded 拦截失败)。若某个 stage 退化但我们抢救出了可用 JD,
-    // 给监控发一条「非致命退化」信号(不失败 run — 契约说 stage 非致命)。
-    const degradedStages = jdStageDegradation(stages);
-    if (degradedStages) {
-      await step.run(`record-jd-stage-degrade-${sanitize(requisitionId)}`, async () => {
-        await recordDependencySignal(
-          {
-            ok: false,
-            provider: 'robohire',
-            op: 'generateJd',
-            reason: 'server',
-            detail: `generate-jd stage 退化(${degradedStages})但已从可用内容抢救出 JD — 未失败 run`,
-          },
-          depCtx,
-        );
-        return { degradedStages, salvaged: true };
-      });
-      logger.warn(
-        `[${AGENT_NAME}] generate-jd stage 退化(${degradedStages})— 已抢救可用 JD 并入库,发退化信号(非致命)`,
-      );
-    }
-
     // ── 4b. 从 RoboHire 自由文本派生结构化技能数组 ──
     // RoboHire generate-jd 不返回 must_have_skills / nice_to_have_skills 数组,
     // 只给散文 hardRequirements / niceToHave。把它们拆成 List<String> 存进
     // Job_Requisition 的 must_have_skills / nice_to_have_skills(下游 matchResume /
-    // ruleCheck 读的就是这两个数组)。已有结构化值优先(upstream 录入更权威),
-    // 为空才用 RoboHire 派生。
-    const mustHaveSkills =
-      arrayOrUndefined(requirement.must_have_skills) ??
-      arrayOrUndefined(proseToSkillArray(jdData.hardRequirements));
-    const niceToHaveSkills =
-      arrayOrUndefined(requirement.nice_to_have_skills) ??
-      arrayOrUndefined(proseToSkillArray(jdData.niceToHave));
+    // ruleCheck 读的就是这两个数组)。
+    const mustHaveSkills = resolveSkillArray(
+      requirement.must_have_skills,
+      proseToSkillArray(jdData.hardRequirements),
+      { forceRegenerate },
+    );
+    const niceToHaveSkills = resolveSkillArray(
+      requirement.nice_to_have_skills,
+      proseToSkillArray(jdData.niceToHave),
+      { forceRegenerate },
+    );
 
     // 派生技能回填进 requirement,allmeta + partner-pg 两边写入都带上。
     const enrichedRequirement: Record<string, unknown> = {
@@ -419,6 +416,7 @@ export const createJdAgent = inngest.createFunction(
     // 让 Rule Check Audit "实时读 Neo4j" 的 :Job_Requisition anchor 能查到.
     // partner 数据库是真相源,Neo4j 镜像 idempotent upsert.
     // (放在 RoboHire 之后:镜像才能带上派生的 must/nice_to_have_skills。)
+    // 这是本流程第一个写操作；只有严格 stage 门禁和内容检查均通过后才可触达。
     await step.run(`write-jr-neo4j-${sanitize(requisitionId)}`, async () => {
       const r = await writeJobRequisitionInstance({ requirement: enrichedRequirement });
       if (r.ok) logger.info(`[${AGENT_NAME}] ✓ allmeta wrote Job_Requisition ${requisitionId}`);
@@ -431,8 +429,13 @@ export const createJdAgent = inngest.createFunction(
     // 实体数据(title / responsibility / requirement / key_words /
     // recruitment_type / work_years 等 Job_Posting impacted_properties)全部
     // 写进 partner Postgres,partner 订阅 JD_GENERATED 后从表里读。
-    // 事件本身只携带 2 个字段(canonical):job_posting_id + jd_content。
-    const syncResult = await step.run(`sync-jd-${sanitize(requisitionId)}`, async () => {
+    // JD_GENERATED outbox 与岗位在同一 Partner PG 事务提交；事务任一步失败
+    // 都不会留下“岗位存在但审核事件永远丢失”的半成品。
+    const jdContent = assembleJdContent(jdData);
+    // v2 is intentional: old in-flight runs may have memoized the pre-outbox
+    // sync-jd step. A new id forces one replay-safe execution that ensures the
+    // durable outbox row exists before this run can finish.
+    const syncResult = await step.run(`sync-jd-outbox-v2-${sanitize(requisitionId)}`, async () => {
       const input: SyncJdInput = {
         job_requisition_id: requisitionId,
         client_id: clientId,
@@ -449,20 +452,78 @@ export const createJdAgent = inngest.createFunction(
         interview_mode: stringOrUndefined(requirement.interview_mode),
         recruitment_type: stringOrUndefined(requirement.recruitment_type),
         city: pickCityFromBoth(requirement, jdData),
+        force_regenerate: forceRegenerate,
+        jd_generated_outbox: {
+          source_event_id: sourceEventId,
+          jd_content: jdContent,
+          source_action: 'createJD',
+          trace: envelope.trace ?? null,
+        },
       };
       const r = await syncJdToPartnerPg(input);
       logger.info(
         `[${AGENT_NAME}] partner-pg syncJdToPartnerPg OK · synced=${r.synced} ` +
           `job_posting_id=${r.job_posting_id}` +
+          (r.regenerated ? ' regenerated=true' : '') +
           (r.reason ? ` reason=${r.reason}` : ''),
       );
       return r;
     });
 
     const jobPostingId = syncResult.job_posting_id;
+    if (syncResult.reason === 'skipped_protected_existing_posting') {
+      // force_regenerate=true 时仍走到这里，只可能是岗位已 closed(ADR-0154 保留
+      // 的唯一硬闸)——日志带上该标记，免得排查时误以为放行没生效。
+      logger.info(
+        `[${AGENT_NAME}] skipped protected existing JobPosting · ` +
+          `job_posting_id=${jobPostingId} requisition=${requisitionId} ` +
+          `force_regenerate=${forceRegenerate}`,
+      );
+      fileLogger.event('handler.skipped', {
+        reason: syncResult.reason,
+        job_posting_id: jobPostingId,
+        job_requisition_id: requisitionId,
+        force_regenerate: forceRegenerate,
+      });
+      return {
+        ok: true,
+        skipped: true,
+        reason: syncResult.reason,
+        job_posting_id: jobPostingId,
+        requisition_id: requisitionId,
+        client_id: clientId,
+        force_regenerate: forceRegenerate,
+      };
+    }
+    if (syncResult.reason === 'replayed_existing_outbox') {
+      logger.info(
+        `[${AGENT_NAME}] source event already has JD_GENERATED outbox · ` +
+          `event_id=${syncResult.jd_generated_event_id ?? '?'} requisition=${requisitionId}`,
+      );
+      fileLogger.event('handler.replayed', {
+        event_id: syncResult.jd_generated_event_id ?? null,
+        job_posting_id: jobPostingId,
+        job_requisition_id: requisitionId,
+      });
+      return {
+        ok: true,
+        replayed: true,
+        reason: syncResult.reason,
+        job_posting_id: jobPostingId,
+        jd_generated_event_id: syncResult.jd_generated_event_id ?? null,
+        requisition_id: requisitionId,
+        client_id: clientId,
+      };
+    }
     if (!jobPostingId) {
       throw new NonRetriableError(
         `[${AGENT_NAME}] partner-pg syncJdToPartnerPg 没返回 job_posting_id (reason=${syncResult.reason ?? '?'})`,
+      );
+    }
+    const jdGeneratedEventId = syncResult.jd_generated_event_id;
+    if (!jdGeneratedEventId) {
+      throw new NonRetriableError(
+        `[${AGENT_NAME}] partner-pg 未返回 JD_GENERATED outbox event_id`,
       );
     }
 
@@ -485,40 +546,14 @@ export const createJdAgent = inngest.createFunction(
       return r;
     });
 
-    // ── 6. emit JD_GENERATED (canonical schema — events_v0_1_002.json)──
-    //
-    // canonical event_data:job_posting_id + jd_content。
-    // partner 便利 FK:job_requisition_id + client_id(对齐 REQUIREMENT_LOGGED
-    // 把 FK 平铺在 payload 顶层的习惯,让订阅者一查就到位)。
-    // 其他实体数据(title/responsibility/requirement/...)由 partner-pg 写入
-    // partner Postgres job_posting 表;partner 订阅事件后从表里读。
-    const outboundEnvelope: JdGeneratedEnvelope = {
-      entity_type: 'Job_Posting',
-      entity_id: jobPostingId,
-      event_id: randomUUID(),
-      source_action: 'createJD',
-      payload: {
-        job_posting_id: jobPostingId,
-        job_requisition_id: requisitionId,
-        client_id: clientId,
-        jd_content: assembleJdContent(jdData),
-      },
-      trace: (envelope.trace as Record<string, unknown> | undefined) ?? {
-        trace_id: null,
-        request_id: null,
-        workflow_id: null,
-        parent_trace_id: null,
-      },
-    };
-
-    fileLogger.event('emit.jd-generated', {
+    // ── 6. JD_GENERATED 已在 Step 5 进入 RAAS durable outbox ──
+    // 只允许 RAAS OutboxDispatcher 发布，AO 不再作为第二个 publisher 直发，
+    // 以免 dispatcher 竞跑造成双投；下游仍按 event_id 做防御性幂等。
+    fileLogger.event('outbox.jd-generated', {
+      event_id: jdGeneratedEventId,
       job_posting_id: jobPostingId,
       job_requisition_id: requisitionId,
       client_id: clientId,
-    });
-    await step.sendEvent(`emit-jd-generated-${sanitize(requisitionId)}`, {
-      name: 'JD_GENERATED',
-      data: outboundEnvelope,
     });
     await notifyRecruitmentLifecycle(step, 'JD_GENERATED', {
       anchors: { job_requisition_id: requisitionId, client_id: clientId },
@@ -527,10 +562,12 @@ export const createJdAgent = inngest.createFunction(
     });
 
     logger.info(
-      `[${AGENT_NAME}] ✅ emitted JD_GENERATED · job_posting_id=${jobPostingId} requisition=${requisitionId}`,
+      `[${AGENT_NAME}] ✅ enqueued JD_GENERATED · event_id=${jdGeneratedEventId} ` +
+        `job_posting_id=${jobPostingId} requisition=${requisitionId}`,
     );
     fileLogger.event('handler.done', {
       job_posting_id: jobPostingId,
+      jd_generated_event_id: jdGeneratedEventId,
       requisition_id: requisitionId,
       robohire_request_id: generated.requestId,
     });
@@ -538,6 +575,7 @@ export const createJdAgent = inngest.createFunction(
     return {
       ok: true,
       job_posting_id: jobPostingId,
+      jd_generated_event_id: jdGeneratedEventId,
       requisition_id: requisitionId,
       client_id: clientId,
       title: typeof jdData.title === 'string' ? jdData.title : null,
@@ -585,21 +623,23 @@ function assembleJdContent(jdData: RobohireGenerateJdData): string {
 // ──────────────────────────────────────────────────────────────────────
 
 /**
- * 从 REQUIREMENT_LOGGED envelope 取 job_requisition_id.
+ * 从 CLARIFICATION_READY envelope 取 job_requisition_id.
  *
  * 优先级:
  *   1. event.data.entity_id  ← Workflow A 标准位置 (RAAS canonical)
- *   2. payload.requirement_id / payload.raw_input_data.job_requisition_id
+ *   2. payload.job_requisition_id
+ *   3. payload.requirement_id / payload.raw_input_data.job_requisition_id
  *      ← 老 envelope 兼容
  */
 function pickRequisitionIdFromEnvelope(
-  envelope: RequirementLoggedEnvelope,
+  envelope: ClarificationReadyEnvelope,
 ): string | null {
   if (typeof envelope.entity_id === 'string' && envelope.entity_id.trim()) {
     return envelope.entity_id.trim();
   }
   const payload = envelope.payload ?? (envelope as unknown as RaasRequirementPayload);
   const cands: Array<unknown> = [
+    payload?.job_requisition_id,
     payload?.requirement_id,
     payload?.raw_input_data?.job_requisition_id,
   ];
@@ -609,17 +649,31 @@ function pickRequisitionIdFromEnvelope(
   return null;
 }
 
+function pickSourceEventId(
+  envelope: ClarificationReadyEnvelope,
+  inngestEventId: unknown,
+): string | null {
+  for (const candidate of [envelope.event_id, inngestEventId]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+
 /**
  * 从 GET /requirements/:id 返回的 requirement + specification 拼一段
  * RoboHire /api/v1/jobs/generate-jd 期望的 free-text prompt (4-4000 chars).
  *
- * F4 spec (2026-05-19): 40+ 字段，重要日期语义校正:
- *   - s.deadline 之前误标 "截止日期" → 应作为 "期望到岗日期" 的 fallback
- *     (primary: r.required_arrival_date)
- *   - s.start_date 之前误标 "期望到岗" → 应作为 "服务开始日期" (HRO contract)
- *   - 新增 "发布日期" = pick(r.client_published_at, r.open_date)
+ * 取舍原则:只拼「候选人该看到、且能改善 JD 正文」的字段。generate-jd 是纯文本
+ * 进 / JD 文本出,响应里没有任何日期或技能数组字段,所以拼进去的东西唯一的去向
+ * 就是候选人可见的 JD 正文。据此排除(2026-08-17):
+ *   - 期望级别        客户自家级别区间,无通用映射,且可反推客户身份
+ *   - 发布日期        纯元数据,易被误读成 deadline
+ *   - 期望到岗日期    内部排期口径
+ *   - 服务开始日期    HRO↔客户合同条款
+ *   - 必备/加分技能   本 agent 自己派生并回写的字段,拼回去构成自反馈回路
+ * 详见各处内联说明。
  */
-function buildPromptFromRequirement(
+export function buildPromptFromRequirement(
   requirement: RaasRequirement,
   specification: RaasRequirementSpecification | null,
   clarifications: RequirementClarificationRecord[] = [],
@@ -674,9 +728,17 @@ function buildPromptFromRequirement(
   push('服务BG', r.service_bg);
   push('需求类型', r.demand_type);
   push('招聘类型', r.recruitment_type);
-  push('期望级别', r.expected_level);
+  // ❌ 期望级别(expected_level)不进 prompt:各客户的级别体系是自家原始区间
+  //    (P7 / 2-2 / T3-2 / M2 …),没有跨客户的通用映射。塞给 Gohire 只会把客户
+  //    内部职级黑话写进候选人可见 JD,而那套黑话本身就是可反推客户身份的强特征
+  //    (规则 4-2 精神)。expected_level 仍照常回写 job_requisition 列(见 §5)。
   if (typeof r.headcount === 'number') push('招聘人数', String(r.headcount));
-  push('工作城市', r.city);
+  // 一条需求可覆盖多个办公城市(RAAS `city_ids`)。这里必须把**全部**城市名拼进去 ——
+  // generate-jd 只吃自由文本 prompt(没有结构化城市参数),所以 JD 正文里能不能出现
+  // 多城市,完全取决于这一行。此前只 push 兼容主城市 `r.city`,多城市需求生成出来的
+  // JD 永远只有一个城市。`city_names` 由 getRequirementDetail 读时解析(见 CITY_NAMES_SQL),
+  // 解析不出来(存量 city_ids=NULL / 字典查不到)时回落主城市,绝不出现 UUID。
+  push('工作城市', resolveCityNames(r).join(' / ') || r.city);
   push('工作地点', formatWorkAddress(r.work_address));
   push('薪资范围', r.salary_range);
   if (typeof r.work_years === 'number') push('工作年限', `${r.work_years} 年以上`);
@@ -718,27 +780,28 @@ function buildPromptFromRequirement(
   push('紧急度', r.urgency_level);
   push('填充难度', r.fill_difficulty);
 
-  // ── 三个日期(F4 关键校正点)──
-  push(
-    '发布日期',
-    formatDate(r.client_published_at) ?? formatDate(r.open_date),
-  );
-  push(
-    '期望到岗日期',
-    formatDate(r.required_arrival_date) ?? formatDate((s as any).deadline),
-  );
-  push('服务开始日期', formatDate((s as any).start_date));
-
+  // ── 日期一律不进 prompt ──
+  // generate-jd 的响应 schema 里没有任何日期字段(RobohireGenerateJdData),日期
+  // 从不被结构化回吐;塞进去唯一可能的后果就是被写进候选人可见的 JD 正文。而这
+  // 三个日期没有一个是候选人该看的:
+  //   · 发布日期(client_published_at / open_date)  纯需求元数据,且易被模型误读成 deadline
+  //   · 期望到岗日期(required_arrival_date / s.deadline) 内部排期口径,仅供内部查看
+  //   · 服务开始日期(s.start_date)                  HRO↔客户的合同服务起始日,商务条款
+  // 三者仍在 job_requisition / specification 表里,内部视图照常读。
   if (s.is_exclusive) push('独家委托', '是');
   push('招聘策略', r.recruitment_strategies);
 
-  // ── 技能 / 排除 / 原始文本 ──
-  if (Array.isArray(r.must_have_skills) && r.must_have_skills.length) {
-    lines.push(`\n必备技能:\n  - ${(r.must_have_skills as string[]).join('\n  - ')}`);
-  }
-  if (Array.isArray(r.nice_to_have_skills) && r.nice_to_have_skills.length) {
-    lines.push(`\n加分技能:\n  - ${(r.nice_to_have_skills as string[]).join('\n  - ')}`);
-  }
+  // ── 排除条件 / 原始文本 ──
+  // ❌ must_have_skills / nice_to_have_skills 不进 prompt —— 这是自反馈回路。
+  //    客户需求侧从不录入这两个字段;job_requisition 上它们的唯一写入者就是本
+  //    agent 自己(§4b 从 Gohire 的 hardRequirements/niceToHave 散文派生 → §5
+  //    UPDATE job_requisition)。所以第 2 次跑(用户在需求详情页点「重新生成岗位」)
+  //    读到的值 100% 是上一轮 Gohire 自己的输出,拼回 prompt 等于把模型的旧输出
+  //    当成客户硬性要求喂回去,逐轮自我强化 / 漂移。
+  //    客户真正录入的技能要求本来就在下面「岗位职责(原始)/任职要求(原始)」里,
+  //    那才是权威输入。
+  //    ⚠️ 若将来 upstream 支持客户直接录入这两个字段,不能简单地把这段加回来 ——
+  //    必须先能区分「客户录入」与「Gohire 派生」两种来源,只拼前者。
   if (typeof r.negative_requirement === 'string' && r.negative_requirement.trim()) {
     lines.push(`\n排除条件: ${r.negative_requirement}`);
   }
@@ -789,15 +852,47 @@ function sanitize(s: string): string {
 }
 
 /**
- * city 取值优先级:
- *   1) requirement.city (raas 已知字段，最权威) — 字符串转 array
- *   2) jdData.location (RoboHire 从 prompt 抽出来的)
- *   3) undefined
+ * 需求的办公城市名数组(保序,首项 = 主城市)。
+ *
+ * `city_names` 由 getRequirementDetail 在 SQL 里 JOIN city_dict 读时解析(见
+ * lib/partner-pg/requirements.ts `CITY_NAMES_SQL`),所以这里拿到的一定是城市**名**,
+ * 不会是 `city_ids` 里的 UUID。存量行(city_ids=NULL)或字典全查不到时为空数组,
+ * 由调用方各自回落兼容主城市 `city`。
+ *
+ * 参数刻意收成 Record —— prompt 构造那边拿到的是 `r`(已 as Record<string, any>),
+ * 两个调用点共用同一份解析,避免口径分叉。
  */
-function pickCityFromBoth(
+export function resolveCityNames(requirement: Record<string, any>): string[] {
+  const raw = requirement?.city_names;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const v of raw) {
+    if (typeof v !== 'string') continue;
+    const name = v.trim();
+    // 去重但保序:同一城市被重复选进 city_ids 时不该在 JD 里出现两次。
+    if (name && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * city 取值优先级:
+ *   1) requirement.city_names (raas 办公城市多选,权威多值) — 保序全量
+ *   2) requirement.city (兼容主城市标量) — 存量行 city_ids=NULL 时的回落
+ *   3) jdData.location (RoboHire 从 prompt 抽出来的)
+ *   4) undefined
+ *
+ * 返回值此前恒为 1 元数组(直接 `[requirement.city]`),是「岗位 JD 只有一个城市」的
+ * 降级点之一。现在多城市需求会返回多项;下游 syncJdToPartnerPg 仍只把首项写进
+ * `job_posting.city` 单列(主城市),但 allmeta 的 Job_Posting.city 是 List<String>,
+ * 从此装的是真多城市。
+ */
+export function pickCityFromBoth(
   requirement: RaasRequirement,
   jdData: RobohireGenerateJdData,
 ): string[] | undefined {
+  const cityNames = resolveCityNames(requirement as unknown as Record<string, any>);
+  if (cityNames.length > 0) return cityNames;
   const reqCity = stringOrUndefined(requirement.city);
   if (reqCity) return [reqCity];
   if (typeof jdData.location === 'string' && jdData.location.trim()) {
@@ -820,41 +915,36 @@ export function proseToSkillArray(s: unknown): string[] {
 }
 
 /**
- * Gohire generate-jd contract: when the PARSE stage fails, the response comes back
- * with `title` set to the raw prompt (the whole ~4000-char requirement blob) —
- * unusable as a JD heading — while the GENERATE stage still produced real body
- * content. Fall back to the requisition's known job title in that case. When parse
- * succeeded (or there's no stage info), keep RoboHire's parsed title; if RoboHire
- * gave us nothing usable, fall back regardless.
+ * 决定 must_have_skills / nice_to_have_skills 最终落库用哪份值。
+ *
+ * `job_requisition` 上这两列的唯一写入者就是本 agent(§4b 派生 → §5 UPDATE),
+ * 客户需求侧从不录入。于是「已有值优先」在重新生成时会把**第一轮**的派生结果永久
+ * 冻结:Gohire 基于新需求产出的新散文写进了 `hard_requirements` 列,数组却还是旧
+ * 的 —— 同一次写入里两份数据自相矛盾,且用户点多少次「重新生成岗位」都改不掉。
+ *
+ * 所以按 force_regenerate(ADR-0154,用户在需求详情页显式勾选)分流:
+ *   - 显式重新生成 → 新派生值优先,派生为空才回退旧值(宁可留旧值也不清空下游依赖)
+ *   - 普通首轮/重放 → 保持既有语义:已有值优先,为空才用派生值
+ * 后者留给「upstream 将来支持客户录入」的可能:那时首轮不会覆盖客户填的值。
  */
-export function resolveJdTitle(
-  rawTitle: unknown,
-  stages: { parse?: string; generate?: string } | undefined,
-  fallbackTitle: string | undefined,
-): string | undefined {
-  // Parse stage failed → RoboHire echoes the raw prompt (a ~4000-char requirement
-  // blob) as `title`, which is unusable as a heading. NEVER keep it: use the
-  // requisition's known job title, else the same placeholder assembleJdContent
-  // falls back to (未命名岗位) — never the blob.
-  if (stages?.parse === 'failed') return fallbackTitle ?? UNTITLED_JD;
-  return typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle : fallbackTitle;
+export function resolveSkillArray(
+  existing: unknown,
+  derived: string[],
+  opts: { forceRegenerate?: boolean } = {},
+): string[] | undefined {
+  const existingArr = arrayOrUndefined(existing);
+  const derivedArr = arrayOrUndefined(derived);
+  return opts.forceRegenerate === true
+    ? (derivedArr ?? existingArr)
+    : (existingArr ?? derivedArr);
 }
 
-/**
- * Which generate-jd stages degraded, as a comma-joined string ('parse',
- * 'generate', or 'parse,generate') — or null when no stage failed / no stage info.
- * Used to emit a NON-fatal dependency-health signal when we salvage a usable-but-
- * degraded JD, so the monitor still sees the vendor degradation even though the run
- * succeeds. Stage status is a health signal here, never a run-failing gate.
- */
-export function jdStageDegradation(
-  stages: { parse?: string; generate?: string } | undefined,
-): string | null {
-  if (!stages) return null;
-  const failed: string[] = [];
-  if (stages.parse === 'failed') failed.push('parse');
-  if (stages.generate === 'failed') failed.push('generate');
-  return failed.length ? failed.join(',') : null;
+/** Keep RoboHire's non-blank title; otherwise use the requisition title. */
+export function resolveJdTitle(
+  rawTitle: unknown,
+  fallbackTitle: string | undefined,
+): string | undefined {
+  return typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle : fallbackTitle;
 }
 
 /**

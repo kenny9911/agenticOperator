@@ -25,8 +25,8 @@
       "applicableClient": "通用",
       "matchFields": ["name", "email"],
       "fuzzyFields": ["name"],
-      "needsHumanReview": false,
-      "standardizedLogicRule": "手机号未命中时,姓名和邮箱同时相同则判定为同一人。",
+      "needsHumanReview": true,
+      "standardizedLogicRule": "手机号未命中时,姓名和邮箱同时相同仅标记疑似重复,必须人工复核,不得自动判定为同一人。",
       "enforcementLevel": "mandatory"
     },
     {
@@ -37,7 +37,7 @@
       "matchFields": ["name", "gender", "school", "major", "degree", "graduationYear"],
       "fuzzyFields": ["name", "school", "major", "degree"],
       "needsHumanReview": true,
-      "standardizedLogicRule": "前两条未命中时,这 6 个字段全部相同则判定为同一人。弱信号,需人工复核。",
+      "standardizedLogicRule": "前两条未命中时,这 6 个字段全部相同仅标记疑似重复。弱信号,需人工复核,不得自动判定为同一人。",
       "enforcementLevel": "mandatory"
     }
   ],

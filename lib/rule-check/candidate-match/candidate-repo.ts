@@ -1,15 +1,16 @@
-// Candidate record sourcing for the identity agent: a mapper from the RESUME_PROCESSED
-// event shape, plus a repo port (injectable) for fetching existing candidates to
+// Candidate record sourcing for the identity audit agent: a mapper from its
+// resume-shaped manual request, plus a repo port for fetching existing candidates to
 // compare against. The partner-pg implementation prefilters cheaply (same email /
 // name / mobile); the heavy fuzzy judgment then runs only over that small candidate set.
 
 import { query, isPartnerPgConfigured } from '@/lib/partner-pg/client';
 import { normalizePhone } from './field-normalize';
+import { resolveCandidateMobile } from '@/lib/phone/normalize-e164';
 import type { CandidateRecord } from './types';
 
-/** Map the RESUME_PROCESSED event into a CandidateRecord. The real producer
- *  (resume-parser-agent) emits the nested candidate/resume objects EMPTY and puts the
- *  parsed RoboHire output under parsed.data (flat: name/phone/email + education[]
+/** Map a CANDIDATE_IDENTITY_REQUESTED payload into a CandidateRecord. The manual
+ *  audit request may reuse the old resume-shaped payload with RoboHire output under
+ *  parsed.data (flat: name/phone/email + education[]
  *  {school,degree,major,endDate}). So we read parsed.data first, then fall back to the
  *  legacy nested shape. Defensive: every field optional; empty event → 'unknown'. */
 export function candidateFromResumeProcessed(ev: Record<string, any>): CandidateRecord {
@@ -17,10 +18,18 @@ export function candidateFromResumeProcessed(ev: Record<string, any>): Candidate
   const c = (ev?.candidate ?? {}) as Record<string, any>;
   const eduP = ((p.education ?? [])[0] ?? {}) as Record<string, any>;
   const eduN = ((ev?.resume?.education_history ?? [])[0] ?? {}) as Record<string, any>;
+  // Resolve every alias together, exactly like Candidate persistence. Picking the
+  // first truthy field could turn conflicting contact data into a false phone match.
+  const phone = resolveCandidateMobile([
+    p.phone,
+    p.mobile,
+    p.phoneNumber,
+    c.mobile,
+  ]).mobile;
   return {
     candidate_id: ev?.candidate_id ?? ev?.upload_id ?? 'unknown',
     name: p.name ?? c.name ?? null,
-    phone: p.phone ?? c.mobile ?? null,
+    phone,
     email: p.email ?? c.email ?? null,
     gender: p.gender ?? c.gender ?? null,
     school: eduP.school ?? eduN.institution ?? eduN.school ?? null,
@@ -56,8 +65,8 @@ export const partnerPgCandidateRepo: CandidateRepo = {
       conds.push(`lower(replace(name,' ','')) = lower(replace($${params.length},' ',''))`);
     }
     if (phone) {
-      params.push(`%${phone}`);
-      conds.push(`regexp_replace(coalesce(mobile,''), '\\D', '', 'g') LIKE $${params.length}`);
+      params.push(phone);
+      conds.push(`mobile_normalized = $${params.length}`);
     }
     if (conds.length === 0) return [];
     params.push(rec.candidate_id);

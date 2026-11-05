@@ -27,9 +27,9 @@ pnpm-workspace.yaml
 *.bak
 *.bak.*
 .claude
+.codex
 .superpowers
 design_handoff_agentic_operator
 neo4j_data
 **/*.pdf
 **/*.html
-

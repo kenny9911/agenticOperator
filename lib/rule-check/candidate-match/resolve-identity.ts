@@ -1,18 +1,16 @@
-// resolveIdentityMatch — shared identity-dedup resolution used by BOTH the
-// candidate-identity rule-check agent AND the resume-parser ingestion seam
-// (so the dedup verdict can drive storage BEFORE save).
+// resolveIdentityMatch — audit-only candidate similarity resolution.
 //
-// Compares the incoming candidate against a pre-filtered comparison pool with the
-// three-tier identity rules (phone → name+email → 6-field). The engine compares
-// per-pair and does NOT return WHICH existing candidate matched, so we capture
-// other.candidate_id here at the hit — the SOLE source of same_as_candidate_id.
+// Compares the incoming candidate against a pre-filtered comparison pool.
+// Only a strong mainland-mobile hit is an authoritative identity match. Name /
+// email / profile similarities may identify a review suspect but never merge or
+// drive Candidate storage.
 
 import { applyIdentityRules, type IdentityMatchResult } from './identity-engine';
 import type { CandidateRecord } from './types';
 import type { IdentityRule } from './rules-data';
 import type { AiFieldJudge } from './field-equivalence';
 
-export type DedupAction = 'auto-merged' | 'pending-review' | 'new-candidate';
+export type DedupAction = 'phone-match' | 'pending-review' | 'no-match';
 
 export interface IdentityResolution {
   result: IdentityMatchResult;
@@ -21,9 +19,6 @@ export interface IdentityResolution {
   matchedCandidateId: string | null;
   matchedCandidateName: string | null;
   dedupAction: DedupAction;
-  /** ONLY set for a strong (auto-merge) match — the candidate_id to file the resume under.
-   *  A weak signal surfaces the suspect for review but must never silently merge. */
-  sameAsCandidateId: string | null;
 }
 
 /** Minimal repo shape — just the comparison-pool fetch (keeps callers decoupled). */
@@ -38,6 +33,47 @@ const NO_MATCH: IdentityMatchResult = {
   ruleOutcomes: [],
 };
 
+function isAuthoritativePhoneMatch(result: IdentityMatchResult): boolean {
+  if (result.matchedRule?.ruleId !== 'IDENTITY-1') return false;
+  const phone = result.matchedRule.fieldResults.find((field) => field.field === 'phone');
+  return Boolean(
+    phone?.equivalent &&
+      phone.method === 'exact' &&
+      phone.valueA &&
+      phone.valueA === phone.valueB,
+  );
+}
+
+function forcePhoneAuthority(result: IdentityMatchResult): IdentityMatchResult {
+  const ruleId = result.matchedRule?.ruleId;
+  return {
+    ...result,
+    samePerson: true,
+    needsHumanReview: false,
+    matchedRule: result.matchedRule
+      ? { ...result.matchedRule, needsHumanReview: false }
+      : null,
+    ruleOutcomes: result.ruleOutcomes.map((outcome) =>
+      outcome.ruleId === ruleId ? { ...outcome, needsHumanReview: false } : outcome,
+    ),
+  };
+}
+
+function forcePendingReview(result: IdentityMatchResult): IdentityMatchResult {
+  const ruleId = result.matchedRule?.ruleId;
+  return {
+    ...result,
+    samePerson: false,
+    needsHumanReview: true,
+    matchedRule: result.matchedRule
+      ? { ...result.matchedRule, needsHumanReview: true }
+      : null,
+    ruleOutcomes: result.ruleOutcomes.map((outcome) =>
+      outcome.ruleId === ruleId ? { ...outcome, needsHumanReview: true } : outcome,
+    ),
+  };
+}
+
 export async function resolveIdentityMatch(
   rec: CandidateRecord,
   repo: ComparisonPool,
@@ -48,28 +84,55 @@ export async function resolveIdentityMatch(
   let result: IdentityMatchResult = NO_MATCH;
   let matchedCandidateId: string | null = null;
   let matchedCandidateName: string | null = null;
+  let reviewMatch:
+    | { result: IdentityMatchResult; candidateId: string; candidateName: string | null }
+    | null = null;
 
   for (const other of pool) {
     const r = await applyIdentityRules(rec, other, rules, judge);
-    if (r.samePerson) {
-      result = r;
-      matchedCandidateId = other.candidate_id;
-      matchedCandidateName = (other.name ?? null) as string | null;
-      break;
+    if (r.matchedRule) {
+      if (isAuthoritativePhoneMatch(r)) {
+        // Phone is the only authoritative signal and therefore wins regardless
+        // of the repository's OR-prefilter row order.
+        result = forcePhoneAuthority(r);
+        matchedCandidateId = other.candidate_id;
+        matchedCandidateName = (other.name ?? null) as string | null;
+        break;
+      }
+      // Keep the first non-phone suspect for review, but continue scanning: a
+      // later row may contain the actual mobile match.
+      reviewMatch ??= {
+        // Rule data is not trusted to grant identity authority: every non-phone
+        // match is review-only even if a custom snapshot sets review=false.
+        result: forcePendingReview(r),
+        candidateId: other.candidate_id,
+        candidateName: (other.name ?? null) as string | null,
+      };
+      continue;
     }
     // keep the richest evaluated outcome for the audit even when no dup
     if (result.ruleOutcomes.length === 0) result = r;
   }
 
-  // auto-merged   = strong match (rule 1/2) → file the resume under the existing candidate.
-  // pending-review = weak match (rule 3, 6-field) → we know the suspect but NEVER auto-merge.
-  // new-candidate  = no match → create a new candidate.
-  const dedupAction: DedupAction = result.samePerson
-    ? result.needsHumanReview
-      ? 'pending-review'
-      : 'auto-merged'
-    : 'new-candidate';
-  const sameAsCandidateId = dedupAction === 'auto-merged' ? matchedCandidateId : null;
+  if (result.matchedRule?.ruleId !== 'IDENTITY-1' && reviewMatch) {
+    result = reviewMatch.result;
+    matchedCandidateId = reviewMatch.candidateId;
+    matchedCandidateName = reviewMatch.candidateName;
+  }
 
-  return { result, poolSize: pool.length, matchedCandidateId, matchedCandidateName, dedupAction, sameAsCandidateId };
+  const phoneMatch = result.samePerson && isAuthoritativePhoneMatch(result);
+  const hasReviewSuspect = result.matchedRule !== null && !phoneMatch;
+  if (hasReviewSuspect) {
+    // Defense in depth for custom rule data: a review-only match can surface a
+    // suspect, but it can never carry same-person authority.
+    result = { ...result, samePerson: false, needsHumanReview: true };
+  }
+
+  const dedupAction: DedupAction = phoneMatch
+    ? 'phone-match'
+    : hasReviewSuspect
+      ? 'pending-review'
+      : 'no-match';
+
+  return { result, poolSize: pool.length, matchedCandidateId, matchedCandidateName, dedupAction };
 }

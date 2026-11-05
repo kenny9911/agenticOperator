@@ -20,12 +20,15 @@
 //
 //   Sink 文件: logs/robohire-YYYY-MM-DD.log   (覆盖 AO_LOG_DIR env)
 //   每行 1 个 JSON: { ts, label, url, method, status, duration_ms, request, response/error }
-//   全字段 in/out — 不 truncate, 不 cherry-pick.
+//   默认记录完整 in/out；parse-resume 因包含候选人身份与简历正文，只记录
+//   格式、字节数、状态、request id 与字段/数组计数。
 
 import { currentLogger, type AgentLogger } from './agent-logger';
 import { logApiCall } from './external-api-log';
+import { prepareResumePdf } from './resume-convert/prepare-resume-pdf';
 
 const DEFAULT_TIMEOUT_MS = 300_000;
+const DEFAULT_EMPLOYMENT_TYPE = 'outsourcing';
 
 /** Shared apiCall wrapper — logs request + response (or error) for every RoboHire op. */
 async function instrumentedFetch<T>(
@@ -37,6 +40,7 @@ async function instrumentedFetch<T>(
   parse: (res: Response) => Promise<T>,
   traceId?: string,
   loggerOverride?: AgentLogger | null,
+  summarizeResponseForLog?: (response: unknown, status: number) => unknown,
 ): Promise<T> {
   // 2026-05-27 — 优先用 agent 显式传入的 fileLogger(闭包,带 run_id,Inngest
   // step.run 内部也稳定);ALS-based currentLogger() 在 step.run 里不可靠.
@@ -83,7 +87,10 @@ async function instrumentedFetch<T>(
       responseBody = null;
     }
   }
-  // 独立 sink — 必落,绕过 ALS,完整 in/out
+  const loggedResponse = summarizeResponseForLog
+    ? summarizeResponseForLog(responseBody, status)
+    : responseBody;
+  // 独立 sink — 必落,绕过 ALS；PII 类响应由调用方先收敛为元数据。
   logApiCall({
     category: 'robohire',
     label,
@@ -95,7 +102,7 @@ async function instrumentedFetch<T>(
     status,
     duration_ms: Date.now() - start,
     request,
-    response: responseBody,
+    response: loggedResponse,
   });
   // Agent logger 兜底(ALS context 在的话同步一份)
   logger?.apiCall(label, {
@@ -104,7 +111,7 @@ async function instrumentedFetch<T>(
     request,
     status,
     durationMs: Date.now() - start,
-    response: responseBody,
+    response: loggedResponse,
   });
   return parse(res);
 }
@@ -172,6 +179,55 @@ function isUnparseableDocMessage(msg: string): boolean {
   );
 }
 
+/**
+ * Resume parsing returns candidate identity and the full extracted resume.
+ * Those values are needed by the caller, but must never be copied into the
+ * durable external-API or per-run audit logs. Keep only operational metadata
+ * and cardinalities; error text is classified instead of echoed because a
+ * vendor message may repeat the uploaded filename or extracted content.
+ */
+function summarizeParseResumeResponseForLog(response: unknown, status: number): unknown {
+  if (response == null || typeof response !== 'object' || Array.isArray(response)) {
+    return {
+      http_status: status,
+      response_kind: response == null ? 'empty' : typeof response,
+    };
+  }
+
+  const body = response as Record<string, unknown>;
+  const data =
+    body.data != null && typeof body.data === 'object' && !Array.isArray(body.data)
+      ? (body.data as Record<string, unknown>)
+      : null;
+  const skills = data?.skills;
+  const skillCount = Array.isArray(skills)
+    ? skills.length
+    : skills != null && typeof skills === 'object'
+      ? Object.values(skills as Record<string, unknown>).reduce<number>(
+          (count, value) => count + (Array.isArray(value) ? value.length : 0),
+          0,
+        )
+      : 0;
+  const error = typeof body.error === 'string' ? body.error : null;
+
+  return {
+    http_status: status,
+    success: body.success === true,
+    cached: typeof body.cached === 'boolean' ? body.cached : null,
+    request_id: typeof body.requestId === 'string' ? body.requestId : null,
+    data_present: data !== null,
+    data_field_count: data ? Object.keys(data).length : 0,
+    experience_count: Array.isArray(data?.experience) ? data.experience.length : 0,
+    education_count: Array.isArray(data?.education) ? data.education.length : 0,
+    skill_count: skillCount,
+    error_category: error
+      ? isUnparseableDocMessage(error)
+        ? 'UNPARSEABLE'
+        : 'VENDOR_ERROR'
+      : null,
+  };
+}
+
 export type CommonOpts = {
   traceId?: string;
   timeoutMs?: number;
@@ -214,13 +270,28 @@ export type RobohireParseResumeResponse = {
 };
 
 export async function parseResumeDirect(
-  pdf: Buffer,
+  document: Buffer,
   filename: string,
   opts: CommonOpts = {},
 ): Promise<RobohireParseResumeResponse> {
   const { baseUrl, apiKey, timeoutMs } = config();
+  const prepared = await prepareResumePdf(document, filename, {
+    traceId: opts.traceId,
+    logger: opts.logger,
+  });
+  opts.logger?.event(prepared.converted ? 'document.converted' : 'document.pdf-verified', {
+    source_format: prepared.sourceFormat,
+    original_bytes: prepared.originalBytes,
+    pdf_bytes: prepared.pdfBytes,
+  });
   const form = new FormData();
-  form.append('file', new Blob([new Uint8Array(pdf)], { type: 'application/pdf' }), filename);
+  form.append(
+    'file',
+    new Blob([new Uint8Array(prepared.pdf)], { type: 'application/pdf' }),
+    // Candidate filenames frequently contain PII. GoHire only needs a stable
+    // PDF name; keep the original name out of both vendor and local logs.
+    'resume.pdf',
+  );
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${apiKey}`,
@@ -229,8 +300,17 @@ export async function parseResumeDirect(
 
   const url = `${baseUrl}/api/v1/parse-resume`;
   // Logged request body is a metadata-only summary (we can't serialize the
-  // multipart form bytes meaningfully; PDF blob would dump base64 noise).
-  const requestSummary = { filename, pdf_bytes: pdf.length, trace_id: opts.traceId ?? null };
+  // multipart form bytes meaningfully; PDF blob would dump base64 noise). Do
+  // not repeat the caller-provided filename here because it often contains
+  // candidate PII and this summary is mirrored into durable audit logs.
+  const requestSummary = {
+    filename: 'resume.pdf',
+    source_format: prepared.sourceFormat,
+    converted: prepared.converted,
+    original_bytes: prepared.originalBytes,
+    pdf_bytes: prepared.pdfBytes,
+    trace_id: opts.traceId ?? null,
+  };
   return instrumentedFetch(
     'RoboHire.parseResume',
     url,
@@ -248,6 +328,7 @@ export async function parseResumeDirect(
     (res) => handleJsonResponse<RobohireParseResumeResponse>(res, 'parse-resume'),
     opts.traceId,
     opts.logger,
+    summarizeParseResumeResponseForLog,
   );
 }
 
@@ -258,6 +339,8 @@ export type RobohireMatchResumeInput = {
   jd: string;
   candidatePreferences?: string;
   jobMetadata?: string;
+  /** Employment model expected by GoHire; defaults to outsourcing. */
+  employmentType?: string;
   /**
    * 匹配分析输出语言 — RoboHire 据此决定 summary / analysis 文本语言。
    * 调用方不显式指定时,matchResumeDirect 统一回填 'zh'(中文)。可传 'en' 等覆盖。
@@ -293,10 +376,13 @@ export async function matchResumeDirect(
   if (opts.traceId) headers['X-Trace-Id'] = opts.traceId;
 
   const url = `${baseUrl}/api/v1/match-resume`;
-  // /api/v1/match-resume 入参统一补 locale,默认 'zh' —— 调用方未显式指定时
-  // 一律按中文输出匹配分析,可经 input.locale 覆盖(如 'en')。在 HTTP 边界单点
-  // 回填,覆盖所有调用方(当前生产链路 matchResumeAgent + 未来新调用方)。(partner-pg 79a6257)
-  const body = { ...input, locale: input.locale ?? 'zh' };
+  // 在 HTTP 边界统一回填 locale='zh' 与 employmentType='outsourcing',覆盖
+  // 当前生产链路 matchResumeAgent、动态工具和未来新调用方；显式入参仍可覆盖。
+  const body = {
+    ...input,
+    employmentType: input.employmentType ?? DEFAULT_EMPLOYMENT_TYPE,
+    locale: input.locale ?? 'zh',
+  };
   return instrumentedFetch(
     'RoboHire.matchResume',
     url,
@@ -325,6 +411,8 @@ export type RobohireGenerateJdInput = {
   language?: 'en' | 'zh' | 'zh-TW' | 'ja' | 'es' | 'fr' | 'pt' | 'de';
   companyName?: string;
   department?: string;
+  /** Employment model expected by GoHire; defaults to outsourcing. */
+  employmentType?: string;
 };
 
 /**
@@ -356,11 +444,28 @@ export type RobohireGenerateJdData = {
   [k: string]: unknown;
 };
 
+export type RobohireGenerateJdStages = {
+  parse?: string;
+  generate?: string;
+};
+
 export type RobohireGenerateJdResponse = {
   data: RobohireGenerateJdData;
-  meta?: { stages?: { parse?: string; generate?: string } };
+  meta?: { stages?: RobohireGenerateJdStages };
   requestId: string;
 };
+
+/**
+ * Fail-closed generate-jd completion gate. Both vendor stages must be present
+ * and strictly equal to the lowercase literal `success` before AO may use the
+ * response. Missing, differently-cased, unknown, skipped, or failed values all
+ * fail the gate.
+ */
+export function generateJdStagesSucceeded(
+  stages: RobohireGenerateJdStages | undefined,
+): stages is { parse: 'success'; generate: 'success' } {
+  return stages?.parse === 'success' && stages?.generate === 'success';
+}
 
 export async function generateJdDirect(
   input: RobohireGenerateJdInput,
@@ -374,16 +479,20 @@ export async function generateJdDirect(
   if (opts.traceId) headers['X-Trace-Id'] = opts.traceId;
 
   const url = `${baseUrl}/api/v1/jobs/generate-jd`;
+  const body = {
+    ...input,
+    employmentType: input.employmentType ?? DEFAULT_EMPLOYMENT_TYPE,
+  };
   const resp = await instrumentedFetch(
     'RoboHire.generateJd',
     url,
     'POST',
-    input,
+    body,
     () =>
       fetch(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(input),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(opts.timeoutMs ?? timeoutMs),
       }).catch((e) => {
         throw new RobohireApiError(0, 'NETWORK', `jobs/generate-jd fetch failed: ${(e as Error).message}`);
@@ -392,17 +501,19 @@ export async function generateJdDirect(
     opts.traceId,
     opts.logger,
   );
-  // Contract-faithful: generate-jd's two internal stages (parse, generate) are
-  // NON-FATAL. A degraded stage still returns a usable response — parse-fail →
-  // generate ran off the raw prompt (real body, raw-prompt title); generate-fail →
-  // parse's structured fields are still returned. The docs say to read
-  // `meta.stages` to see which succeeded, NOT to treat a failed stage as a failed
-  // call. So the transport client returns the response verbatim (stages and all);
-  // whether the *content* is usable is the caller's decision, owned by
-  // classifyRobohire (the single source of truth for "is this payload usable").
-  // Throwing on stage status here would discard a parse-fail-but-generate-ok JD
-  // that is fully usable. handleJsonResponse still rejects transport faults +
-  // envelope `success: false`.
+  // A 200/success envelope is not enough: AO may persist or publish a JD only
+  // after BOTH internal stages report the exact lowercase literal `success`.
+  // Enforce this at the shared client boundary so every caller, including dynamic
+  // tools, fails closed before it can consume a partial/degraded response.
+  if (!generateJdStagesSucceeded(resp.meta?.stages)) {
+    const stages = resp.meta?.stages;
+    throw new RobohireApiError(
+      502,
+      'SERVER',
+      `jobs/generate-jd stage gate failed: parse=${stages?.parse ?? 'missing'} generate=${stages?.generate ?? 'missing'}; both must equal success`,
+      resp.requestId,
+    );
+  }
   return resp;
 }
 
@@ -549,7 +660,12 @@ async function handleJsonResponse<T>(res: Response, op: string): Promise<T> {
       op === 'parse-resume' && typeof body?.error === 'string' && isUnparseableDocMessage(body.error)
         ? 'UNPARSEABLE'
         : statusToCode(res.status);
-    throw new RobohireApiError(res.status, code, errMsg, body?.requestId);
+    throw new RobohireApiError(
+      res.status,
+      code,
+      op === 'parse-resume' ? `parse-resume failed (${code})` : errMsg,
+      body?.requestId,
+    );
   }
 
   if (!body || body.success === false) {
@@ -561,7 +677,9 @@ async function handleJsonResponse<T>(res: Response, op: string): Promise<T> {
     throw new RobohireApiError(
       res.status,
       code,
-      `${op} returned success=false: ${errMsg}`,
+      op === 'parse-resume'
+        ? `parse-resume returned success=false (${code})`
+        : `${op} returned success=false: ${errMsg}`,
       body?.requestId,
     );
   }

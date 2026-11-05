@@ -2,7 +2,7 @@
   {
     "id": "RG-1",
     "name": "parseResume",
-    "description": "简历下载后做去重锁定并经 RoboHire 结构化解析,落库候选人与简历,完成发 RESUME_PROCESSED。",
+    "description": "简历下载后仅按规范中国大陆手机号做候选人存储去重与归属锁定,再经 RoboHire 结构化解析并落库候选人与简历,完成发 RESUME_PROCESSED。缺失、无效、多号码或非大陆手机号不得自动合并。",
     "category": "简历处理",
     "object_type": "action",
     "actor": ["Agent"],
@@ -15,7 +15,7 @@
     "outputs": [{ "name": "resume_id", "type": "String" }],
     "side_effects": { "data_changes": [{ "object_type": "Candidate", "action": "CREATE_OR_MODIFY" }, { "object_type": "Resume", "action": "CREATE" }] },
     "action_steps": [
-      { "name": "lockAndDedup", "description": "三级去重 + 归属锁定;冲突发 RESUME_LOCKED_CONFLICT", "rules": [] },
+      { "name": "lockAndDedup", "description": "仅以规范中国大陆手机号匹配既有 Candidate 并处理归属锁定;缺失、无效、多号码或非大陆手机号一律新建待复核记录,不得使用姓名、邮箱或模糊字段自动合并;归属冲突发 RESUME_LOCKED_CONFLICT", "rules": [] },
       { "name": "downloadAndParse", "description": "MinIO 取件 → RoboHire 解析为结构化字段", "rules": [] },
       { "name": "persist", "description": "落 partner-pg + 镜像 Neo4j,发 RESUME_PROCESSED", "rules": [] }
     ]
@@ -89,7 +89,7 @@
     "category": "JD创建与更新",
     "object_type": "action",
     "actor": ["Agent"],
-    "trigger": ["REQUIREMENT_LOGGED", "CLARIFICATION_READY", "JD_REJECTED"],
+    "trigger": ["CLARIFICATION_READY"],
     "triggered_event": ["JD_GENERATED"],
     "target_objects": ["Job_Requisition", "Job_Posting"],
     "tool_use": ["partnerpg.getRequirement", "robohire.generateJd", "partnerpg.syncJd", "allmeta.writeInstance"],
@@ -105,21 +105,22 @@
   {
     "id": "RG-6",
     "name": "candidateIdentity",
-    "description": "候选人查重:三级去重(精确手机/邮箱 + LLM 模糊姓名/学校/专业),写审计并返回判定,发 CANDIDATE_IDENTITY_CHECKED。",
+    "description": "独立候选人身份审计:仅由 CANDIDATE_IDENTITY_REQUESTED 触发。规范中国大陆手机号是唯一确定身份信号;姓名+邮箱及六字段相似仅标记待人工复核。只写 OntologyRuleCheck 审计并发 CANDIDATE_IDENTITY_CHECKED,不关联、合并或改写 Candidate/Resume。",
     "category": "候选人查重",
     "object_type": "action",
     "actor": ["Agent"],
     "trigger": ["CANDIDATE_IDENTITY_REQUESTED"],
     "triggered_event": ["CANDIDATE_IDENTITY_CHECKED"],
-    "target_objects": ["Candidate"],
+    "target_objects": ["Candidate", "OntologyRuleCheck"],
     "tool_use": ["partnerpg.getParsedResume", "llm.fieldJudge"],
     "system_prompt": "",
     "user_prompt": "",
-    "outputs": [{ "name": "samePerson", "type": "Boolean" }, { "name": "sameAsCandidateId", "type": "String" }],
+    "outputs": [{ "name": "samePerson", "type": "Boolean", "description": "仅规范中国大陆手机号命中时为 true,只表示审计结论。" }, { "name": "needsHumanReview", "type": "Boolean", "description": "姓名+邮箱或六字段相似时为 true。" }, { "name": "matchedCandidateId", "type": "String", "description": "审计比对证据中的候选人编号,不得作为存储关联或合并指令。" }, { "name": "dedupAction", "type": "String", "description": "审计结论类型:phone-match / pending-review / no-match。" }],
     "side_effects": { "data_changes": [{ "object_type": "OntologyRuleCheck", "action": "CREATE" }] },
     "action_steps": [
-      { "name": "exactCompare", "description": "手机/邮箱/性别精确比对", "rules": [{ "id": "9-15" }] },
-      { "name": "fuzzyJudge", "description": "LLM 判定姓名/学校/专业/学历等价", "rules": [] }
+      { "name": "exactCompare", "description": "仅比较规范中国大陆手机号;相同可形成同一人审计结论,但不触发档案关联或合并", "rules": [{ "id": "9-15" }] },
+      { "name": "reviewSignals", "description": "姓名+邮箱或姓名+性别+学校+专业+学历+毕业时间六字段可用 LLM 生成相似性证据,命中只标记 pending-review,不得自动判同", "rules": [{ "id": "9-15" }] },
+      { "name": "persistAudit", "description": "只写 OntologyRuleCheck 审计并发 CANDIDATE_IDENTITY_CHECKED 通知;不写 Candidate/Resume", "rules": [] }
     ]
   }
 ]

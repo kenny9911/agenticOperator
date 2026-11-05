@@ -30,19 +30,20 @@ describe('applyIdentityRules — priority short-circuit', () => {
     expect(r.ruleOutcomes.map((o) => o.ruleId)).toEqual(['IDENTITY-1']);
   });
 
-  it('phone differs but name+email match → rule 2, rule 1 recorded as not matched', async () => {
+  it('phone differs but name+email match → review suspect, never same-person authority', async () => {
     const b: CandidateRecord = { ...base, candidate_id: 'B', phone: '13900139000' };
     const r = await applyIdentityRules(base, b, RULES);
-    expect(r.samePerson).toBe(true);
+    expect(r.samePerson).toBe(false);
+    expect(r.needsHumanReview).toBe(true);
     expect(r.matchedRule?.ruleId).toBe('IDENTITY-2');
     expect(r.ruleOutcomes.map((o) => o.ruleId)).toEqual(['IDENTITY-1', 'IDENTITY-2']);
     expect(r.ruleOutcomes[0].matched).toBe(false);
   });
 
-  it('only rule 3 (6 fields) matches → same person but flagged for human review', async () => {
+  it('only rule 3 (6 fields) matches → review suspect, not same person', async () => {
     const b: CandidateRecord = { ...base, candidate_id: 'B', phone: '13900139000', email: 'other@x.com' };
     const r = await applyIdentityRules(base, b, RULES);
-    expect(r.samePerson).toBe(true);
+    expect(r.samePerson).toBe(false);
     expect(r.matchedRule?.ruleId).toBe('IDENTITY-3');
     expect(r.needsHumanReview).toBe(true);
   });
@@ -73,7 +74,8 @@ describe('applyIdentityRules — AI only for fuzzy fields', () => {
     // phone differs; name surface-differs (needs AI); email exact-equal.
     const b: CandidateRecord = { ...base, candidate_id: 'B', phone: '13900139000', name: 'Zhang San' };
     const r = await applyIdentityRules(base, b, RULES, judge);
-    expect(r.samePerson).toBe(true);
+    expect(r.samePerson).toBe(false);
+    expect(r.needsHumanReview).toBe(true);
     expect(r.matchedRule?.ruleId).toBe('IDENTITY-2');
     // judge consulted for name (fuzzy) — and only for fuzzy fields.
     const judgedFields = judge.mock.calls.map((c) => c[0]);
@@ -93,7 +95,7 @@ describe('applyIdentityRules — AI only for fuzzy fields', () => {
       degree: '学士', // vs 本科
     };
     const r = await applyIdentityRules(base, b, RULES, judge);
-    expect(r.samePerson).toBe(true);
+    expect(r.samePerson).toBe(false);
     expect(r.matchedRule?.ruleId).toBe('IDENTITY-3');
     expect(r.needsHumanReview).toBe(true);
   });

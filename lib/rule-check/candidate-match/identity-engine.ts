@@ -1,7 +1,7 @@
-// Identity engine — given two candidate records, decide "same person?" by applying
-// the identity rules in priority order (rule 1 phone → rule 2 name+email → rule 3 the
-// 6-field set). The first rule whose every field is equivalent wins; a rule marked
-// needsHumanReview (rule 3, the weak signal) routes its match to human review.
+// Identity engine — compare two candidate records in priority order (rule 1 phone →
+// rule 2 name+email → rule 3 the 6-field set). A matched review-only rule records a
+// suspect but never returns samePerson=true. Only a non-review rule can be identity
+// authority (the bundled policy makes that rule 1 / canonical mainland mobile).
 //
 // The rule STRUCTURE comes from data (rules-data.ts). The AI judge is injected and
 // used ONLY for a rule's fuzzyFields, only when the exact path fails — so this engine
@@ -29,7 +29,7 @@ export interface IdentityMatchResult {
   samePerson: boolean;
   /** The first rule that fired (null when no rule matched). */
   matchedRule: IdentityRuleOutcome | null;
-  /** True when the matched rule is a weak signal requiring human confirmation. */
+  /** True when the matched rule is a review-only signal requiring confirmation. */
   needsHumanReview: boolean;
   /** Rules actually evaluated, in priority order (up to + including the match). */
   ruleOutcomes: IdentityRuleOutcome[];
@@ -73,7 +73,7 @@ export async function applyIdentityRules(
 
     if (matched) {
       return {
-        samePerson: true,
+        samePerson: !rule.needsHumanReview,
         matchedRule: outcome,
         needsHumanReview: rule.needsHumanReview,
         ruleOutcomes,

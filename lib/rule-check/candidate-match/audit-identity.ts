@@ -1,9 +1,8 @@
 // auditIdentityResolution — 用「同一份查重结论」落规则检查审计。
 //
-// 架构(2026-06-11):查重判定只在简历解析内部执行一次(落库前,resolveIdentityMatch),
-// 那一份 IdentityResolution 既驱动存储(same_as_candidate_id)、也由本函数写成审计 ——
-// 审计与落库行为出自同一次执行,杜绝「合并后重跑判定 → self 被排除 → 审计报无重复」
-// 的失真。独立的候选人查重智能体默认停用,保留为可选的独立复核器(共用本函数)。
+// Candidate persistence no longer consumes this result. This module records an
+// independent audit: phone matches are deterministic evidence; every other
+// similarity is a review hint and never a same-person storage instruction.
 //
 // 规则抓取/说明生成可以降级，但 authoritative audit 持久化不能 soft-fail：
 // DB 写失败必须抛出，让 Inngest 重试后再继续主流程。
@@ -109,7 +108,6 @@ export async function auditIdentityResolution(
         matchedCandidateId: resolution.matchedCandidateId,
         matchedCandidateName: resolution.matchedCandidateName,
         dedupAction: resolution.dedupAction,
-        sameAsCandidateId: resolution.sameAsCandidateId,
         llmPrompt: rationale.prompt || null,
         llmResponse: rationale.raw || null,
       },

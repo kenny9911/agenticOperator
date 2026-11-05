@@ -6,6 +6,9 @@ const fakeFunction = vi.hoisted(() => (id: string) => ({ opts: { id }, id: () =>
 vi.mock("./agents/create-jd-agent", () => ({
   createJdAgent: fakeFunction("create-jd-agent"),
 }));
+vi.mock("./agents/task-assigner-agent", () => ({
+  taskAssignerAgent: fakeFunction("task-assigner-agent"),
+}));
 vi.mock("./agents/resume-parser-agent", () => ({
   resumeParserAgent: fakeFunction("resume-parser-agent"),
 }));
@@ -25,6 +28,7 @@ vi.mock("./agents/interview-inviter-agent", () => ({
 vi.mock("@/lib/agent-mapping", () => ({
   AGENT_MAP: [
     { short: "DemoA", wsId: "demo-a", triggersEvents: ["DEMO_A"] },
+    { short: "TaskAssigner", wsId: "6", triggersEvents: ["JD_APPROVED"] },
     { short: "Chatbot", wsId: "system-chatbot", triggersEvents: [] },
   ],
 }));
@@ -44,7 +48,7 @@ describe("RAAS-v1 Inngest function registry", () => {
     delete process.env.STUB_RPA_OWNED;
   });
 
-  it("registers exactly the six RAAS-v1 real functions by default", async () => {
+  it("registers exactly the seven RAAS-v1 real functions by default", async () => {
     const mod = await import("./functions");
 
     expect(functionIds(mod.raasV1Functions)).toEqual([...RAAS_V1_FUNCTION_IDS]);
@@ -60,5 +64,12 @@ describe("RAAS-v1 Inngest function registry", () => {
       ...RAAS_V1_FUNCTION_IDS,
       "agent.demoa",
     ]);
+  });
+
+  it("does not register the TaskAssigner stub alongside the real function", async () => {
+    process.env.STUB_AGENTS = "1";
+    const mod = await import("./functions");
+
+    expect(functionIds(mod.allFunctions)).not.toContain("agent.taskassigner");
   });
 });

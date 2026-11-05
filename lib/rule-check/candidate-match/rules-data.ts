@@ -35,7 +35,8 @@ export interface IdentityRule {
   /** Subset of matchFields whose equivalence may fall back to the AI judge when
    *  exact-normalized comparison fails (e.g. 清华 vs 清华大学). */
   fuzzyFields: MatchField[];
-  /** True for weak-signal rules (rule 3) — a match still routes to human review. */
+  /** True for every review-only signal (bundled rule 2 and rule 3). Only canonical
+   *  phone rule 1 is allowed to grant same-person authority. */
   needsHumanReview: boolean;
   standardizedLogicRule: string;
   enforcementLevel: string;

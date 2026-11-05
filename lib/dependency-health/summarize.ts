@@ -14,8 +14,9 @@ export type ProviderSeverity = 'ok' | 'info' | 'warn' | 'critical';
 
 export interface ProviderHealth {
   provider: DepProvider;
-  /** 'healthy' (no failures) | 'watching' (sub-threshold) | judged verdict. */
-  label: DepLabel | 'healthy' | 'watching';
+  /** 'healthy' (no failures) | 'watching' (sub-threshold) | judged verdict |
+   *  'recovered' (healthy again after a dep_down alert was resolved recently). */
+  label: DepLabel | 'healthy' | 'watching' | 'recovered';
   severity: ProviderSeverity;
   /** Count of actual degraded calls in the window (NOT the alarm dedupe count). */
   failureCount: number;

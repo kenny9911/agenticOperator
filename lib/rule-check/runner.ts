@@ -579,7 +579,17 @@ export async function runRuleCheck(
       tools: {
         schema: TOOL_SCHEMA,
         onToolCall: dispatcher,
-        maxIterations: 5,
+        // 5 rounds was too tight for JRs with many relationship rules
+        // (亲属关系 / 合规文档 …): the model legitimately fetches one entity per
+        // round and the whole run was parked as tool-use-loop-exceeded.
+        maxIterations: 8,
+        // Budget spent → force a final tools-disabled answer from what was
+        // already fetched; rules still unresolved become insufficient_info
+        // (→ supplement / human review) instead of failing the whole check.
+        finalizeOnLimit:
+          '工具调用次数已用完,不能再调用任何 tool。请立即基于 INPUT、GRAPH_CONTEXT 与已返回的 tool 结果,' +
+          '按要求输出最终 JSON(rule_results[] 覆盖全部规则)。仍无法确认的规则一律标记 insufficient_info,' +
+          '并在 reason 中说明缺少哪项信息。',
       },
     });
   } catch (err) {

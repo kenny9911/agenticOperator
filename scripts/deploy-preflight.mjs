@@ -24,6 +24,10 @@ function parseEnv(source) {
 
 const fileFlag = process.argv.indexOf("--env-file");
 const envPath = resolve(process.cwd(), fileFlag >= 0 ? process.argv[fileFlag + 1] : ".env.deploy");
+const expectedModeFlag = process.argv.indexOf("--expect-mode");
+const expectedMode = expectedModeFlag >= 0 ? process.argv[expectedModeFlag + 1] : undefined;
+const expectedVolumeFlag = process.argv.indexOf("--expect-volume-mode");
+const expectedVolumeMode = expectedVolumeFlag >= 0 ? process.argv[expectedVolumeFlag + 1] : undefined;
 if (!existsSync(envPath)) {
   console.error(`[deploy-check] ${envPath} does not exist.`);
   console.error("[deploy-check] Copy .env.deploy.example to .env.deploy and replace every placeholder.");
@@ -31,7 +35,10 @@ if (!existsSync(envPath)) {
 }
 
 const fileEnv = parseEnv(readFileSync(envPath, "utf8"));
-const env = { ...fileEnv, ...process.env };
+// Validate exactly the file that deploy-compose.sh will consume. Falling back
+// to, or overriding with, the operator's exported shell environment can make
+// preflight approve one project/volume while Compose operates on another.
+const env = fileEnv;
 const errors = [];
 const warnings = [];
 
@@ -46,6 +53,10 @@ const placeholders = [
 function validValue(name) {
   const value = env[name]?.trim();
   return Boolean(value) && !placeholders.some((marker) => marker.test(value));
+}
+
+function hasValue(name) {
+  return Boolean(env[name]?.trim());
 }
 
 function requireValue(name, reason) {
@@ -76,6 +87,17 @@ for (const [name, reason] of [
   ["ALLMETA_BASE_URL", "Allmeta/Neo4j gateway is required for full functionality"],
   ["ALLMETA_API_KEY", "Allmeta bearer token is required"],
   ["ROBOHIRE_API_KEY", "RoboHire parse/match key is required"],
+  ["DOCUMENT_CONVERTER_URL", "private Gotenberg/LibreOffice origin is required"],
+  ["DOCUMENT_CONVERTER_TIMEOUT_MS", "converter client timeout is required"],
+  ["DOCUMENT_CONVERTER_MAX_INPUT_BYTES", "converter input limit is required"],
+  ["DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES", "converter output limit is required"],
+  ["GOTENBERG_IMAGE", "a pinned LibreOffice converter image is required"],
+  ["GOTENBERG_API_TIMEOUT", "converter server timeout is required"],
+  ["GOTENBERG_API_BODY_LIMIT", "converter multipart body limit is required"],
+  ["GOTENBERG_MAX_QUEUE_SIZE", "bounded LibreOffice queue size is required"],
+  ["GOTENBERG_CPUS", "converter CPU limit is required"],
+  ["GOTENBERG_MEMORY_LIMIT", "converter memory limit is required"],
+  ["GOTENBERG_PIDS_LIMIT", "converter PID limit is required"],
   ["RAAS_POSTGRES_URL", "partner Postgres dual-write URL is required"],
   ["MINIO_ENDPOINT", "resume object-store host is required"],
   ["MINIO_ACCESS_KEY", "MinIO access key is required"],
@@ -109,28 +131,232 @@ if (validValue("AI_API_KEY")) {
 requireUrl("AO_PUBLIC_ORIGIN", ["http:", "https:"]);
 requireUrl("INNGEST_PUBLIC_ORIGIN", ["http:", "https:"]);
 requireUrl("DATABASE_URL", ["postgres:", "postgresql:"]);
+requireUrl("INNGEST_BASE_URL", ["http:", "https:"]);
+requireUrl("INNGEST_SERVE_ORIGIN", ["http:", "https:"]);
 requireUrl("RAAS_POSTGRES_URL", ["postgres:", "postgresql:"]);
 requireUrl("ALLMETA_BASE_URL", ["http:", "https:"]);
 requireUrl("ROBOHIRE_API_BASE_URL", ["http:", "https:"]);
+requireUrl("DOCUMENT_CONVERTER_URL", ["http:", "https:"]);
 if (validValue("AI_BASE_URL")) requireUrl("AI_BASE_URL", ["http:", "https:"]);
 
-// Inngest mode sanity: without the bundled-inngest profile the compose file
-// starts NO event engine, so shared-instance URLs must be configured — a
-// missing COMPOSE_PROFILES otherwise silently drops the inngest service.
+// Deployment mode is an explicit two-state contract. Shared is the production
+// default and must use the overlay; bundled is an isolated-machine opt-in. A
+// half-shared/half-bundled configuration is rejected instead of guessed.
+const deployMode = env.DEPLOY_MODE?.trim();
+const composeProjectName = env.COMPOSE_PROJECT_NAME?.trim();
 const composeProfiles = (env.COMPOSE_PROFILES ?? "")
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
 const bundledInngest = composeProfiles.includes("bundled-inngest");
-if (!bundledInngest && (!validValue("INNGEST_BASE_URL") || !validValue("INNGEST_SERVE_ORIGIN"))) {
+
+if (deployMode !== "shared" && deployMode !== "bundled") {
+  errors.push("DEPLOY_MODE must be exactly 'shared' or 'bundled'");
+}
+if (expectedMode && deployMode !== expectedMode) {
+  errors.push(`DEPLOY_MODE must be '${expectedMode}' for this command; the env file contains '${deployMode ?? ""}'`);
+}
+requireValue("COMPOSE_PROJECT_NAME", "an explicit deployment generation name is required; never rely on the compose default");
+if (validValue("COMPOSE_PROJECT_NAME") && !/^[a-z0-9][a-z0-9_-]*$/.test(composeProjectName)) {
+  errors.push("COMPOSE_PROJECT_NAME must use lowercase letters, digits, underscores or hyphens");
+}
+if (["agentic-operator", "ao-postgres", "steven"].includes(composeProjectName)) {
+  errors.push("COMPOSE_PROJECT_NAME must identify a new deployment generation, not a legacy/default project name");
+}
+
+function parsedUrl(name) {
+  if (!validValue(name)) return null;
+  try {
+    return new URL(env[name]);
+  } catch {
+    return null;
+  }
+}
+
+function requireOriginOnly(name, parsed) {
+  if (!parsed) return;
+  if (parsed.pathname !== "/" || parsed.search || parsed.hash || parsed.username || parsed.password) {
+    errors.push(`${name} must be an origin only (scheme + host + optional port), without path/query/credentials`);
+  }
+}
+
+const inngestBase = parsedUrl("INNGEST_BASE_URL");
+const inngestServe = parsedUrl("INNGEST_SERVE_ORIGIN");
+const documentConverter = parsedUrl("DOCUMENT_CONVERTER_URL");
+requireOriginOnly("INNGEST_BASE_URL", inngestBase);
+requireOriginOnly("INNGEST_SERVE_ORIGIN", inngestServe);
+requireOriginOnly("DOCUMENT_CONVERTER_URL", documentConverter);
+
+if (documentConverter?.origin !== "http://gotenberg:3000") {
   errors.push(
-    "Inngest mode: COMPOSE_PROFILES lacks 'bundled-inngest' and INNGEST_BASE_URL/INNGEST_SERVE_ORIGIN are unset — no event engine would run. Set COMPOSE_PROFILES=bundled-inngest, or configure both shared-instance URLs.",
+    "DOCUMENT_CONVERTER_URL must be exactly http://gotenberg:3000 so resume documents stay on the private Compose network",
   );
 }
-if (bundledInngest && (validValue("INNGEST_BASE_URL") || validValue("INNGEST_SERVE_ORIGIN"))) {
-  warnings.push(
-    "bundled-inngest profile is enabled but INNGEST_BASE_URL/INNGEST_SERVE_ORIGIN overrides are set; the overrides win — confirm this is intended",
+
+const gotenbergImage = env.GOTENBERG_IMAGE?.trim() ?? "";
+if (
+  hasValue("GOTENBERG_IMAGE") &&
+  gotenbergImage !== "gotenberg/gotenberg:8.34.0-libreoffice"
+) {
+  errors.push(
+    "GOTENBERG_IMAGE must be exactly the approved official image gotenberg/gotenberg:8.34.0-libreoffice",
   );
+}
+
+for (const name of [
+  "DOCUMENT_CONVERTER_TIMEOUT_MS",
+  "DOCUMENT_CONVERTER_MAX_INPUT_BYTES",
+  "DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES",
+]) {
+  if (!validValue(name)) continue;
+  const value = Number(env[name]);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    errors.push(`${name} must be a positive integer`);
+  }
+}
+
+function parseDurationMs(value) {
+  const match = /^([1-9]\d*)(ms|s|m)$/.exec(value);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const multiplier = match[2] === "ms" ? 1 : match[2] === "s" ? 1_000 : 60_000;
+  const milliseconds = amount * multiplier;
+  return Number.isSafeInteger(milliseconds) ? milliseconds : null;
+}
+
+function parseByteSize(value) {
+  const match = /^([1-9]\d*)(KB|MB|GB)$/i.exec(value);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const unit = match[2].toUpperCase();
+  const multiplier = unit === "KB" ? 1_000 : unit === "MB" ? 1_000_000 : 1_000_000_000;
+  const bytes = amount * multiplier;
+  return Number.isSafeInteger(bytes) ? bytes : null;
+}
+
+const serverTimeoutMs = validValue("GOTENBERG_API_TIMEOUT")
+  ? parseDurationMs(env.GOTENBERG_API_TIMEOUT.trim())
+  : null;
+if (validValue("GOTENBERG_API_TIMEOUT") && serverTimeoutMs === null) {
+  errors.push("GOTENBERG_API_TIMEOUT must be a positive duration such as 120s");
+}
+const clientTimeoutMs = Number(env.DOCUMENT_CONVERTER_TIMEOUT_MS);
+if (
+  serverTimeoutMs !== null &&
+  Number.isSafeInteger(clientTimeoutMs) &&
+  clientTimeoutMs <= serverTimeoutMs
+) {
+  errors.push("DOCUMENT_CONVERTER_TIMEOUT_MS must be greater than GOTENBERG_API_TIMEOUT");
+}
+
+const bodyLimitBytes = validValue("GOTENBERG_API_BODY_LIMIT")
+  ? parseByteSize(env.GOTENBERG_API_BODY_LIMIT.trim())
+  : null;
+if (validValue("GOTENBERG_API_BODY_LIMIT") && bodyLimitBytes === null) {
+  errors.push("GOTENBERG_API_BODY_LIMIT must be a positive size such as 12MB");
+}
+const maxInputBytes = Number(env.DOCUMENT_CONVERTER_MAX_INPUT_BYTES);
+if (
+  bodyLimitBytes !== null &&
+  Number.isSafeInteger(maxInputBytes) &&
+  bodyLimitBytes <= maxInputBytes
+) {
+  errors.push("GOTENBERG_API_BODY_LIMIT must be greater than DOCUMENT_CONVERTER_MAX_INPUT_BYTES for multipart overhead");
+}
+
+for (const name of ["GOTENBERG_MAX_QUEUE_SIZE", "GOTENBERG_PIDS_LIMIT"]) {
+  if (!validValue(name)) continue;
+  const value = Number(env[name]);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    errors.push(`${name} must be a positive integer; zero/unlimited is rejected`);
+  }
+}
+if (validValue("GOTENBERG_CPUS")) {
+  const cpus = Number(env.GOTENBERG_CPUS);
+  if (!Number.isFinite(cpus) || cpus <= 0) {
+    errors.push("GOTENBERG_CPUS must be a positive number");
+  }
+}
+if (validValue("GOTENBERG_MEMORY_LIMIT") && !/^[1-9]\d*(?:\.\d+)?[KMG]$/i.test(env.GOTENBERG_MEMORY_LIMIT.trim())) {
+  errors.push("GOTENBERG_MEMORY_LIMIT must be a positive Docker size such as 1G");
+}
+
+if (deployMode === "shared") {
+  if (composeProfiles.length > 0) {
+    errors.push("shared mode requires COMPOSE_PROFILES to be empty; bundled-inngest must not be enabled");
+  }
+  requireValue("INNGEST_BASE_URL", "shared Inngest origin is required");
+  requireValue("INNGEST_SERVE_ORIGIN", "shared Inngest callback origin is required");
+  requireValue("RAAS_SHARED_NETWORK", "existing external Docker network is required in shared mode");
+  requireValue("AO_SHARED_NETWORK_ALIAS", "AO callback alias is required in shared mode");
+
+  const alias = env.AO_SHARED_NETWORK_ALIAS?.trim();
+  const network = env.RAAS_SHARED_NETWORK?.trim();
+  if (validValue("AO_SHARED_NETWORK_ALIAS") && !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(alias)) {
+    errors.push("AO_SHARED_NETWORK_ALIAS must be a DNS-safe single label");
+  }
+  if (validValue("RAAS_SHARED_NETWORK") && !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(network)) {
+    errors.push("RAAS_SHARED_NETWORK contains characters Docker network names do not support");
+  }
+  if (inngestBase && ["inngest", "app", alias].includes(inngestBase.hostname)) {
+    errors.push("shared INNGEST_BASE_URL must point to the existing shared engine, not this compose project's inngest/app service");
+  }
+  if (inngestServe && alias && inngestServe.hostname !== alias) {
+    errors.push("shared INNGEST_SERVE_ORIGIN hostname must exactly match AO_SHARED_NETWORK_ALIAS");
+  }
+  if (inngestServe && inngestServe.port !== "3002") {
+    errors.push("shared INNGEST_SERVE_ORIGIN must use AO's container port 3002");
+  }
+}
+
+if (deployMode === "bundled") {
+  if (!bundledInngest || composeProfiles.length !== 1) {
+    errors.push("bundled mode requires COMPOSE_PROFILES=bundled-inngest and no other profile");
+  }
+  if (hasValue("RAAS_SHARED_NETWORK") || hasValue("AO_SHARED_NETWORK_ALIAS")) {
+    errors.push("bundled mode must not carry shared-only RAAS_SHARED_NETWORK/AO_SHARED_NETWORK_ALIAS values");
+  }
+  if (inngestBase?.origin !== "http://inngest:8288") {
+    errors.push("bundled mode requires INNGEST_BASE_URL=http://inngest:8288");
+  }
+  if (inngestServe?.origin !== "http://app:3002") {
+    errors.push("bundled mode requires INNGEST_SERVE_ORIGIN=http://app:3002");
+  }
+}
+
+// PostgreSQL volume choice is likewise explicit. New is the safe default;
+// external means the operator also adds docker-compose.reuse-postgres-volume.yml.
+const volumeMode = env.AO_POSTGRES_VOLUME_MODE?.trim();
+const schemaSync = env.DATABASE_SCHEMA_SYNC?.trim();
+if (volumeMode !== "new" && volumeMode !== "external") {
+  errors.push("AO_POSTGRES_VOLUME_MODE must be exactly 'new' or 'external'");
+}
+if (expectedVolumeMode && volumeMode !== expectedVolumeMode) {
+  errors.push(
+    `AO_POSTGRES_VOLUME_MODE must be '${expectedVolumeMode}' for this command; the env file contains '${volumeMode ?? ""}'`,
+  );
+}
+if (schemaSync !== "0" && schemaSync !== "1") {
+  errors.push("DATABASE_SCHEMA_SYNC must be exactly 0 or 1");
+}
+if (deployMode === "shared" && schemaSync !== "0") {
+  errors.push("shared production mode requires DATABASE_SCHEMA_SYNC=0; apply only the exact reviewed SQL artifact");
+}
+if (schemaSync === "0") {
+  warnings.push("DATABASE_SCHEMA_SYNC=0: schema changes will not run on web startup; generate/review a Prisma SQL diff, apply that exact approved SQL transactionally, then verify an empty diff");
+}
+if (volumeMode === "new" && hasValue("AO_EXISTING_POSTGRES_VOLUME")) {
+  errors.push("AO_EXISTING_POSTGRES_VOLUME is set while AO_POSTGRES_VOLUME_MODE=new; remove it or use the explicit external-volume workflow");
+}
+if (volumeMode === "external") {
+  requireValue("AO_EXISTING_POSTGRES_VOLUME", "exact existing Docker volume name is required for external reuse");
+  const volumeName = env.AO_EXISTING_POSTGRES_VOLUME?.trim();
+  if (validValue("AO_EXISTING_POSTGRES_VOLUME") && !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(volumeName)) {
+    errors.push("AO_EXISTING_POSTGRES_VOLUME contains characters Docker volume names do not support");
+  }
+  if (schemaSync !== "0") {
+    errors.push("external PostgreSQL volume rehearsal requires DATABASE_SCHEMA_SYNC=0; apply only an exact reviewed SQL artifact after backup");
+  }
 }
 
 if (env.INNGEST_EVENT_KEY?.trim().toLowerCase() === "dev") {
@@ -184,4 +410,3 @@ if (errors.length > 0) {
 
 console.log(`[deploy-check] OK: ${envPath}`);
 console.log("[deploy-check] Static configuration is valid; runtime dependency health is checked after startup.");
-

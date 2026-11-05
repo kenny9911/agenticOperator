@@ -24,9 +24,9 @@ const rules = rulesDoc.rules;
 
 // ── 6 live agents, wiring = DEPLOYED code (createFunction triggers + step.sendEvent emits) ──
 const AGENTS = [
-  { agent: 'JDGenerator',      inngestId: 'create-jd-agent',                     actionId: '4',    triggers: ['REQUIREMENT_LOGGED', 'CLARIFICATION_READY', 'JD_REJECTED'], emits: ['JD_GENERATED'] },
+  { agent: 'JDGenerator',      inngestId: 'create-jd-agent',                     actionId: '4',    triggers: ['CLARIFICATION_READY'],                                      emits: ['JD_GENERATED'] },
   { agent: 'ResumeParser',     inngestId: 'resume-parser-agent',                 actionId: '9-1',  triggers: ['RESUME_DOWNLOADED'],                                       emits: ['RESUME_PROCESSED', 'RESUME_LOCKED_CONFLICT'] },
-  { agent: 'CandidateDedup',   inngestId: 'rule-check-candidate-identity-agent', actionId: '10-3', triggers: ['RESUME_PROCESSED'],                                        emits: ['CANDIDATE_IDENTITY_CHECKED'] }, // invoke-based; runs at RESUME_PROCESSED seam
+  { agent: 'CandidateDedup',   inngestId: 'rule-check-candidate-identity-agent', actionId: '10-3', triggers: ['CANDIDATE_IDENTITY_REQUESTED'],                            emits: ['CANDIDATE_IDENTITY_CHECKED'] }, // standalone audit-only review entry
   { agent: 'RuleCheck',        inngestId: 'rule-check-agent',                    actionId: '10-1', triggers: ['RESUME_PROCESSED'],                                        emits: ['MATCH_RULE_CHECK_PASSED', 'MATCH_RULE_CHECK_FAILED'] },
   { agent: 'Matcher',          inngestId: 'match-resume-agent',                  actionId: '10-2', triggers: ['MATCH_RULE_CHECK_PASSED'],                                 emits: ['MATCH_PASSED_NEED_INTERVIEW', 'MATCH_PASSED_NO_INTERVIEW', 'MATCH_FAILED'] },
   { agent: 'InterviewInviter', inngestId: 'interview-inviter-agent',             actionId: '11-1', triggers: ['INTERVIEW_INVITATION_REQUESTED'],                          emits: ['INTERVIEW_INVITATION_SENT', 'INTERVIEW_INVITATION_FAILED'] },
@@ -36,10 +36,11 @@ const WIRING_EVENTS = new Set(AGENTS.flatMap((a) => [...a.triggers, ...a.emits])
 
 // ── action trigger/triggered_event PATCHES — align data → deployed code ──
 const ACTION_PATCHES = {
-  '4':    { trigger: ['REQUIREMENT_LOGGED', 'CLARIFICATION_READY', 'JD_REJECTED'] },            // 补 REQUIREMENT_LOGGED
+  '4':    { trigger: ['CLARIFICATION_READY'] },                                                // 驳回不自动重生成
   '9-1':  { triggered_event: ['RESUME_PROCESSED', 'RESUME_LOCKED_CONFLICT'] },                  // 去掉代码不发的 INFO_MISSING/PARSE_ERROR
+  '10-3': { trigger: ['CANDIDATE_IDENTITY_REQUESTED'], triggered_event: ['CANDIDATE_IDENTITY_CHECKED'] },
   '11-1': { trigger: ['INTERVIEW_INVITATION_REQUESTED'], triggered_event: ['INTERVIEW_INVITATION_SENT', 'INTERVIEW_INVITATION_FAILED'] },
-  // 10-3 保持 RESUME_PROCESSED(invoke-based);10-1/10-2 已与代码一致 → 不 patch
+  // 10-1/10-2 已与代码一致 → 不 patch
 };
 
 // ── 4 live stages exposed by actions_005 ──
@@ -135,7 +136,7 @@ for (const a of AGENTS) {
 md.push('\n### 对齐修正(数据 → 代码)\n');
 for (const p of patched) md.push('- ' + p);
 md.push('\n### 接缝说明\n');
-md.push('- `10-3` 候选人查重是 **invoke-based**:Inngest 形式注册触发是 `CANDIDATE_IDENTITY_REQUESTED`(正常链路不发),实际在 `RESUME_PROCESSED` 这一步被直接 invoke,故本体 trigger 用 `RESUME_PROCESSED` 更忠实。');
+md.push('- `10-3` 候选人查重是 **独立 audit-only 复核入口**：只订阅 `CANDIDATE_IDENTITY_REQUESTED`，正常 `RESUME_PROCESSED` 入库链路不发送、不 invoke，也不消费其结论；它仅落审计并通知 `CANDIDATE_IDENTITY_CHECKED`。');
 md.push('- `11-1` 面试邀约前有一跳外部审批:`MATCH_PASSED_NEED_INTERVIEW`(10-2 产出)→ **RaaS 侧 HSM 审批** → 回发 `INTERVIEW_INVITATION_REQUESTED` → 触发 11-1。`INTERVIEW_INVITATION_REQUESTED` 是外部边界事件(无 AO action 产出)。');
 md.push('- 6 个 agent 的部分输入由非这 6 个的步骤产出(REQUIREMENT_LOGGED/CLARIFICATION_READY/RESUME_DOWNLOADED 等),嵌在更大的 24-action 流水线 + 外部 RaaS 内,非自闭环。\n');
 md.push('## 文件 & 计数\n');
