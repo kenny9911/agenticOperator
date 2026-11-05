@@ -189,6 +189,10 @@ export type MatchResumeCheckResult = {
      *  ='llm-call-error'). Lets the dependency-health classifier tell apart
      *  没钱(quota) / 故障(5xx/timeout) / 说不准(auth). */
     llm_error_detail?: string;
+    /** Every ontology tool call the LLM made (name / args / hit|empty|error|repeat),
+     *  capped. Explains a tool-use-loop-exceeded: which lookups kept coming back
+     *  empty. See lib/rule-check/tool-guard.ts. */
+    llm_tool_trace?: import('./tool-guard').ToolTraceEntry[];
     /** Full user prompt sent to LLM (markdown) — for /rule-check audit UI. */
     user_prompt?: string;
     /** Full LLM raw response text — for /rule-check audit UI Rule Flags / LLM Response tabs. */
