@@ -201,6 +201,57 @@ describe('chatComplete with tools', () => {
     });
   });
 
+  it('does not dispatch malformed tool arguments; reports them back to the model', async () => {
+    createMock
+      .mockResolvedValueOnce({
+        choices: [
+          {
+            finish_reason: 'tool_calls',
+            message: {
+              content: null,
+              tool_calls: [{ id: 'tc_bad', type: 'function', function: { name: 'get_instance', arguments: '{"label":"Cand' } }],
+            },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ choices: [{ message: { content: 'done' } }] });
+    const dispatcher = vi.fn();
+    const out = await chatComplete({
+      system: 'sys',
+      user: 'u',
+      tools: {
+        schema: [{ type: 'function', function: { name: 'get_instance', parameters: { type: 'object', properties: {} } } }],
+        onToolCall: dispatcher,
+      },
+    });
+    expect(out.text).toBe('done');
+    expect(dispatcher).not.toHaveBeenCalled();
+    const toolMsg = createMock.mock.calls[1][0].messages.find((m: { role: string }) => m.role === 'tool');
+    expect(JSON.parse(toolMsg.content).error).toMatch(/not valid JSON/);
+  });
+
+  it('loop-exceeded error names the last finish_reason', async () => {
+    createMock.mockResolvedValue({
+      choices: [
+        {
+          finish_reason: 'tool_calls',
+          message: { content: null, tool_calls: [{ id: 't', type: 'function', function: { name: 'get_instance', arguments: '{}' } }] },
+        },
+      ],
+    });
+    await expect(
+      chatComplete({
+        system: 'sys',
+        user: 'u',
+        tools: {
+          schema: [{ type: 'function', function: { name: 'get_instance', parameters: { type: 'object', properties: {} } } }],
+          onToolCall: vi.fn().mockResolvedValue({}),
+          maxIterations: 1,
+        },
+      }),
+    ).rejects.toThrow(/tool-use loop exceeded 1 iterations.*finish_reason=tool_calls/);
+  });
+
   it('returns text without tool_calls if model emits content first', async () => {
     createMock.mockResolvedValueOnce({
       choices: [{ message: { content: 'no tools needed' } }],

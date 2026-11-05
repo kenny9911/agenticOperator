@@ -189,6 +189,16 @@ export async function chatComplete(opts: {
   // Set once the tool budget is spent and `finalizeOnLimit` asked for one
   // last tools-disabled round.
   let finalizing = false;
+  let invalidArgCalls = 0;
+  // Why the loop gave up — appended to the error so an overrun is diagnosable
+  // (it is neither a timeout nor a max_tokens cut by itself).
+  const loopExceeded = () =>
+    new Error(
+      `tool-use loop exceeded ${maxIterations} iterations without final text` +
+        ` (last finish_reason=${lastFinishReason ?? 'n/a'}` +
+        (invalidArgCalls > 0 ? `, invalid tool args=${invalidArgCalls}` : '') +
+        ')',
+    );
 
   try {
     while (true) {
@@ -245,9 +255,7 @@ export async function chatComplete(opts: {
         // Accept any text it produced alongside; otherwise give up.
         text = (msg?.content ?? '').trim();
         if (text) break;
-        throw new Error(
-          `tool-use loop exceeded ${maxIterations} iterations without final text`,
-        );
+        throw loopExceeded();
       }
 
       // Append the assistant message (with its tool_calls) to history.
@@ -266,9 +274,18 @@ export async function chatComplete(opts: {
         toolCalls.map(async (call) => {
           let parsed: unknown;
           try {
-            parsed = JSON.parse(call.function.arguments);
+            parsed = JSON.parse(call.function.arguments || '{}');
           } catch {
-            parsed = {};
+            // Malformed / truncated arguments (e.g. the response hit max_tokens
+            // mid tool_call). Dispatching `{}` silently just burns another round
+            // on a guaranteed-useless lookup — tell the model instead.
+            invalidArgCalls += 1;
+            return {
+              call,
+              result: {
+                error: 'tool arguments are not valid JSON (possibly truncated); fix them or stop calling tools and answer',
+              },
+            };
           }
           const result = await opts.tools!.onToolCall(call.function.name, parsed);
           return { call, result };
@@ -285,9 +302,7 @@ export async function chatComplete(opts: {
       iterations += 1;
       if (iterations >= maxIterations) {
         if (!opts.tools.finalizeOnLimit) {
-          throw new Error(
-            `tool-use loop exceeded ${maxIterations} iterations without final text`,
-          );
+          throw loopExceeded();
         }
         // Budget spent: one last round with tools disabled so the model
         // answers from what it already fetched instead of failing the run.
