@@ -11,7 +11,7 @@
 // Philosophy: development warns loudly so a fresh clone can still boot; production
 // fails fast when RAAS-v1 runtime dependencies are missing or still set to dev /
 // placeholder values. Required = "without this, the app cannot serve a single
-// useful request"; production-required = "without this, the RAAS-v1 agents
+// useful request"; production-required = "without this, the six RAAS-v1 agents
 // cannot run reliably after deployment".
 
 export type EnvCheckResult = {
@@ -28,7 +28,6 @@ type EnvRequirement = {
   reason: string;
   altOf?: string | readonly string[];
   disallowValues?: readonly string[];
-  allowValues?: readonly string[];
 };
 
 const REQUIRED: readonly EnvRequirement[] = [
@@ -80,10 +79,6 @@ const PRODUCTION_REQUIRED: readonly EnvRequirement[] = [
     reason: "RoboHire parse/match/invite calls fail without it.",
   },
   {
-    name: "DOCUMENT_CONVERTER_URL",
-    reason: "DOC/DOCX resumes must be converted to a validated PDF before RoboHire parsing.",
-  },
-  {
     name: "ALLMETA_BASE_URL",
     reason: "Rule-check and entity enrichment need Allmeta/Neo4j HTTP access.",
   },
@@ -95,27 +90,6 @@ const PRODUCTION_REQUIRED: readonly EnvRequirement[] = [
     name: "AI_API_KEY",
     reason: "LLM gateway key (or OPENAI_API_KEY). JD generation and rule-check LLM steps need it.",
     altOf: "OPENAI_API_KEY",
-  },
-] as const;
-
-const TASK_ASSIGNER_PRODUCTION_REQUIRED: readonly EnvRequirement[] = [
-  {
-    name: "RAAS_API_BASE_URL",
-    altOf: "RAAS_INTERNAL_API_URL",
-    reason: "TaskAssigner shadow/auto mode must read live, scope-filtered dispatch context from RAAS.",
-  },
-  {
-    name: "RAAS_AGENT_API_KEY",
-    altOf: "AGENT_API_KEY",
-    reason: "TaskAssigner uses an authenticated typed RAAS dispatch contract.",
-  },
-] as const;
-
-const TASK_ASSIGNER_AUTO_PRODUCTION_REQUIRED: readonly EnvRequirement[] = [
-  {
-    name: "TASK_ASSIGNER_LEGACY_AUTO_CLAIM_DISABLED",
-    reason: "Auto mode is unsafe until RAAS legacy auto-claim is disabled; set this attestation to 1 only after verification.",
-    allowValues: ["1"],
   },
 ] as const;
 
@@ -148,10 +122,6 @@ const RECOMMENDED: readonly EnvRequirement[] = [
   {
     name: "ROBOHIRE_API_KEY",
     reason: "RoboHire resume parser. /parse-resume + /match-resume fail without it.",
-  },
-  {
-    name: "DOCUMENT_CONVERTER_URL",
-    reason: "Gotenberg/LibreOffice origin. DOC/DOCX parsing fails closed without it.",
   },
 ] as const;
 
@@ -188,9 +158,7 @@ function valuePresent(name: string, r: EnvRequirement): boolean {
   const raw = process.env[name];
   if (!raw || looksPlaceholder(raw)) return false;
   const normalized = raw.trim().toLowerCase();
-  if ((r.disallowValues ?? []).some((v) => normalized === v.toLowerCase())) return false;
-  if (r.allowValues && !r.allowValues.some((v) => normalized === v.toLowerCase())) return false;
-  return true;
+  return !(r.disallowValues ?? []).some((v) => normalized === v.toLowerCase());
 }
 
 function evaluateRequirement(r: EnvRequirement): { name: string; present: boolean; reason: string } {
@@ -201,15 +169,7 @@ function evaluateRequirement(r: EnvRequirement): { name: string; present: boolea
 export function checkEnv(): EnvCheckResult {
   const isProduction = process.env.NODE_ENV === "production";
   const required = REQUIRED.map(evaluateRequirement);
-  const taskAssignerMode = process.env.TASK_ASSIGNER_MODE?.trim().toLowerCase() ?? "";
-  const productionRequirements = [
-    ...PRODUCTION_REQUIRED,
-    ...(["shadow", "auto"].includes(taskAssignerMode)
-      ? TASK_ASSIGNER_PRODUCTION_REQUIRED
-      : []),
-    ...(taskAssignerMode === "auto" ? TASK_ASSIGNER_AUTO_PRODUCTION_REQUIRED : []),
-  ];
-  const productionRequired = productionRequirements.map(evaluateRequirement);
+  const productionRequired = PRODUCTION_REQUIRED.map(evaluateRequirement);
   const recommended = RECOMMENDED.map(evaluateRequirement);
 
   const requiredOk = required.every((r) => r.present);

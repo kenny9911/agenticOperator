@@ -13,7 +13,6 @@ import type { DependencyHealthRow } from './contract';
 const PROVIDERS: ReadonlySet<string> = new Set<DepProvider>(['robohire', 'llm']);
 const LABELS: ReadonlySet<string> = new Set<DepLabel | 'healthy' | 'watching'>([
   'out_of_funds',
-  'fault_warning',
   'fault',
   'unknown',
   'healthy',
@@ -86,49 +85,12 @@ export function parseFiringDepAlert(row: FiringNotificationRow): FiringDepAlert 
   };
 }
 
-/** A recent 故障恢复 message (posted when a dep_down alert was resolved). */
-export interface RecentRecovery {
-  provider: DepProvider;
-  ts: string;
-  notificationId: string;
-}
-
-/** Minimal Notification shape for a 故障恢复 message (matches the prisma select). */
-export interface RecoveryNotificationRow {
-  id: string;
-  ts: Date;
-  anchorsJson: string | null;
-}
-
-/** Reconstruct a RecentRecovery from a 故障恢复 message row, or null. */
-export function parseRecoveryRow(row: RecoveryNotificationRow): RecentRecovery | null {
-  if (!row.anchorsJson) return null;
-  try {
-    const a = JSON.parse(row.anchorsJson) as Record<string, unknown>;
-    const provider = a.dep_recovered;
-    if (typeof provider !== 'string' || !PROVIDERS.has(provider)) return null;
-    return { provider: provider as DepProvider, ts: row.ts.toISOString(), notificationId: row.id };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Build the per-provider rows: window-derived, overridden by any firing alert.
- * A provider with no failures, no firing alert, but a recent 故障恢复 message is
- * shown as 'recovered' (green) so operators see "it was down, now it's back".
- */
+/** Build the per-provider rows: window-derived, overridden by any firing alert. */
 export function buildDependencyHealth(
   failures: DepFailure[],
   firing: FiringDepAlert[],
   t: MonitorThresholds,
-  recoveries: RecentRecovery[] = [],
 ): DependencyHealthRow[] {
-  const latestRecovery = new Map<DepProvider, RecentRecovery>();
-  for (const r of recoveries) {
-    const prev = latestRecovery.get(r.provider);
-    if (!prev || r.ts > prev.ts) latestRecovery.set(r.provider, r);
-  }
   const firstByProvider = new Map<DepProvider, FiringDepAlert>();
   for (const a of firing) {
     if (!firstByProvider.has(a.provider)) firstByProvider.set(a.provider, a);
@@ -136,13 +98,7 @@ export function buildDependencyHealth(
 
   return summarizeDependencyHealth(failures, t).map((base) => {
     const alert = firstByProvider.get(base.provider);
-    if (!alert) {
-      const rec = latestRecovery.get(base.provider);
-      if (rec && base.label === 'healthy') {
-        return { ...base, label: 'recovered' as const, severity: 'ok' as const, sinceTs: rec.ts, notificationId: rec.notificationId };
-      }
-      return { ...base, notificationId: null };
-    }
+    if (!alert) return { ...base, notificationId: null };
     // Firing alert wins the headline (label/severity) and owns "since" (when the
     // alarm started). The failure COUNT and last-failure time stay window-derived
     // so "N 次失败" means actual degraded calls, not how many sweeps re-fired.

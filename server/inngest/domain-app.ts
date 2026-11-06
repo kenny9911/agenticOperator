@@ -95,8 +95,9 @@ function makeShellFunction(
       // chain is isolated from production (which uses bare event names) AND
       // matches the namespaced entry events deploy.ts fireAndObserve sends.
       // Without namespacing the shell listens on a bare name nobody in this
-      // domain fires → runs:[] (the observe gap). Multi-trigger support keeps
-      // generated-domain agents reachable from every event declared by their spec.
+      // domain fires → runs:[] (the observe gap). Multi-trigger so an agent that
+      // consumes several events (e.g. jdGenerator on REQUIREMENT_LOGGED |
+      // CLARIFICATION_READY) is reachable from any of them.
       triggers: events.triggers.map((e) => ({ event: `${domain}/${e}` })),
     },
     async ({ event, step }: { event: { id?: string; name: string; data?: unknown }; step: any }) => {

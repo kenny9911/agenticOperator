@@ -10,19 +10,19 @@ import {
 } from './field-normalize';
 
 describe('normalizePhone', () => {
-  it('normalizes mainland +86/0086 variants to the same 11 digits', () => {
+  it('strips non-digits and takes the last 11 for 11+ digit numbers', () => {
     expect(normalizePhone('+86 138 0013 8000')).toBe('13800138000');
-    expect(normalizePhone('0086-13800138000')).toBe('13800138000');
+    expect(normalizePhone('086-13800138000')).toBe('13800138000');
   });
-  it('rejects malformed, short and placeholder values', () => {
-    expect(normalizePhone('086-13800138000')).toBe('');
-    expect(normalizePhone('1234567')).toBe('');
+  it('keeps short digit strings as-is (>=7), drops too-short', () => {
+    expect(normalizePhone('1234567')).toBe('1234567');
     expect(normalizePhone('12')).toBe('');
-    expect(normalizePhone('13800138888')).toBe('');
     expect(normalizePhone(null)).toBe('');
   });
-  it('international numbers never become identity keys', () => {
-    expect(normalizePhone('+65 9123 4567')).toBe('');
+  it('international number → correct national number, not last-11-of-raw (anti 假并/假拆)', () => {
+    // Old China-only heuristic returned '6591234567' (wrongly kept the +65 country
+    // code in the suffix key); the shared normalizer gives the true national number.
+    expect(normalizePhone('+65 9123 4567')).toBe('91234567');
   });
 });
 

@@ -15,10 +15,6 @@ import {
   type RuntimeConfigSaveTarget,
   type RuntimeConfigState,
 } from '@/server/ops/runtime-config';
-import {
-  getSystemConfigWritePolicy,
-  type SystemConfigWritePolicy,
-} from '@/server/ops/system-config-access';
 import { closeDriver as closeNeo4jDriver } from '@/server/em/clients/neo4j';
 
 export const dynamic = 'force-dynamic';
@@ -49,7 +45,6 @@ export type SystemConfigResponse = {
     apiHealthy: boolean | null;
   };
   runtimeConfig: RuntimeConfigState;
-  writePolicy: SystemConfigWritePolicy;
   generatedAt: string;
 };
 
@@ -170,7 +165,6 @@ async function buildResponse(): Promise<SystemConfigResponse> {
       apiHealthy: null,
     },
     runtimeConfig: await getRuntimeConfigState(),
-    writePolicy: getSystemConfigWritePolicy(),
     generatedAt: new Date().toISOString(),
   };
 }
@@ -181,14 +175,6 @@ export async function GET(): Promise<Response> {
 }
 
 export async function PATCH(req: Request): Promise<Response> {
-  const writePolicy = getSystemConfigWritePolicy();
-  if (!writePolicy.enabled) {
-    return NextResponse.json<SystemConfigUpdateResponse>(
-      { ok: false, error: 'SYSTEM_CONFIG_WRITE_DISABLED' },
-      { status: 403 },
-    );
-  }
-
   let values: unknown;
   let target: RuntimeConfigSaveTarget | undefined;
   try {

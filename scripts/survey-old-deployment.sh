@@ -62,34 +62,12 @@ else
 fi
 
 echo ""
-echo "===== 5. AO PostgreSQL 事实（决定新卷恢复还是外部卷复用）====="
-PG_CONTAINERS=$(docker ps -a --format '{{.Names}}' | grep -E '^ao-postgres$|^ao-.*-ao-postgres-[0-9]+$|^agentic.*ao-postgres' || true)
-if [ -z "$PG_CONTAINERS" ]; then
-  echo "没找到 AO PostgreSQL 容器；不要按 compose 文件名猜 volume，先人工定位。"
-else
-  for c in $PG_CONTAINERS; do
-    echo "-- $c --"
-    docker inspect "$c" --format '镜像 tag: {{.Config.Image}} · image id: {{.Image}} · 状态: {{.State.Status}}'
-    docker inspect "$c" --format '{{range .Mounts}}volume={{.Name}} · source={{.Source}} · target={{.Destination}}{{"\n"}}{{end}}'
-    docker exec "$c" sh -c '
-      echo -n "PG_VERSION 文件: "; cat "${PGDATA:-/var/lib/postgresql/data}/PG_VERSION" 2>/dev/null || echo unknown
-      psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
-        "select current_user || '\'' | db='\'' || current_database(); show server_version; show data_directory;" \
-        2>/dev/null || echo "数据库未运行或当前 POSTGRES_USER/POSTGRES_DB 与已初始化集群不一致"
-    ' 2>/dev/null || echo "容器未运行，无法查询 server_version；先保留 volume，勿启动第二个 Postgres 试挂。"
-  done
-fi
-if docker volume inspect ao-postgres_ao-pgdata >/dev/null 2>&1; then
-  echo "Steven 默认物理卷 ao-postgres_ao-pgdata 存在（仍以容器 Mounts 输出为准）。"
-fi
+echo "===== 5. 关键端口占用 ====="
+lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | awk 'NR==1 || /:(3002|3003|8288|8289|5433|5435|9000|9003|3500|4500|7474|7475|7687|7688)\>/' \
+  || netstat -an 2>/dev/null | grep LISTEN | grep -E '(3002|8288|8289|5433|5435|9000|3500)'
 
 echo ""
-echo "===== 6. 关键端口占用 ====="
-lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | awk 'NR==1 || /:(3002|3003|8288|8289|5433|5434|5435|5436|9000|9003|3500|4500|7474|7475|7687|7688)\>/' \
-  || netstat -an 2>/dev/null | grep LISTEN | grep -E '(3002|8288|8289|5433|5434|5435|5436|9000|3500)'
-
-echo ""
-echo "===== 7. 外部依赖连通性（从这台机器测）====="
+echo "===== 6. 外部依赖连通性（从这台机器测）====="
 probe_http() {
   local code
   code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 6 --max-time 12 "$2" 2>/dev/null || true)
@@ -109,12 +87,12 @@ probe_http "GitHub(参考)   " "https://github.com"
 probe_http "DockerHub(参考)" "https://registry-1.docker.io/v2/"
 
 echo ""
-echo "===== 8. 磁盘与 Docker 资源 ====="
+echo "===== 7. 磁盘与 Docker 资源 ====="
 df -h / | tail -1
 docker system df 2>/dev/null
 
 echo ""
-echo "===== 9. Docker volumes ====="
+echo "===== 8. Docker volumes ====="
 docker volume ls --format '{{.Name}}' | head -40
 
 echo ""

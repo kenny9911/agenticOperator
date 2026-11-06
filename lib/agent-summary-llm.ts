@@ -126,7 +126,7 @@ const STATIC: Record<string, string> = {
   'agentic-operator-main-resume-parser-agent':
     'ResumeParser 在收到 RESUME_DOWNLOADED 事件后:从 MinIO 拉简历 PDF → 调 RAAS /parse-resume 解析 → 调 RAAS /candidates 持久化 → 发出 RESUME_PROCESSED 触发下游 Matcher。每份简历约 200-500ms。',
   'agentic-operator-main-create-jd-agent':
-    'CreateJD 仅在 CLARIFICATION_READY 后运行:直连 RoboHire 生成 JD → 同一 Partner PG 事务写 JobPosting 与 JD_GENERATED outbox → 由 RAAS dispatcher 可靠投递审核待办与通知；JD_REJECTED 不会自动重生成。',
+    'CreateJD 在收到 REQUIREMENT_LOGGED 事件后:调 RAAS /generate-jd 用 LLM 生成 JD 文本 → 投影成 partner-canonical 形状 → 调 RAAS /jd/sync-generated 持久化 → 发出 JD_GENERATED 通知。也接 CLARIFICATION_READY / JD_REJECTED 做 refine。',
   'agentic-operator-main-match-resume-agent':
     'Matcher 在 RESUME_PROCESSED 后:从 parsed.data 拍平成 resume text → 拉相关 JR(单个或全部 recruiting)→ 对每个 JR 调 RAAS /match-resume 打分 → 写回 /match-results → 发 MATCH_PASSED_NEED_INTERVIEW 或 MATCH_FAILED。',
 };
@@ -146,16 +146,15 @@ export const KNOWN_DESCRIPTIONS: Record<string, string> = {
     'legacy 路径:事件 payload 直接带 parsed.data 时跳过 step 2-3',
   ].join('\n'),
   'agentic-operator-main-create-jd-agent': [
-    '功能职责:JD 自动生成。仅当需求澄清完成(CLARIFICATION_READY)时触发；REQUIREMENT_LOGGED 与 JD_REJECTED 都不直接放行。',
+    '功能职责:JD 自动生成。当 RAAS 提交一条新的招聘需求(REQUIREMENT_LOGGED),或澄清完成(CLARIFICATION_READY),或被 reviewer 驳回(JD_REJECTED)时触发。',
     '关键 step:',
     '  1) check-pause',
-    '  2) 直读 Partner PG 拉最新需求、规格与澄清记录',
-    '  3) 直连 RoboHire /api/v1/jobs/generate-jd 生成 JD 草稿，parse/generate 双阶段 fail-closed',
+    '  2) 从 RAAS GET /api/v1/requirements/{id} 拉 raw_input_data',
+    '  3) 调 RAAS POST /api/v1/generate-jd(透传 RoboHire LLM)生成 JD 草稿',
     '  4) 投影成 partner-canonical 形状(title / posting_description / hard_requirements / nice_to_have ...)',
-    '  5) 同一 Partner PG 事务写 JobPosting + JD_GENERATED event_outbox',
-    '  6) RAAS OutboxDispatcher 可靠投递 JD_GENERATED，AO 不重复直发',
-    '幂等:上游 event_id 绑定 outbox 幂等键；同 JR 由 Inngest concurrency + PG advisory lock 串行化',
-    '常见失败:RoboHire timeout / Partner PG 不可用 / prompt 不合规',
+    '  5) 调 RAAS POST /api/v1/jd/sync-generated 持久化',
+    '  6) emit JD_GENERATED 通知下游 reviewer / publisher',
+    '常见失败:LLM gateway timeout / RAAS 4xx / prompt 不合规',
   ].join('\n'),
   'agentic-operator-main-match-resume-agent': [
     '功能职责:候选人 - JR 匹配打分。当 ResumeParser 发出 RESUME_PROCESSED 后触发。',

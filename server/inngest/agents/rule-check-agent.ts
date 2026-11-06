@@ -31,14 +31,11 @@ import { isInfraFailure, friendlyInfraReason } from '@/lib/rule-check/infra-fail
 import { recordNotification } from '@/server/notifications/ingest';
 import { resolveAlertsByPrefix } from '@/server/notifications/resolve';
 import { classifyLlm } from '@/lib/dependency-health/classify';
-import { recordDependencySignal, recordDependencyOk } from '@/lib/dependency-health/report';
+import { recordDependencySignal } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
 import { isPartnerPgConfigured } from '@/lib/partner-pg/client';
-import {
-  getRequirementDetail,
-  getRequirementDetailByJobPostingId,
-} from '@/lib/partner-pg/requirements';
+import { getRequirementDetail } from '@/lib/partner-pg/requirements';
 import { getRequirementsAgentView } from '@/lib/partner-pg/agent-view';
 import { getRecruitingJobsAsRequirements } from '@/lib/partner-pg/recruiting-jobs';
 import { getParsedResume } from '@/lib/partner-pg/parsed-resume';
@@ -64,7 +61,6 @@ import {
 } from '@/lib/allmeta-writers';
 import { createAgentLogger, runWithLogger } from '@/lib/agent-logger';
 import { skipIfRaasV1Paused } from '@/server/inngest/raas-v1';
-import { parseResumeProcessingContract } from '@/lib/raas-v1/resume-processing-contract';
 
 const AGENT_ID = 'rule-check-agent';
 const AGENT_NAME = 'ruleCheck';
@@ -85,23 +81,10 @@ export async function ruleCheckAgentHandler({
   runId?: string;
 }) {
   const data = unwrapResumeProcessedEvent(event.data);
-  let processingContract;
-  try {
-    processingContract = parseResumeProcessingContract(data);
-  } catch (error) {
-    throw new NonRetriableError(
-      `[resume-processing-contract] invalid RESUME_PROCESSED: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-  }
   const traceId = getTraceId(event.data);
   const uploadId = pickUploadId(data);
   const candidateId = pickCandidateId(data);
-  const employeeId = pickEmployeeId(data, processingContract?.processing_mode);
-  const operatorId = pickOperatorId(data);
-  const processingContractData =
-    processingContract ?? (operatorId ? { operator_id: operatorId } : {});
+  const employeeId = pickEmployeeId(data);
   const resumeId = typeof data.resume_id === 'string' ? data.resume_id : '';
   const parentAuditId = pickParentAuditId(data);
   // 透传候选人求职期望(resumeParser 抽出)→ matchResume 拼 candidatePreferences。
@@ -157,10 +140,6 @@ export async function ruleCheckAgentHandler({
     typeof data.job_requisition_id === 'string' && data.job_requisition_id.trim().length > 0
       ? data.job_requisition_id.trim()
       : null;
-  const linkedJobPostingId =
-    typeof data.job_posting_id === 'string' && data.job_posting_id.trim().length > 0
-      ? data.job_posting_id.trim()
-      : null;
 
   // ADR-0040 — RAAS Nextcloud 路径预填的窄化 JR 数组(单数 job_requisition_id 为空时
   // 才有意义)。已在 RAAS 侧按「文件名岗位名 × 招聘员名下在招岗位」模糊匹配收敛,
@@ -186,23 +165,6 @@ export async function ruleCheckAgentHandler({
       };
       if (!hasMatchableContent(merged)) {
         logger.warn(`[${AGENT_NAME}] linked JR ${linkedJrId} 内容空,跳过`);
-        return [];
-      }
-      return [merged];
-    }
-    if (linkedJobPostingId) {
-      const detail = await getRequirementDetailByJobPostingId(linkedJobPostingId);
-      if (!detail) {
-        throw new NonRetriableError(
-          `[${AGENT_NAME}] partner Postgres: job_posting ${linkedJobPostingId} 不存在`,
-        );
-      }
-      const merged: RequirementsAgentViewItem = {
-        ...(detail.specification ?? {}),
-        ...detail,
-      };
-      if (!hasMatchableContent(merged)) {
-        logger.warn(`[${AGENT_NAME}] linked JP ${linkedJobPostingId} 对应 JR 内容空,跳过`);
         return [];
       }
       return [merged];
@@ -289,7 +251,7 @@ export async function ruleCheckAgentHandler({
       employee_id: employeeId,
       requested_count: 0,
       reason:
-        linkedJrId === null && linkedJobPostingId === null && linkedJrIds.length === 0
+        linkedJrId === null && linkedJrIds.length === 0
           ? 'no-published-jr-claimed-by-recruiter'
           : 'no-matchable-requirements',
     };
@@ -408,11 +370,9 @@ export async function ruleCheckAgentHandler({
         fail_reason: 'bypassed',
       };
       const bypassPayload: MatchRuleCheckPassedData = {
-        ...processingContractData,
         candidate_id: candidateId ?? null,
         resume_id: resumeId || null,
         job_requisition_id: jrid,
-        job_posting_id: pickJobPostingId(req) ?? linkedJobPostingId,
         client_id: clientId,
         rule_check_result: '通过',
         rule_check_reason: '',
@@ -476,22 +436,6 @@ export async function ruleCheckAgentHandler({
       // the LLM — and on retry exhaustion park the run for replay. It runs BEFORE
       // the audit / Neo4j CMR / partner-pg writes + emit below, so an infra outage
       // never writes 未通过 to the partner main table or emits MATCH_RULE_CHECK_FAILED.
-      // LLM gateway answered (any non-gateway outcome with a measured LLM call)
-      // → recovery heartbeat, so an AI 网关 故障预警/故障 clears on the fleet card
-      // as soon as calls succeed again.
-      if (
-        r.audit.fail_reason !== 'llm-call-error' &&
-        r.audit.fail_reason !== 'gateway-unavailable' &&
-        (r.audit.llm_duration_ms ?? 0) > 0
-      ) {
-        await recordDependencyOk('llm', 'ruleCheck', {
-          agent: 'RuleCheck',
-          runId: runId ?? null,
-          traceId: traceId ?? null,
-          domain: RECRUITMENT_DOMAIN_ID,
-        });
-      }
-
       if (r.decision === 'FAIL' && isInfraFailure(r.audit.fail_reason)) {
         const reason = r.audit.fail_reason;
         logger.error(
@@ -802,11 +746,9 @@ export async function ruleCheckAgentHandler({
     // 只剩 PASS / FAIL 两态。PASS → rule_check_result='通过',直接进 MATCH_RULE_CHECK_PASSED。
     if (result.decision !== 'FAIL') {
       const payload: MatchRuleCheckPassedData = {
-        ...processingContractData,
         candidate_id: candidateId ?? null,
         resume_id: resumeId || null,
         job_requisition_id: jrid,
-        job_posting_id: pickJobPostingId(req) ?? linkedJobPostingId,
         client_id: clientId,
         rule_check_result: '通过',
         rule_check_reason: '',
@@ -890,11 +832,9 @@ export async function ruleCheckAgentHandler({
       }
 
       const failedPayload: MatchRuleCheckFailedData = {
-        ...processingContractData,
         candidate_id: candidateId || null,
         resume_id: resumeId || null,
         job_requisition_id: jrid,
-        job_posting_id: pickJobPostingId(req) ?? linkedJobPostingId,
         client_id: clientId,
         rule_check_result: '未通过',
         rule_check_reason: failureReason,
@@ -1007,16 +947,7 @@ function pickJobRequisitionIds(data: any): string[] {
   return out;
 }
 
-function pickOperatorId(data: any): string | null {
-  return typeof data?.operator_id === 'string' && data.operator_id.trim()
-    ? data.operator_id.trim()
-    : null;
-}
-
-function pickEmployeeId(data: any, processingMode?: unknown): string | null {
-  if (processingMode === 'rmhr_deferred') {
-    return pickOperatorId(data);
-  }
+function pickEmployeeId(data: any): string | null {
   for (const c of [
     data.claimer_employee_id,
     data.employee_id,
@@ -1024,13 +955,6 @@ function pickEmployeeId(data: any, processingMode?: unknown): string | null {
     data.operator_id,
     process.env.RAAS_DEFAULT_EMPLOYEE_ID,
   ]) {
-    if (typeof c === 'string' && c.trim()) return c.trim();
-  }
-  return null;
-}
-
-function pickJobPostingId(req: RequirementsAgentViewItem): string | null {
-  for (const c of [(req as any).job_posting_id, (req as any).jobPostingId]) {
     if (typeof c === 'string' && c.trim()) return c.trim();
   }
   return null;

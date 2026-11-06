@@ -208,7 +208,7 @@ function EventRow({
   const isAoEmit = event.name.startsWith('RESUME_PROCESSED') ||
     event.name.startsWith('MATCH_') ||
     event.name.startsWith('JD_GENERATED');
-  const isInbound = event.name === 'RESUME_DOWNLOADED' || event.name === 'REQUIREMENT_LOGGED' || event.name === 'CLARIFICATION_READY';
+  const isInbound = event.name === 'RESUME_DOWNLOADED' || event.name === 'REQUIREMENT_LOGGED' || event.name === 'CLARIFICATION_READY' || event.name === 'JD_REJECTED';
   const isMeta = event.name.startsWith('inngest/');
 
   const dirColor = isMeta

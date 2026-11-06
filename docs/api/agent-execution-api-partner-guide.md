@@ -145,7 +145,7 @@ RESUME_PROCESSED ────────────────┬────
                               (壳)AI 面试 → 评估 → 简历优化 → 推荐包 → 提交客户系统
                                   (AI_INTERVIEW_COMPLETED → EVALUATION_* → … → APPLICATION_SUBMITTED)
 
-JD 支线(真):CLARIFICATION_READY
+JD 支线(真):REQUIREMENT_LOGGED / CLARIFICATION_READY / JD_REJECTED
               ► [真] JDGenerator(RoboHire 生成 JD)► JD_GENERATED;其余 JD 环节为壳
 ```
 
@@ -160,9 +160,7 @@ JD 支线(真):CLARIFICATION_READY
 | CandidateDedup(候选人查重;`/api/agents` 中 short 即此名,Inngest 函数 id `rule-check-candidate-identity-agent`) | 9-3 | RESUME_PROCESSED | (无 —— 审计旁路) |
 | Matcher(简历匹配评分) | 10 | MATCH_RULE_CHECK_PASSED | MATCH_PASSED_NEED_INTERVIEW / MATCH_FAILED |
 | InterviewInviter(面试邀约) | 11-1 | INTERVIEW_INVITATION_REQUESTED(RAAS 回发) | INTERVIEW_INVITATION_SENT / INTERVIEW_INVITATION_FAILED |
-| JDGenerator(JD 生成) | 4 | CLARIFICATION_READY | JD_GENERATED |
-
-> `JD_REJECTED` 只记录人工审核驳回结果,不触发 JD 自动重生成。如需重做,应先修改或重新澄清需求,再产生新的 `CLARIFICATION_READY`。
+| JDGenerator(JD 生成) | 4 | REQUIREMENT_LOGGED / CLARIFICATION_READY / JD_REJECTED | JD_GENERATED |
 
 > 备注:「候选人归属核验(RuleCheckCandidateOwnership)」已于 2026-06-11 下线,不在名册与部署集内。
 

@@ -31,7 +31,7 @@ const NAMES: Array<[string, string, string]> = [
   ["allmeta.getInstance", "读取本体实例", "按 label 主键读取一个实例"],
   ["allmeta.writeInstance", "写入本体实例", "把一个实例写入 Neo4j"],
   ["allmeta.searchEntities", "检索本体实体", "按类型关键字检索实体"],
-  ["candidateLock.runLockCheck", "候选人归属锁定检查", "调用 RMHR 获取候选人当前锁定与归属结论,不承担身份去重"],
+  ["candidateLock.runLockCheck", "候选人锁定去重", "对候选人做三级去重与归属锁定判定"],
   ["llm.complete", "LLM 补全", "通用 LLM 调用"],
   ["llm.fieldJudge", "字段等价判定", "用 LLM 判定两个字段是否等价"],
 ];

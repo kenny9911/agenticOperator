@@ -17,7 +17,7 @@
 
 import { NonRetriableError } from 'inngest';
 import { recordLogEvent as realRecordLogEvent } from '@/server/log/log-event';
-import type { DepOutcome, DepProvider, DepReason } from './types';
+import type { DepOutcome, DepReason } from './types';
 
 type Degraded = Extract<DepOutcome, { ok: false }>;
 
@@ -82,51 +82,6 @@ export async function recordDependencySignal(
       inngestRunId: ctx.runId ?? null,
     }),
   });
-}
-
-// Success heartbeats are throttled per process: one row per (provider, domain)
-// per window is enough for the monitor to see "it works again", without
-// writing a LogEvent for every single healthy call.
-export const DEP_OK_THROTTLE_MS = 30_000;
-const lastOkAt = new Map<string, number>();
-
-/** Test-only: forget the throttle state. */
-export function __resetDependencyOkThrottle(): void {
-  lastOkAt.clear();
-}
-
-/**
- * Record that a call to `provider` just SUCCEEDED. The monitor drops every
- * degraded signal at/before the latest success for the same (provider, domain),
- * so an outage clears — and a 故障恢复 message is posted — as soon as the vendor
- * works again, instead of waiting for old failures to age out of the window.
- * Throttled + never throws.
- */
-export async function recordDependencyOk(
-  provider: DepProvider,
-  op: string,
-  ctx: ReportContext,
-  deps: ReportDeps & { now?: () => number } = {},
-): Promise<void> {
-  const now = (deps.now ?? Date.now)();
-  const key = `${provider}::${ctx.domain}`;
-  const prev = lastOkAt.get(key);
-  if (prev !== undefined && now - prev < DEP_OK_THROTTLE_MS) return;
-  lastOkAt.set(key, now);
-  const record = deps.recordLogEvent ?? realRecordLogEvent;
-  try {
-    await record({
-      type: 'dependency_ok',
-      message: `${friendlyProvider(provider as Degraded['provider'])} ${op} 调用成功`,
-      source: provider === 'llm' ? 'LLM 网关' : 'RoboHire',
-      agent: ctx.agent ?? null,
-      runId: ctx.runId ?? null,
-      traceId: ctx.traceId ?? null,
-      payloadJson: JSON.stringify({ provider, op, domain: ctx.domain }),
-    });
-  } catch {
-    /* best-effort — a missed heartbeat only delays recovery to window age-out */
-  }
 }
 
 /** Record the signal and throw to fail the run. Never returns. */

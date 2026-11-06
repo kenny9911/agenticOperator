@@ -1,11 +1,19 @@
-// RMHR lock snapshot persistence — candidate.employee_id / is_locked /
-// lock_start_time must move as one tuple. The uploader remains resume.uploaded_by.
+// 锁权威归属校正 — saveCandidateToPartnerPg 对 locked_by_employee_id 的处理。
+//
+// 语义 (2026-06-11, per raas ADR-0041 "锁在他人则同步真实归属"):
+//   - locked_by_employee_id 非空 = RMHR 锁持有人是归属权威:
+//       · 新建候选人 → candidate.employee_id 直接写锁持有人 (而非上传者)
+//       · dedup 命中 → UPDATE 无条件覆盖 employee_id 为锁持有人 ($13=true 走 CASE)
+//   - locked_by_employee_id 为空 = 历史语义不变:
+//       · 新建 → employee_id 写上传者
+//       · dedup 命中 → COALESCE 仅填空 (公共池才填, 已有归属不动)
+//   - resume.uploaded_by 永远记上传者, 不受锁影响。
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// Capture every SQL the writer runs inside withTx.
 const queries: Array<{ text: string; params: unknown[] }> = [];
 let existingCandidateRow: Record<string, unknown> | undefined;
-let updatedCandidateRow: Record<string, unknown>;
 
 vi.mock('./client', () => ({
   withTx: vi.fn(async (fn: (c: unknown) => Promise<unknown>) => {
@@ -14,9 +22,6 @@ vi.mock('./client', () => ({
         queries.push({ text, params });
         if (/SELECT candidate_id FROM candidate\b/i.test(text)) {
           return { rows: existingCandidateRow ? [existingCandidateRow] : [] };
-        }
-        if (/UPDATE candidate SET[\s\S]*RETURNING name, mobile/i.test(text)) {
-          return { rows: [updatedCandidateRow] };
         }
         return { rows: [] };
       }),
@@ -28,30 +33,13 @@ vi.mock('./client', () => ({
 
 import { saveCandidateToPartnerPg } from './candidates';
 
-const UPLOADER = 'EMP-UPLOADER';
-const LOCK_HOLDER = 'EMP-LOCK-HOLDER';
-const OTHER_LOCK_HOLDER = 'EMP-OTHER-HOLDER';
-const LOCKED_AT_RAW = '2026-07-14 18:05:33';
-const LOCKED_AT_ISO = '2026-07-14T10:05:33.000Z';
-
 beforeEach(() => {
   queries.length = 0;
   existingCandidateRow = undefined;
-  updatedCandidateRow = {
-    name: '张三',
-    mobile: '13800001111',
-    mobile_normalized: '13800001111',
-    email: 'zhangsan@example.com',
-    gender: null,
-    birth_date: null,
-    current_location: null,
-    highest_acquired_degree: null,
-    work_years: null,
-    employee_id: LOCK_HOLDER,
-    is_locked: true,
-    lock_start_time: new Date(LOCKED_AT_ISO),
-  };
 });
+
+const UPLOADER = 'EMP-UPLOADER';
+const LOCK_HOLDER = 'EMP-LOCK-HOLDER';
 
 const baseInput = {
   upload_id: 'up-1',
@@ -69,149 +57,72 @@ const baseInput = {
 };
 
 function findCandidateInsert() {
-  return queries.find((query) => /INSERT INTO candidate\b/i.test(query.text));
+  return queries.find((q) => /INSERT INTO candidate\b/i.test(q.text));
 }
-
 function findCandidateUpdate() {
-  return queries.find((query) =>
-    /UPDATE candidate SET[\s\S]*employee_id/i.test(query.text),
-  );
+  return queries.find((q) => /UPDATE candidate SET[\s\S]*employee_id/i.test(q.text));
 }
-
 function findResumeInsert() {
-  return queries.find((query) => /INSERT INTO resume\b/i.test(query.text));
+  return queries.find((q) => /INSERT INTO resume\b/i.test(q.text));
 }
 
-describe('saveCandidateToPartnerPg — RMHR lock tuple', () => {
-  it('new Candidate with lock evidence atomically writes holder, true and Beijing-normalized time', async () => {
-    const result = await saveCandidateToPartnerPg({
+describe('saveCandidateToPartnerPg — locked_by_employee_id 锁权威归属', () => {
+  it('新建候选人 + 带锁 → candidate.employee_id 写锁持有人而非上传者', async () => {
+    existingCandidateRow = undefined;
+    await saveCandidateToPartnerPg({
       ...baseInput,
       locked_by_employee_id: LOCK_HOLDER,
-      locked_at: LOCKED_AT_RAW,
     });
 
     const insert = findCandidateInsert();
     expect(insert, 'should INSERT candidate').toBeTruthy();
-    expect(insert!.text).toMatch(/employee_id[\s\S]*is_locked, lock_start_time/i);
-    expect(insert!.params[12]).toBe(LOCK_HOLDER);
-    expect(insert!.params[16]).toBe(true);
-    expect((insert!.params[17] as Date).toISOString()).toBe(LOCKED_AT_ISO);
-    expect(insert!.params).not.toContain(UPLOADER);
-    expect(result.candidate_lock_snapshot).toEqual({
-      employee_id: LOCK_HOLDER,
-      is_locked: true,
-      lock_start_time: new Date(LOCKED_AT_ISO),
-    });
+    expect(insert!.params).toContain(LOCK_HOLDER);
+    expect(insert!.params).not.toContain(UPLOADER); // candidate 行的归属位不是上传者
   });
 
-  it('new Candidate without lock evidence stays in the public pool', async () => {
-    const result = await saveCandidateToPartnerPg(baseInput);
+  it('新建候选人 + 无锁 → candidate.employee_id 写上传者（历史语义）', async () => {
+    existingCandidateRow = undefined;
+    await saveCandidateToPartnerPg(baseInput);
 
     const insert = findCandidateInsert();
     expect(insert).toBeTruthy();
-    expect(insert!.params[12]).toBeNull();
-    expect(insert!.params[16]).toBe(false);
-    expect(insert!.params[17]).toBeNull();
-    expect(insert!.params).not.toContain(UPLOADER);
-    expect(result.candidate_lock_snapshot).toEqual({
-      employee_id: null,
-      is_locked: false,
-      lock_start_time: null,
-    });
+    expect(insert!.params).toContain(UPLOADER);
+    expect(insert!.params).not.toContain(LOCK_HOLDER);
   });
 
-  it('phone dedup with lock evidence updates all three fields through one freshness gate', async () => {
+  it('dedup 命中 + 带锁 → UPDATE 走锁权威覆盖分支 ($13=true, $11=锁持有人)', async () => {
     existingCandidateRow = { candidate_id: 'cand-existing' };
-    const result = await saveCandidateToPartnerPg({
+    await saveCandidateToPartnerPg({
       ...baseInput,
       locked_by_employee_id: LOCK_HOLDER,
-      locked_at: LOCKED_AT_RAW,
     });
 
-    expect(findCandidateInsert()).toBeFalsy();
+    expect(findCandidateInsert(), 'dedup 命中不应 INSERT candidate').toBeFalsy();
     const update = findCandidateUpdate();
     expect(update).toBeTruthy();
-    expect(update!.text).toMatch(/employee_id = CASE[\s\S]*is_locked = CASE[\s\S]*lock_start_time = CASE/i);
-    expect(update!.text).toMatch(/lock_start_time <= \(\$15::timestamptz AT TIME ZONE 'UTC'\)/i);
+    // SQL 必须带 CASE WHEN $13::boolean THEN $11 ELSE COALESCE(employee_id, $11)
+    expect(update!.text).toMatch(/CASE WHEN \$13::boolean THEN \$11/i);
+    expect(update!.text).toMatch(/ELSE COALESCE\(employee_id, \$11\)/i);
+    // $11 (index 10) = 锁持有人, $13 (index 12) = true
     expect(update!.params[10]).toBe(LOCK_HOLDER);
     expect(update!.params[12]).toBe(true);
-    expect((update!.params[14] as Date).toISOString()).toBe(LOCKED_AT_ISO);
-    expect(result.candidate_lock_snapshot).toEqual({
-      employee_id: LOCK_HOLDER,
-      is_locked: true,
-      lock_start_time: new Date(LOCKED_AT_ISO),
-    });
   });
 
-  it('phone dedup without lock evidence preserves the existing lock tuple and never uses uploader as owner', async () => {
+  it('dedup 命中 + 无锁 → 保持 COALESCE 仅填空语义 ($13=false, $11=上传者)', async () => {
     existingCandidateRow = { candidate_id: 'cand-existing' };
-    updatedCandidateRow = {
-      ...updatedCandidateRow,
-      employee_id: OTHER_LOCK_HOLDER,
-      lock_start_time: new Date('2026-07-15T10:05:33.000Z'),
-    };
-
-    const result = await saveCandidateToPartnerPg(baseInput);
+    await saveCandidateToPartnerPg(baseInput);
 
     const update = findCandidateUpdate();
     expect(update).toBeTruthy();
-    expect(update!.params[10]).toBeNull();
+    expect(update!.params[10]).toBe(UPLOADER);
     expect(update!.params[12]).toBe(false);
-    expect(update!.params[14]).toBeNull();
-    expect(update!.text).toMatch(/ELSE employee_id/i);
-    expect(update!.text).not.toMatch(/COALESCE\(employee_id/i);
-    expect(result.candidate_lock_snapshot).toEqual({
-      employee_id: OTHER_LOCK_HOLDER,
-      is_locked: true,
-      lock_start_time: new Date('2026-07-15T10:05:33.000Z'),
-    });
   });
 
-  it('guards an existing newer lock from an older cross-upload lock snapshot', async () => {
-    existingCandidateRow = { candidate_id: 'cand-existing' };
-    updatedCandidateRow = {
-      ...updatedCandidateRow,
-      employee_id: OTHER_LOCK_HOLDER,
-      lock_start_time: new Date('2026-07-15T10:05:33.000Z'),
-    };
-
-    const result = await saveCandidateToPartnerPg({
-      ...baseInput,
-      locked_by_employee_id: LOCK_HOLDER,
-      locked_at: LOCKED_AT_RAW,
-    });
-
-    const update = findCandidateUpdate();
-    expect(update!.text).toMatch(
-      /lock_start_time <= \(\$15::timestamptz AT TIME ZONE 'UTC'\)/i,
-    );
-    expect(update!.text).toMatch(
-      /lock_start_time AT TIME ZONE 'UTC' AS lock_start_time/i,
-    );
-    expect((update!.params[14] as Date).toISOString()).toBe(LOCKED_AT_ISO);
-    expect(result.candidate_lock_snapshot).toEqual({
-      employee_id: OTHER_LOCK_HOLDER,
-      is_locked: true,
-      lock_start_time: new Date('2026-07-15T10:05:33.000Z'),
-    });
-  });
-
-  it('uses the event observation time when a positive legacy lock omitted locked_at', async () => {
+  it('带锁时 resume.uploaded_by 仍是上传者 (文件级语义不受锁影响)', async () => {
+    existingCandidateRow = undefined;
     await saveCandidateToPartnerPg({
       ...baseInput,
       locked_by_employee_id: LOCK_HOLDER,
-      lock_observed_at: '2026-07-14T10:06:00.000Z',
-    });
-
-    const insert = findCandidateInsert();
-    expect((insert!.params[17] as Date).toISOString()).toBe('2026-07-14T10:06:00.000Z');
-  });
-
-  it('keeps resume.uploaded_by as uploader even when Candidate is locked', async () => {
-    await saveCandidateToPartnerPg({
-      ...baseInput,
-      locked_by_employee_id: LOCK_HOLDER,
-      locked_at: LOCKED_AT_RAW,
     });
 
     const resumeInsert = findResumeInsert();
@@ -220,17 +131,16 @@ describe('saveCandidateToPartnerPg — RMHR lock tuple', () => {
     expect(resumeInsert!.params).not.toContain(LOCK_HOLDER);
   });
 
-  it('blank holder is not lock evidence even if a lock time is present', async () => {
+  it('锁字段是空串/空白 → 视为无锁, 不触发覆盖', async () => {
     existingCandidateRow = { candidate_id: 'cand-existing' };
     await saveCandidateToPartnerPg({
       ...baseInput,
       locked_by_employee_id: '   ',
-      locked_at: LOCKED_AT_RAW,
     });
 
     const update = findCandidateUpdate();
-    expect(update!.params[10]).toBeNull();
+    expect(update).toBeTruthy();
+    expect(update!.params[10]).toBe(UPLOADER);
     expect(update!.params[12]).toBe(false);
-    expect(update!.params[14]).toBeNull();
   });
 });

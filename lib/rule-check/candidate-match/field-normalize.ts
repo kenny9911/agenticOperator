@@ -6,12 +6,15 @@
 
 import type { MatchField } from './rules-data';
 import { ruleCheckKey } from '@/lib/phone/normalize-e164';
-import { canonicalGender } from '@/lib/gender/canonical-gender';
 
 const s = (raw: string | null | undefined): string => (raw ?? '').trim();
 
-/** Canonical identity key: one non-placeholder mainland-China 11-digit mobile.
- *  International, malformed and ambiguous values return ''. */
+/** Canonical mobile key for the exact/fuzzy prefilter. Delegates to the shared
+ *  phone normalizer (lib/phone/normalize-e164): libphonenumber's national number
+ *  when the input parses to a valid number (correct for international numbers),
+ *  else the legacy digit heuristic. For China numbers this is byte-identical to the
+ *  old "digits, last 11" behavior; international numbers no longer keep a wrong
+ *  country-code suffix. '' for fewer than 7 digits (not enough to identify). */
 export function normalizePhone(raw: string | null | undefined): string {
   return ruleCheckKey(raw);
 }
@@ -29,11 +32,12 @@ export function normalizeEmail(raw: string | null | undefined): string {
   return s(raw).toLowerCase();
 }
 
-/** Canonicalize common male/female spellings; otherwise pass through normalized.
- *  Shares the mapping table with the DB writers (lib/gender/canonical-gender.ts)
- *  so matching and persistence can never disagree on what '男' means. */
+/** Canonicalize common male/female spellings; otherwise pass through normalized. */
 export function normalizeGender(raw: string | null | undefined): string {
-  return canonicalGender(raw) ?? s(raw).toLowerCase();
+  const v = s(raw).toLowerCase();
+  if (['男', 'm', 'male', '男性'].includes(v)) return 'male';
+  if (['女', 'f', 'female', '女性'].includes(v)) return 'female';
+  return v;
 }
 
 /** Generic text canonicalization for school / major / degree. Collapses whitespace

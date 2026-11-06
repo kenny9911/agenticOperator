@@ -13,7 +13,6 @@ import { prisma } from "../db";
 import { em } from "../em";
 import { getRaasInngestUrl } from "@/lib/inngest-url";
 import { tlog } from "@/lib/terminal-log";
-import { redactResumeDownloadedIdentityForLog } from "@/lib/raas-v1/resume-candidate-identity";
 
 const SHARED_URL = getRaasInngestUrl();
 const POLL_INTERVAL = Number(process.env.RAAS_BRIDGE_POLL_INTERVAL_MS ?? 5000);
@@ -159,10 +158,7 @@ async function tick(): Promise<void> {
                 source: "raas-bridge",
                 shared_event_id: e.id,
                 event_name: e.name,
-                data:
-                  e.name === "RESUME_DOWNLOADED"
-                    ? redactResumeDownloadedIdentityForLog(e.data)
-                    : e.data,
+                data: e.data,
                 em_publish: result,
               }),
             },

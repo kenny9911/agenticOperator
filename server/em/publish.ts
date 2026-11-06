@@ -31,7 +31,6 @@ import { tryParse, type TryParseResult } from "./registry";
 import * as degradedMode from "./degraded-mode";
 import { emitRejection } from "./rejection";
 import { recordNotification } from "../notifications/ingest";
-import { redactResumeDownloadedIdentityForLog } from "@/lib/raas-v1/resume-candidate-identity";
 
 // Schema 拒绝 → 消息通知(warning alert,按事件名 dedupe)。被静默丢弃的业务
 // 事件是数据质量事故,EventInstance 行躺在表里没人看 — 必须主动浮出。
@@ -165,7 +164,7 @@ async function publishInner(
       status: "rejected_filter",
       rejectionType: "FILTER_REJECTED",
       rejectionReason: filterResult.reason,
-      payloadForSummary: payloadForObservability(name, data),
+      payloadForSummary: data,
     });
     degradedMode.recordReject();
     if (emitOnFail) {
@@ -175,7 +174,7 @@ async function publishInner(
         originalSource: opts.source,
         rejectionType: "FILTER_REJECTED",
         rejectionReason: filterResult.reason,
-        payloadSample: toPlainRecord(payloadForObservability(name, data)),
+        payloadSample: toPlainRecord(data),
       });
     }
     return { accepted: false, reason: "filter", details: filterResult.reason };
@@ -212,7 +211,7 @@ async function publishInner(
           causedByName: opts.causedBy?.name,
           passthroughReason: `no schema registered for event ${name}`,
           triedVersions: parsed.triedVersions,
-          payloadForSummary: payloadForObservability(name, data),
+          payloadForSummary: data,
         });
         degradedMode.recordPublish();
         const idempotencyKey = opts.idempotencyKey ?? opts.externalEventId ?? eventId;
@@ -228,7 +227,7 @@ async function publishInner(
           rejectionType: "SCHEMA_VALIDATION_FAILED",
           rejectionReason: `no schema registered for event ${name}`,
           triedVersions: parsed.triedVersions,
-          payloadForSummary: payloadForObservability(name, data),
+          payloadForSummary: data,
         });
         degradedMode.recordReject();
         notifySchemaReject(name, eventId, `事件未注册格式定义`);
@@ -240,7 +239,7 @@ async function publishInner(
             rejectionType: "SCHEMA_VALIDATION_FAILED",
             rejectionReason: `no schema registered for event ${name}`,
             triedVersions: parsed.triedVersions,
-            payloadSample: toPlainRecord(payloadForObservability(name, data)),
+            payloadSample: toPlainRecord(data),
             retryGuidance:
               "register the event in Neo4j or add a builtin schema in server/em/schemas/builtin.ts",
           });
@@ -275,7 +274,7 @@ async function publishInner(
           passthroughReason: summarized,
           schemaErrors: schemaErrorsJson,
           triedVersions: parsed.triedVersions,
-          payloadForSummary: payloadForObservability(name, data),
+          payloadForSummary: data,
         });
         notifySchemaMismatchPassthrough(name, eventId, summarized);
         degradedMode.recordPublish();
@@ -297,7 +296,7 @@ async function publishInner(
             message: i.message,
           })),
           triedVersions: parsed.triedVersions,
-          payloadForSummary: payloadForObservability(name, data),
+          payloadForSummary: data,
         });
         degradedMode.recordReject();
         notifySchemaReject(name, eventId, summarized);
@@ -314,7 +313,7 @@ async function publishInner(
               message: i.message,
             })),
             triedVersions: parsed.triedVersions,
-            payloadSample: toPlainRecord(payloadForObservability(name, data)),
+            payloadSample: toPlainRecord(data),
           });
         }
         return { accepted: false, reason: "schema", details: parsed.issues };
@@ -347,14 +346,14 @@ async function publishInner(
     causedByEventId: opts.causedBy?.eventId,
     causedByName: opts.causedBy?.name,
     schemaVersionUsed,
-    payloadForSummary: payloadForObservability(name, acceptedData),
+    payloadForSummary: acceptedData,
   });
   // Audit is best-effort — we don't want a missing trace_id to block delivery.
   await writeAudit({
     eventName: name,
     traceId,
     source: opts.source,
-    payload: payloadForObservability(name, acceptedData),
+    payload: acceptedData,
   }).catch(() => {/* fire and forget */});
 
   // Step 5 — Inngest send (use externalEventId as idempotency key when present
@@ -378,12 +377,6 @@ async function publishInner(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-function payloadForObservability(name: string, data: unknown): unknown {
-  return name === "RESUME_DOWNLOADED"
-    ? redactResumeDownloadedIdentityForLog(data)
-    : data;
-}
-
 function extractTraceId(data: unknown): string | undefined {
   if (!data || typeof data !== "object") return undefined;
   const t = (data as { trace?: { trace_id?: unknown } }).trace;
@@ -395,3 +388,4 @@ function toPlainRecord(data: unknown): Record<string, unknown> | undefined {
   if (!data || typeof data !== "object") return undefined;
   return data as Record<string, unknown>;
 }
+

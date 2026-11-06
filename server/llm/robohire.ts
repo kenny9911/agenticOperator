@@ -18,7 +18,6 @@
 
 import type { LoggerLike } from "@/server/agent-logger";
 import { fetchWithTelemetry } from "@/server/http/instrumented";
-import { prepareResumePdf } from "@/lib/resume-convert/prepare-resume-pdf";
 
 const BASE = process.env.RAAS_API_BASE_URL ?? "http://localhost:3001";
 const KEY = process.env.AGENT_API_KEY ?? "";
@@ -61,14 +60,13 @@ export async function roboHireParseResume(
   if (!KEY) throw new RoboHireError(0, "AGENT_API_KEY not set");
 
   const startedAt = Date.now();
-  const prepared = await prepareResumePdf(fileBuffer, filename);
   const form = new FormData();
   // RoboHire docs §2: field name "file", mime application/pdf.
   // Don't set Content-Type manually — FormData adds the multipart boundary.
-  const blob = new Blob([new Uint8Array(prepared.pdf)], {
+  const blob = new Blob([new Uint8Array(fileBuffer)], {
     type: "application/pdf",
   });
-  form.append("file", blob, prepared.filename);
+  form.append("file", blob, filename);
 
   const res = await fetchWithTelemetry(
     `${BASE}/api/v1/parse-resume`,
@@ -81,13 +79,7 @@ export async function roboHireParseResume(
     {
       logger: opts?.logger,
       toolName: "RoboHire.parseResume",
-      meta: {
-        filename: prepared.filename,
-        sourceFormat: prepared.sourceFormat,
-        converted: prepared.converted,
-        originalBytes: prepared.originalBytes,
-        pdfBytes: prepared.pdfBytes,
-      },
+      meta: { filename, bytes: fileBuffer.length },
     },
   );
 
