@@ -91,14 +91,6 @@ export type ChatToolsOptions = {
   onToolCall: ChatToolDispatcher;
   /** Cap on tool-call rounds. Default 5. */
   maxIterations?: number;
-  /**
-   * When set, hitting `maxIterations` does NOT throw immediately. Instead the
-   * gateway appends this text as a user message and makes ONE extra request
-   * with `tool_choice: 'none'`, forcing the model to answer from the tool
-   * results it already has. Only if that final round still yields no text
-   * does the call throw `tool-use loop exceeded …`.
-   */
-  finalizeOnLimit?: string;
 };
 
 /**
@@ -186,19 +178,6 @@ export async function chatComplete(opts: {
     | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
     | undefined;
   let lastFinishReason: string | undefined;
-  // Set once the tool budget is spent and `finalizeOnLimit` asked for one
-  // last tools-disabled round.
-  let finalizing = false;
-  let invalidArgCalls = 0;
-  // Why the loop gave up — appended to the error so an overrun is diagnosable
-  // (it is neither a timeout nor a max_tokens cut by itself).
-  const loopExceeded = () =>
-    new Error(
-      `tool-use loop exceeded ${maxIterations} iterations without final text` +
-        ` (last finish_reason=${lastFinishReason ?? 'n/a'}` +
-        (invalidArgCalls > 0 ? `, invalid tool args=${invalidArgCalls}` : '') +
-        ')',
-    );
 
   try {
     while (true) {
@@ -210,7 +189,7 @@ export async function chatComplete(opts: {
       };
       if (opts.tools) {
         createArgs.tools = opts.tools.schema;
-        createArgs.tool_choice = finalizing ? 'none' : 'auto';
+        createArgs.tool_choice = 'auto';
       }
       // Merge provider-specific fields LAST so they can override defaults if
       // the caller needs to (e.g. `extra_body` for Kimi's thinking control).
@@ -250,13 +229,6 @@ export async function chatComplete(opts: {
         text = (msg?.content ?? '').trim();
         break;
       }
-      if (finalizing) {
-        // Model ignored tool_choice='none' and asked for more tools again.
-        // Accept any text it produced alongside; otherwise give up.
-        text = (msg?.content ?? '').trim();
-        if (text) break;
-        throw loopExceeded();
-      }
 
       // Append the assistant message (with its tool_calls) to history.
       // Preserve reasoning_content for thinking-style models (Kimi K2 etc.) —
@@ -274,18 +246,9 @@ export async function chatComplete(opts: {
         toolCalls.map(async (call) => {
           let parsed: unknown;
           try {
-            parsed = JSON.parse(call.function.arguments || '{}');
+            parsed = JSON.parse(call.function.arguments);
           } catch {
-            // Malformed / truncated arguments (e.g. the response hit max_tokens
-            // mid tool_call). Dispatching `{}` silently just burns another round
-            // on a guaranteed-useless lookup — tell the model instead.
-            invalidArgCalls += 1;
-            return {
-              call,
-              result: {
-                error: 'tool arguments are not valid JSON (possibly truncated); fix them or stop calling tools and answer',
-              },
-            };
+            parsed = {};
           }
           const result = await opts.tools!.onToolCall(call.function.name, parsed);
           return { call, result };
@@ -301,13 +264,9 @@ export async function chatComplete(opts: {
 
       iterations += 1;
       if (iterations >= maxIterations) {
-        if (!opts.tools.finalizeOnLimit) {
-          throw loopExceeded();
-        }
-        // Budget spent: one last round with tools disabled so the model
-        // answers from what it already fetched instead of failing the run.
-        finalizing = true;
-        messages.push({ role: 'user', content: opts.tools.finalizeOnLimit });
+        throw new Error(
+          `tool-use loop exceeded ${maxIterations} iterations without final text`,
+        );
       }
     }
 

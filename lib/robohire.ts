@@ -5,8 +5,6 @@
 // Auth: AGENT_API_KEY (issued by raas team; AO must NOT call api.robohire.io directly)
 // Base: RAAS_API_BASE_URL (dev: http://localhost:3001; prod: https://aicoe.chinasoftinc.com/raas-api)
 
-import { prepareResumePdf } from './resume-convert/prepare-resume-pdf';
-
 const BASE = process.env.RAAS_API_BASE_URL ?? 'http://localhost:3001';
 
 function authHeader() {
@@ -63,17 +61,16 @@ export type RoboHireParseResponse = {
   error?: string;
 };
 
-/** 统一校验/转换为 PDF 后,走 multipart 发到 RoboHire /parse-resume。 */
+/** 把 PDF Buffer 包成 Blob 走 multipart 发到 RoboHire /parse-resume */
 export async function parseResumePdf(
-  fileBuffer: Buffer,
+  pdfBuffer: Buffer,
   filename: string
 ): Promise<RoboHireParseResponse> {
-  const prepared = await prepareResumePdf(fileBuffer, filename);
   const form = new FormData();
   form.append(
     'file',
-    new Blob([new Uint8Array(prepared.pdf)], { type: 'application/pdf' }),
-    prepared.filename
+    new Blob([new Uint8Array(pdfBuffer)], { type: 'application/pdf' }),
+    filename || 'resume.pdf'
   );
 
   const r = await fetch(`${BASE}/api/v1/parse-resume`, {

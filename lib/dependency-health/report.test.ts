@@ -1,13 +1,6 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { NonRetriableError } from 'inngest';
-import {
-  reportDependencyDegraded,
-  recordDependencySignal,
-  isRecoverableReason,
-  recordDependencyOk,
-  __resetDependencyOkThrottle,
-  DEP_OK_THROTTLE_MS,
-} from './report';
+import { reportDependencyDegraded, recordDependencySignal, isRecoverableReason } from './report';
 import type { DepOutcome } from './types';
 
 function degraded(over: Partial<Extract<DepOutcome, { ok: false }>>): Extract<DepOutcome, { ok: false }> {
@@ -95,39 +88,5 @@ describe('isRecoverableReason', () => {
     expect(isRecoverableReason('server')).toBe(true);
     expect(isRecoverableReason('auth')).toBe(false);
     expect(isRecoverableReason('empty')).toBe(false);
-  });
-});
-
-describe('recordDependencyOk', () => {
-  const ctx = { agent: 'Matcher', runId: 'r1', domain: '招聘-v1' };
-
-  it('writes a dependency_ok heartbeat with provider/op/domain', async () => {
-    __resetDependencyOkThrottle();
-    const record = vi.fn().mockResolvedValue(undefined);
-    await recordDependencyOk('robohire', 'matchResume', ctx, { recordLogEvent: record, now: () => 1_000 });
-    expect(record).toHaveBeenCalledTimes(1);
-    const arg = record.mock.calls[0][0];
-    expect(arg.type).toBe('dependency_ok');
-    expect(JSON.parse(arg.payloadJson)).toEqual({ provider: 'robohire', op: 'matchResume', domain: '招聘-v1' });
-  });
-
-  it('is throttled per provider+domain', async () => {
-    __resetDependencyOkThrottle();
-    const record = vi.fn().mockResolvedValue(undefined);
-    await recordDependencyOk('robohire', 'matchResume', ctx, { recordLogEvent: record, now: () => 1_000 });
-    await recordDependencyOk('robohire', 'parseResume', ctx, { recordLogEvent: record, now: () => 2_000 });
-    await recordDependencyOk('llm', 'ruleCheck', ctx, { recordLogEvent: record, now: () => 2_000 });
-    expect(record).toHaveBeenCalledTimes(2);
-    await recordDependencyOk('robohire', 'matchResume', ctx, {
-      recordLogEvent: record,
-      now: () => 1_000 + DEP_OK_THROTTLE_MS,
-    });
-    expect(record).toHaveBeenCalledTimes(3);
-  });
-
-  it('never throws', async () => {
-    __resetDependencyOkThrottle();
-    const record = vi.fn().mockRejectedValue(new Error('db down'));
-    await expect(recordDependencyOk('llm', 'ruleCheck', ctx, { recordLogEvent: record })).resolves.toBeUndefined();
   });
 });

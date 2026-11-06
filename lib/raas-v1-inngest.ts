@@ -5,7 +5,6 @@ export const RAAS_V1_DOMAIN_ID = RECRUITMENT_DOMAIN_ID;
 
 export const RAAS_V1_FUNCTION_IDS = [
   "create-jd-agent",
-  "task-assigner-agent",
   "resume-parser-agent",
   "rule-check-candidate-identity-agent",
   "rule-check-agent",

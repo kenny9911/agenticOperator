@@ -186,7 +186,7 @@
 
   <g aria-label="标题">
     <text x="60" y="78" font-size="42" font-weight="800" fill="#152235">Agentic Operator · RAAS-v1 事件流转图</text>
-    <text x="60" y="118" font-size="19" fill="#6E7A8C">依据当前运行时代码梳理 · 6 个真实 Inngest Functions · 2026-08-04</text>
+    <text x="60" y="118" font-size="19" fill="#6E7A8C">依据当前运行时代码梳理 · 6 个真实 Inngest Functions · 2026-07-28</text>
     <g transform="translate(1780 48)">
       <rect width="360" height="58" rx="29" fill="#E9EEF5"/>
       <circle cx="32" cy="29" r="9" fill="#16945A"/>
@@ -202,7 +202,9 @@
 
     <g aria-label="JD 入口事件">
       <rect class="event-card" x="250" y="235" width="350" height="132" rx="18"/>
+      <text class="event-text mono" x="275" y="272">REQUIREMENT_LOGGED</text>
       <text class="event-text mono" x="275" y="307">CLARIFICATION_READY</text>
+      <text class="event-text mono" x="275" y="342">JD_REJECTED</text>
     </g>
 
     <g aria-label="Function 1 Create JD Agent">

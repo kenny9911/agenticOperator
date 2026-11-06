@@ -1,146 +1,112 @@
-// Candidate-mobile normalization SSOT.
+// lib/phone/normalize-e164.ts
 //
-// Despite the historical filename, candidate identity no longer uses E.164 or a
-// generic international phone parser. The production contract is deliberately
-// narrower: only a strong mainland-China mobile (`^1[3-9][0-9]{9}$`) may drive
-// candidate deduplication. Common +86 / 0086 / formatting variants collapse to
-// the same 11 digits; international, ambiguous, placeholder and malformed values
-// are retained only in Resume.raw_parse_result and never become Candidate keys.
+// SINGLE home for candidate phone-number normalization. Before this module the
+// codebase had two divergent China-only "strip non-digits (+ maybe last 11)"
+// heuristics — `normalizePhone` (rule-check exact/fuzzy prefilter) and
+// `normalizeMobile` (partner-pg dedup + the stored `mobile_normalized` column).
+// International numbers 假并/假拆 (a +86 number and a foreign number sharing a
+// digit suffix collapse; one person written two ways splits).
+//
+// This module unifies them and adds a real E.164 canonicalizer
+// (libphonenumber-js — offline, deterministic, per-country trunk/length rules):
+//
+//   • toE164()        — E.164 canonical form (`+8613800138000`), the correct
+//                       globally-unique key. Exposed for the (deferred) shared-DB
+//                       `mobile_e164` column and for display; NOT yet the stored
+//                       dedup key (see below).
+//   • nationalDigits()— national significant number of a VALID parse (country code
+//                       dropped) — e.g. `+65 9123 4567` → `91234567`, the fix the
+//                       old last-11 heuristic got wrong.
+//   • legacyDigits()  — the raw digit strip (unchanged heuristic base).
+//   • dedupKey()      — the partner-pg WRITE key. Deliberately kept **byte-identical
+//                       to the pre-refactor `normalizeMobile`** (pure legacy digits):
+//                       the key is matched as a suffix `LIKE '%digits'` against the
+//                       raw `mobile` column AND lives in the partner DB shared with
+//                       the live RAAS system, so its FORMAT cannot change without a
+//                       coordinated column migration (deferred — see the 2026-07-21
+//                       old-repo optimization design, §3). Zero online risk.
+//   • ruleCheckKey()  — the rule-check IN-MEMORY prefilter key. Safe to upgrade
+//                       (transient; the prefilter is a documented superset), so it
+//                       uses libphonenumber's national number when parseable and
+//                       falls back to the legacy heuristic otherwise. CN output is
+//                       byte-identical to the old normalizePhone; international is
+//                       corrected.
 
-type RawPhone = unknown;
+import { parsePhoneNumberFromString, type CountryCode } from 'libphonenumber-js';
 
-export type CandidateMobileStatus =
-  | 'valid'
-  | 'missing'
-  | 'invalid'
-  | 'placeholder'
-  | 'ambiguous';
+export type PhoneRegion = CountryCode;
 
-export type CandidateMobileResolution = {
-  /** Canonical mainland mobile and the sole candidate dedup key. */
-  mobile: string | null;
-  status: CandidateMobileStatus;
-};
+/** Default region used to resolve a bare national number. CN because this is a
+ *  China-first recruitment flow; we NEVER blindly prepend +86 — a number only
+ *  becomes CN when libphonenumber validly parses it as such. */
+const DEFAULT_REGION: CountryCode = 'CN';
 
-export const MAINLAND_MOBILE_RE = /^1[3-9][0-9]{9}$/;
+type RawPhone = string | null | undefined;
 
-// Repeated defaults/test values become catastrophic once phone is the sole
-// identity key. Keep this list explicit and reviewable instead of guessing from
-// names or email addresses.
-const PLACEHOLDER_MOBILES = new Set([
-  '13800138888',
-  '13812345678',
-]);
-
-const MULTI_VALUE_SEPARATOR_RE = /[,，;；/／、|\n\r]+/;
-
-function isPlaceholderMobile(mobile: string): boolean {
-  if (PLACEHOLDER_MOBILES.has(mobile)) return true;
-  // Obvious repeated test tails (`13800000000`, `13911111111`, ...). Eight
-  // identical trailing digits are strong enough to fail closed for identity use.
-  if (/([0-9])\1{7}$/.test(mobile)) return true;
-  // Obvious ascending / descending test tails such as 13812345678 and
-  // 13987654321. Restrict this heuristic to the last eight digits so ordinary
-  // carrier prefixes do not participate in the sequence check.
-  const tail = mobile.slice(-8);
-  if ('01234567890123456789'.includes(tail)) return true;
-  if ('98765432109876543210'.includes(tail)) return true;
-  return false;
-}
-
-type SingleResolution = {
-  mobile: string | null;
-  status: Exclude<CandidateMobileStatus, 'missing' | 'ambiguous'>;
-};
-
-function normalizeSingle(raw: RawPhone): SingleResolution | null {
+function parse(raw: RawPhone, region: CountryCode) {
   if (typeof raw !== 'string' || !raw.trim()) return null;
-
-  // NFKC converts full-width digits and punctuation before applying the narrow
-  // formatting allowance. Letters and other content remain and therefore fail.
-  const compact = raw
-    .normalize('NFKC')
-    .trim()
-    .replace(/[\s.\-()]/g, '');
-
-  let mobile: string;
-  if (MAINLAND_MOBILE_RE.test(compact)) {
-    mobile = compact;
-  } else {
-    const prefixed = /^(?:\+86|0086|86)(1[3-9][0-9]{9})$/.exec(compact);
-    if (!prefixed) return { mobile: null, status: 'invalid' };
-    mobile = prefixed[1];
+  try {
+    return parsePhoneNumberFromString(raw, region) ?? null;
+  } catch {
+    return null;
   }
-
-  return isPlaceholderMobile(mobile)
-    ? { mobile: null, status: 'placeholder' }
-    : { mobile, status: 'valid' };
 }
 
-function flattenRawValues(value: RawPhone, out: unknown[]): void {
-  if (Array.isArray(value)) {
-    for (const item of value) flattenRawValues(item, out);
-    return;
+/** E.164 canonical form (`+8613800138000`) for a valid number, else null. */
+export function toE164(raw: RawPhone, region: CountryCode = DEFAULT_REGION): string | null {
+  const p = parse(raw, region);
+  return p && p.isValid() ? p.number : null;
+}
+
+/** National significant number (digits, country code dropped) for a VALID parse,
+ *  else null. `+65 9123 4567` → `91234567`. */
+export function nationalDigits(
+  raw: RawPhone,
+  region: CountryCode = DEFAULT_REGION,
+): string | null {
+  const p = parse(raw, region);
+  if (!p || !p.isValid()) return null;
+  const n = String(p.nationalNumber ?? '').replace(/\D/g, '');
+  return n || null;
+}
+
+/** Raw digit strip — the pre-existing heuristic base, kept verbatim. */
+export function legacyDigits(raw: RawPhone): string {
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/\D/g, '');
+}
+
+export type DedupKeyOptions = {
+  /** DEDUP_PHONE_PRIMARY semantics: require >= 11 digits and take the LAST 11
+   *  (collapse country-code / OCR variants), else null. */
+  phonePrimary?: boolean;
+};
+
+/**
+ * Partner-pg dedup / `mobile_normalized` write key.
+ *
+ * ⚠️ Byte-identical to the legacy `normalizeMobile` on purpose — the stored value
+ * is co-owned with the live RAAS system and matched via suffix LIKE, so its format
+ * must not drift without a coordinated migration. libphonenumber intentionally does
+ * NOT influence this key. (E.164 upgrade of the stored column is the deferred §3.)
+ */
+export function dedupKey(raw: RawPhone, opts: DedupKeyOptions = {}): string | null {
+  const digits = legacyDigits(raw);
+  if (opts.phonePrimary) {
+    return digits.length >= 11 ? digits.slice(-11) : null;
   }
-  out.push(value);
+  return digits.length >= 7 ? digits : null;
 }
 
 /**
- * Resolve every phone-shaped field returned by RoboHire into one authoritative
- * mainland mobile. Multiple distinct strong numbers are deliberately ambiguous;
- * no "first number wins" rule is allowed.
+ * Rule-check in-memory prefilter/exact key. Uses libphonenumber's national number
+ * when the input parses to a valid number (correct for international), otherwise the
+ * legacy digit heuristic. Output shape matches the old normalizePhone: '' for
+ * < 7 digits, last 11 for >= 11, else the digits as-is. For China numbers this is
+ * byte-identical to the old behavior (country code 86 drops out either way).
  */
-export function resolveCandidateMobile(rawValues: RawPhone | RawPhone[]): CandidateMobileResolution {
-  const flattened: unknown[] = [];
-  flattenRawValues(rawValues, flattened);
-
-  const nonEmpty = flattened.filter(
-    (value) => typeof value === 'string' && value.trim().length > 0,
-  ) as string[];
-  if (nonEmpty.length === 0) return { mobile: null, status: 'missing' };
-
-  const valid = new Set<string>();
-  let sawPlaceholder = false;
-  let sawInvalid = false;
-  let sawMultipleValues = false;
-
-  for (const raw of nonEmpty) {
-    const parts = raw
-      .split(MULTI_VALUE_SEPARATOR_RE)
-      .map((part) => part.trim())
-      .filter(Boolean);
-    if (parts.length > 1) sawMultipleValues = true;
-
-    for (const part of parts.length > 0 ? parts : [raw]) {
-      const resolved = normalizeSingle(part);
-      if (!resolved || resolved.status === 'invalid') {
-        sawInvalid = true;
-      } else if (resolved.status === 'placeholder') {
-        sawPlaceholder = true;
-      } else if (resolved.mobile) {
-        valid.add(resolved.mobile);
-      }
-    }
-  }
-
-  if (sawMultipleValues || valid.size > 1) return { mobile: null, status: 'ambiguous' };
-  // A valid number alongside any other non-empty unusable value is conflicting
-  // contact data, not permission to silently choose the valid-looking field.
-  if (valid.size === 1 && (sawInvalid || sawPlaceholder)) {
-    return { mobile: null, status: 'ambiguous' };
-  }
-  if (valid.size === 1) return { mobile: [...valid][0], status: 'valid' };
-  if (sawPlaceholder) return { mobile: null, status: 'placeholder' };
-  if (sawInvalid) return { mobile: null, status: 'invalid' };
-  return { mobile: null, status: 'missing' };
-}
-
-/** Canonical key used by partner-pg candidate storage. */
-export function dedupKey(raw: RawPhone): string | null {
-  return resolveCandidateMobile(raw).mobile;
-}
-
-/** Exact phone key used by the audit-only candidate identity rules. */
-export function ruleCheckKey(raw: RawPhone): string {
-  return dedupKey(raw) ?? '';
+export function ruleCheckKey(raw: RawPhone, region: CountryCode = DEFAULT_REGION): string {
+  const digits = nationalDigits(raw, region) ?? legacyDigits(raw);
+  if (digits.length < 7) return '';
+  return digits.length >= 11 ? digits.slice(-11) : digits;
 }

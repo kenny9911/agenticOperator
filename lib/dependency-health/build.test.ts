@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseFiringDepAlert, buildDependencyHealth, parseRecoveryRow } from './build';
+import { parseFiringDepAlert, buildDependencyHealth } from './build';
 import { DEFAULT_THRESHOLDS } from '../monitor/monitor-types';
 import type { DepFailure } from './types';
 
@@ -96,40 +96,5 @@ describe('buildDependencyHealth', () => {
   it('healthy provider with neither window failures nor an alert', () => {
     const rows = buildDependencyHealth([], [], T);
     expect(rows.find((r) => r.provider === 'llm')!).toMatchObject({ label: 'healthy', notificationId: null, failureCount: 0 });
-  });
-
-  it('shows 故障恢复 (recovered, green) after a dep_down alert was resolved', () => {
-    const rec = { provider: 'robohire' as const, ts: '2026-06-05T10:10:00.000Z', notificationId: 'n-rec' };
-    const rows = buildDependencyHealth([], [], T, [rec]);
-    expect(rows.find((r) => r.provider === 'robohire')!).toMatchObject({
-      label: 'recovered',
-      severity: 'ok',
-      sinceTs: rec.ts,
-      notificationId: 'n-rec',
-    });
-    expect(rows.find((r) => r.provider === 'llm')!.label).toBe('healthy');
-  });
-
-  it('a fresh failure / firing alert wins over an earlier recovery', () => {
-    const rec = { provider: 'robohire' as const, ts: '2026-06-05T09:00:00.000Z', notificationId: 'n-rec' };
-    const rows = buildDependencyHealth([dep({ reason: 'empty' })], [], T, [rec]);
-    expect(rows.find((r) => r.provider === 'robohire')!.label).toBe('watching');
-  });
-});
-
-describe('parseRecoveryRow', () => {
-  it('reads the provider from the dep_recovered anchor', () => {
-    const ts = new Date('2026-06-05T10:10:00Z');
-    expect(parseRecoveryRow({ id: 'n1', ts, anchorsJson: JSON.stringify({ dep_recovered: 'llm' }) })).toEqual({
-      provider: 'llm',
-      ts: ts.toISOString(),
-      notificationId: 'n1',
-    });
-  });
-  it('rejects rows without a valid anchor', () => {
-    const ts = new Date();
-    expect(parseRecoveryRow({ id: 'n', ts, anchorsJson: null })).toBeNull();
-    expect(parseRecoveryRow({ id: 'n', ts, anchorsJson: '{bad' })).toBeNull();
-    expect(parseRecoveryRow({ id: 'n', ts, anchorsJson: JSON.stringify({ dep_recovered: 'x' }) })).toBeNull();
   });
 });

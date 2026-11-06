@@ -4,12 +4,7 @@
 // partner's @prisma/client — we hand-mirror just the fields AO agents read.
 //
 // Source of truth: raas_v4/backend/prisma/schema.prisma
-// Last synced: 2026-08-23
-//
-// ⚠️ 这行 `Last synced` 是本文件与 RAAS schema 之间**唯一**的对齐约定 —— RAAS 侧没有
-// 任何护栏/checklist 会在加列时提醒来同步这里。它一旦过期就是静默的功能缺失：
-// `city_ids`（RAAS 2026-06-19 加的办公城市多选）因为没同步进来，AO 对多城市类型级
-// 失明了两个月，生成出来的 JD 一直只有一个城市。加字段时请一并推这行日期。
+// Last synced: 2026-05-20 (schema rev = current)
 
 // ──────────────────────────────────────────────────────────────────────
 // JobRequisitionSpecification (HRO contract metadata layer)
@@ -61,17 +56,8 @@ export type JobRequisition = {
   age_range: string | null;
   degree_requirement: string | null;
   education_requirement: string | null;
-  /** 兼容主城市名 = city_ids 首项解析出的名字。多城市需求下只是其中之一。 */
   city: string | null;
-  /** 兼容主城市 UUID = city_ids 首项。 */
   city_id: string | null;
-  /**
-   * 办公城市名数组（保序，首项 = 主城市）。**不是** RAAS 的 `city_ids` 原始 UUID 列 ——
-   * 由 `getRequirementDetail` 在 SQL 里 JOIN `city_dict` 读时解析而来，见该文件
-   * `CITY_NAMES_SQL`。需求只有单城市时长度为 1；`city_ids` 为空/存量 NULL 时为 `[]`
-   * （调用方回落 `city`）。🔴 这里永远是城市名，绝不会出现 UUID。
-   */
-  city_names: string[];
   work_address: unknown;
   salary_range: string | null;
   must_have_skills: string[] | null;

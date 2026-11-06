@@ -19,7 +19,6 @@
 import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from 'pg';
 import { currentLogger } from '@/lib/agent-logger';
 import { logApiCall } from '@/lib/external-api-log';
-import { summarizeLogValue } from '@/lib/security/log-value-summary';
 import { isConnFailure, runWithMirrorFallback } from './mirror-fallback';
 
 declare global {
@@ -158,7 +157,7 @@ function reportPgFailure(err: unknown, ctx: FailureCtx): void {
     hint,
     duration_ms: ctx.durationMs,
     sql: ctx.sql ? ctx.sql.slice(0, 800) : undefined,
-    params: summarizeLogValue(ctx.params),
+    params: ctx.params,
     error: (err as Error)?.message,
   });
 }
@@ -178,7 +177,6 @@ async function loggedQuery<T extends QueryResultRow = QueryResultRow>(
   const label = sqlLabel(text);
   const sqlPreview = text.length > 800 ? text.slice(0, 800) + '…' : text;
   const url = inTx ? 'partner-pg://tx-query' : 'partner-pg://query';
-  const paramsForLog = summarizeLogValue(params);
   try {
     const r = await exec(text, params);
     const durationMs = Date.now() - start;
@@ -189,13 +187,13 @@ async function loggedQuery<T extends QueryResultRow = QueryResultRow>(
       method: 'POST',
       status: 200,
       duration_ms: durationMs,
-      request: { sql: sqlPreview, params: paramsForLog, in_tx: inTx },
+      request: { sql: sqlPreview, params, in_tx: inTx },
       response: { rowCount: r.rowCount },
     });
     logger?.apiCall(label, {
       url,
       method: 'POST',
-      request: { sql: sqlPreview, params: paramsForLog, in_tx: inTx },
+      request: { sql: sqlPreview, params, in_tx: inTx },
       status: 200,
       durationMs,
       response: { rowCount: r.rowCount },
@@ -209,13 +207,13 @@ async function loggedQuery<T extends QueryResultRow = QueryResultRow>(
       url,
       method: 'POST',
       duration_ms: durationMs,
-      request: { sql: sqlPreview, params: paramsForLog, in_tx: inTx },
+      request: { sql: sqlPreview, params, in_tx: inTx },
       error: (err as Error).message,
     });
     logger?.apiCall(label, {
       url,
       method: 'POST',
-      request: { sql: sqlPreview, params: paramsForLog, in_tx: inTx },
+      request: { sql: sqlPreview, params, in_tx: inTx },
       durationMs,
       error: (err as Error).message,
     });
@@ -323,14 +321,10 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
  * BEGIN / COMMIT / ROLLBACK are logged as well so a single audit line per
  * step shows the full tx boundary.
  */
-export async function withTx<T>(
-  fn: (client: PoolClient) => Promise<T>,
-  options: { allowMirrorFallback?: boolean } = {},
-): Promise<T> {
+export async function withTx<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
   try {
     return await runTxOnPool(getPool(), fn);
   } catch (err) {
-    if (options.allowMirrorFallback === false) throw err;
     const mirror = getMirrorPool();
     if (mirror && isConnFailure(err)) {
       console.warn('[partner-pg] ✗ partner 不可达 → 本地镜像兜底(事务 · 开发态)');

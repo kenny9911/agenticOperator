@@ -149,11 +149,11 @@ describe('workflow-graph-meta', () => {
     }
   });
 
-  it('deployed nodes include the real TaskAssigner and existing RPA-owned wsIds', () => {
+  it('deployed nodes are 4 RPA-owned wsIds (incl. RuleCheck)', () => {
     const deployed = NODES.filter(n => n.deployment === 'deployed');
-    expect(deployed).toHaveLength(5);
+    expect(deployed).toHaveLength(4);
     const wsIds = deployed.map(n => n.wsId).sort();
-    expect(wsIds).toEqual(['10', '10-5', '4', '6', '9-1']);
+    expect(wsIds).toEqual(['10', '10-5', '4', '9-1']);
   });
 
   it('no node centers within 80px of each other (overlap check)', () => {

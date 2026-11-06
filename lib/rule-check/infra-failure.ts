@@ -50,9 +50,7 @@ export function friendlyInfraReason(
     case 'parse-error':
       return 'AI 模型返回的结果无法解析,稍后将自动重试(候选人未被拒绝)';
     case 'tool-use-loop-exceeded':
-      // Not a timeout (→ llm-call-error) nor a max_tokens cut (→ parse-error):
-      // the model kept requesting more ontology lookups and never answered.
-      return 'AI 模型多轮查询数据仍未得出结论(超出工具调用步数限制,并非超时或 token 超限),稍后将自动重试(候选人未被拒绝)';
+      return 'AI 模型推理超出步数限制,稍后将自动重试(候选人未被拒绝)';
     default:
       return '规则校验因基础设施故障未能完成(候选人未被拒绝)';
   }

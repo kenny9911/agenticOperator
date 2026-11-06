@@ -40,7 +40,7 @@ function evidenceOf(o: IdentityRuleOutcome): string {
 export interface IdentityLinkInfo {
   matchedCandidateId?: string | null;
   matchedCandidateName?: string | null;
-  dedupAction?: 'phone-match' | 'pending-review' | 'no-match';
+  dedupAction?: 'auto-merged' | 'pending-review' | 'new-candidate';
 }
 
 /** The single ontology rule (9-15「同一候选人判定规则」) this check is fetched from /
@@ -52,8 +52,8 @@ export interface IdentityOntologyRule {
   name: string; // '同一候选人判定规则'
 }
 
-/** Identity result → check. A confident phone outcome or no-match is VALIDATED;
- *  any non-phone review suspect is VIOLATED (surfaces as a soft
+/** Identity result → check. A confident outcome (strong-rule dup, or no dup) is
+ *  VALIDATED (PASS); a weak rule-3 dup needs human review → VIOLATED (surfaces as a
  *  flag). The matched rule's eval is PASS (clean) / FAIL (needs review); rules tried
  *  but not fired are NA. `link` (optional) surfaces the matched candidate in the UI.
  *  `ontologyRule` (optional) — when the agent fetched 9-15 from Neo4j/Allmeta, render
@@ -66,8 +66,8 @@ export function identityToCheck(
   llmRationale?: string | null,
 ): CandidateOntologyCheck {
   const linkSuffix =
-    link.matchedCandidateId && link.dedupAction !== 'no-match'
-      ? ` · ${link.dedupAction === 'pending-review' ? '待复核疑似' : '关联到'}候选人 ${link.matchedCandidateName ?? '(未知名)'}（${link.matchedCandidateId}）· 去重动作 ${link.dedupAction ?? ''}`
+    res.samePerson && link.matchedCandidateId
+      ? ` · 关联到候选人 ${link.matchedCandidateName ?? '(未知名)'}（${link.matchedCandidateId}）· 去重动作 ${link.dedupAction ?? ''}`
       : '';
 
   // 本体抓取模式:9-15 是唯一原规则,命中的三级(手机号/姓名+邮箱/六字段)折进 checkPoint。
@@ -76,11 +76,11 @@ export function identityToCheck(
     const tier = matched
       ? `命中第${matched.ruleId.replace(/\D/g, '') || '?'}级(${matched.ruleName})`
       : '三级均未命中';
-    const result: CandidateEval['result'] = res.needsHumanReview
-      ? 'FAIL'
-      : res.samePerson
-        ? 'PASS'
-        : 'NA';
+    const result: CandidateEval['result'] = res.samePerson
+      ? res.needsHumanReview
+        ? 'FAIL'
+        : 'PASS'
+      : 'NA';
     // 纳入依据:优先用大模型生成的业务文案;LLM 不可达时回退机械文案。机械判定依据 +
     // 字段证据始终留在 evidence,大模型文案上位也不丢失可审计的确定性依据。
     const mechanical = `${matched ? '命中' : '未命中'}规则 ${ontologyRule.id} · ${tier}${linkSuffix}`;

@@ -26,8 +26,6 @@
 // We translate that into RaasApiError carrying status + code so callers
 // can branch by code (AGENT_AUTH_INVALID / RATE_LIMITED / etc).
 
-import { prepareResumePdf } from './resume-convert/prepare-resume-pdf';
-
 const TIMEOUT_MS_DEFAULT = 120_000; // RoboHire match-resume can take ~120s
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -137,16 +135,15 @@ export type ParseResumeResponse = RaasResponse & {
 };
 
 export async function parseResume(
-  fileBuffer: Buffer,
+  pdfBuffer: Buffer,
   filename: string,
   opts: CommonOpts = {},
 ): Promise<ParseResumeResponse> {
-  const prepared = await prepareResumePdf(fileBuffer, filename, { traceId: opts.traceId });
   const form = new FormData();
   form.append(
     'file',
-    new Blob([new Uint8Array(prepared.pdf)], { type: 'application/pdf' }),
-    prepared.filename,
+    new Blob([new Uint8Array(pdfBuffer)], { type: 'application/pdf' }),
+    filename || 'resume.pdf',
   );
   const body = await doRequest('POST', '/api/v1/parse-resume', { body: form }, opts);
   return {

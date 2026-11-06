@@ -1,7 +1,7 @@
 // The GOLD STANDARD — the 招聘-v1 production agents, reverse-engineered into a
 // comparable contract so the factory's regeneration (in the Agents-generation
 // domain, reading the SAME Neo4j ontology) can be graded against "what good looks
-// like". The 7 real recruitment agents ARE the answer key.
+// like". The 6 real recruitment agents ARE the answer key.
 //
 // Honest reverse-engineering (no hand-keyed expectations):
 //   · each ontology action is paired to its real agent by EVENT SIGNATURE (the same

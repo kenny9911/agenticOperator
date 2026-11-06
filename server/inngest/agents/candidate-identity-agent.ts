@@ -1,16 +1,20 @@
 // rule-check-candidate-identity — 候选人查重 RULE-CHECK agent("是不是同一个人")。
 //
-// 独立注册、舰队可管理的 audit-only Inngest 函数。它不写 candidate / resume，
-// 也不再被简历解析同步 invoke。只有规范中国大陆手机号命中是确定身份信号；
-// 姓名/邮箱/六字段相似只产生人工复核证据。
+// 2026-06-11 形态(invoke 模式):一个**独立注册、舰队可管理**的 Inngest 函数,但
+// **不具备任何存储操作** —— 只做「抽取规则(9-15)→ 三级判定 → 落审计 → 返回结论」。
+// 简历解析在落库**之前**用 step.invoke 同步调用它并等待返回值,用结论驱动落库
+// (挂老档 / 新建);查重函数自己绝不写 candidate / resume 表。
+//   - 每次 invoke 产生本函数自己的 run(舰队页运行数/成功率/耗时全真实)。
+//   - 本函数下线或失败 → 解析端 catch 后按「新候选人」降级,主链路零阻塞。
 //   - 判定完成后补发本体预留的 CANDIDATE_IDENTITY_CHECKED 事件(action 10-3 的
 //     triggered_event),当前无订阅者,纯通知/蓝图闭环。
 //
-// 唯一 trigger 是专用事件 CANDIDATE_IDENTITY_REQUESTED，留作手动/独立复核入口；
-// 正常简历入库链路不发送也不等待它。
+// trigger 是专用事件 CANDIDATE_IDENTITY_REQUESTED(正常链路不发,主路径是被 invoke;
+// 留作手动/独立复核入口)。判定与审计共用 lib/rule-check/candidate-match/ 的共享
+// 模块(resolveIdentityMatch + auditIdentityResolution),与解析端永远同一套逻辑。
 //
-// 三级规则:手机号为唯一确定身份信号；姓名/邮箱/六字段命中均只标人工复核。
-// 模糊字段可用大模型生成相似性证据,绝不自动合并。业务依赖可降级,
+// 三级规则:精确字段(手机号/邮箱/性别)直接比对,模糊字段(姓名/学校/专业/学历)
+// 大模型语义等价;弱命中(第3级六字段)只标人工复核,绝不自动合并。业务依赖可降级,
 // 但审计库写失败会抛出重试,禁止产生无审计结论。
 
 import { inngest } from '@/server/inngest/client';
@@ -47,7 +51,7 @@ function defaultDeps(): IdentityHandlerDeps {
     repo: partnerPgCandidateRepo,
     judge: makeAiFieldJudge(),
     persist: persistCandidateRuleCheck,
-    // 总开关:CANDIDATE_IDENTITY_ENABLED=0 关闭独立审计入口。
+    // 总开关:CANDIDATE_IDENTITY_ENABLED=0 关闭查重(解析端同样跳过 invoke)。
     enabled: process.env.CANDIDATE_IDENTITY_ENABLED !== '0',
   };
 }
@@ -109,9 +113,8 @@ export async function candidateIdentityHandler(ctx: HandlerCtx, depsOverride: Pa
             candidate_id: rec.candidate_id,
             resume_id: (ev.resume_id as string) ?? null,
             same_person: computed.result.samePerson,
+            same_as_candidate_id: computed.sameAsCandidateId,
             dedup_action: computed.dedupAction,
-            suspected_candidate_id:
-              computed.dedupAction === 'pending-review' ? computed.matchedCandidateId : null,
             matched_rule: computed.result.matchedRule?.ruleId ?? null,
             audit_id: audit.id,
           },
@@ -124,13 +127,14 @@ export async function candidateIdentityHandler(ctx: HandlerCtx, depsOverride: Pa
         dedup_action: computed.dedupAction,
         audit_id: audit.id,
       });
-      // ④ 返回独立审计结论，供手动复核入口和可观测页展示。
+      // ④ 返回结论 —— 这是 step.invoke 的返回值,简历解析用它驱动落库。
       return {
         skipped: false as const,
         samePerson: computed.result.samePerson,
         matchedRule: computed.result.matchedRule?.ruleId ?? null,
         matchedCandidateId: computed.matchedCandidateId,
         matchedCandidateName: computed.matchedCandidateName,
+        sameAsCandidateId: computed.sameAsCandidateId,
         dedupAction: computed.dedupAction,
         needsHumanReview: computed.result.needsHumanReview,
         poolSize: computed.poolSize,
@@ -138,7 +142,7 @@ export async function candidateIdentityHandler(ctx: HandlerCtx, depsOverride: Pa
       };
     } catch (e) {
       if (isRuleAuditPersistenceFailure(e)) throw e;
-      // 非审计写入错误以可观测结果返回；审计持久化失败仍必须抛出重试。
+      // Soft-fail:查重绝不向调用方(简历解析)抛错 —— 返回 error,解析按新人降级。
       fileLogger.event('handler.error', { error: (e as Error).message ?? String(e) });
       return { skipped: false as const, error: (e as Error).message ?? String(e) };
     }

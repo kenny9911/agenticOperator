@@ -1,10 +1,10 @@
-// Function ① — 订阅 RESUME_DOWNLOADED → download resume → parse → 持久化 → 发 RESUME_PROCESSED
+// Function ① — 订阅 RESUME_DOWNLOADED → download PDF → parse → 持久化 → 发 RESUME_PROCESSED
 //
 // 流程 (per agentic-operator-onboarding v7 §4.8 + ADR-0011 边界):
 //   1. RESUME_DOWNLOADED 带 transport 元数据和可选 expectation_payload。
 //      raas **不**预先 parse — parse 是 agent 的职责；candidate expectation
 //      则由 RAAS 上传入口直接提供，AO 不需要另改事件名等待补齐。
-//   2. agent → GET /api/v1/resumes/uploads/<upload_id>/raw  (PDF/DOC/DOCX bytes, RAAS MinIO)
+//   2. agent → GET /api/v1/resumes/uploads/<upload_id>/raw  (PDF bytes, RAAS MinIO)
 //   3. agent → POST {RoboHire}/api/v1/parse-resume   (multipart — 直连 RoboHire, 不走 RAAS proxy)
 //   4. agent → partner Postgres (Candidate + CandidateExpectation + Resume)
 //      并同步 AllmetaOntology (Neo4j)。
@@ -15,7 +15,7 @@
 // 跳过 step 2-3.
 //
 // etag 兜底: 事件里的 etag 可能是 null (RAAS 手动上传链路目前没填),
-// agent 在拿到原始简历字节后用 MD5 算一个本地 etag 作为 saveCandidate
+// agent 在拿到 PDF 字节后用 MD5 算一个本地 etag 作为 saveCandidate
 // 的 dedup key.
 
 import { createHash } from 'node:crypto';
@@ -33,15 +33,13 @@ import {
   writeResumeInstance,
 } from '@/lib/allmeta-writers';
 import { parseResumeDirect, RobohireApiError } from '@/lib/robohire-client';
-import { DocumentConversionError } from '@/lib/resume-convert/prepare-resume-pdf';
-import { routeDocumentConversionFailure } from '@/lib/resume-convert/route-conversion-failure';
 import { extractCandidateExpectation } from '@/lib/mappers/candidate-preferences';
 import {
   normalizeCandidateExpectationPayload,
 } from '@/lib/raas-v1/candidate-expectation';
-import { parseResumeProcessingContract } from '@/lib/raas-v1/resume-processing-contract';
+import { detectResumeFormat, convertDocxBufferToPdf } from '@/lib/resume-convert/docx-to-pdf';
 import { classifyRobohire } from '@/lib/dependency-health/classify';
-import { reportDependencyDegraded, recordDependencyOk } from '@/lib/dependency-health/report';
+import { reportDependencyDegraded } from '@/lib/dependency-health/report';
 import { RECRUITMENT_DOMAIN_ID } from '@/lib/domain-ids';
 import { inngest, type ResumeProcessedData } from '@/server/inngest/client';
 import { skipIfRaasV1Paused } from '@/server/inngest/raas-v1';
@@ -49,11 +47,9 @@ import { createAgentLogger, runWithLogger } from '@/lib/agent-logger';
 import { prisma } from '@/server/db';
 import { notifyRecruitmentLifecycle } from '@/server/notifications/recruitment-lifecycle';
 import { runLockCheck } from '@/lib/candidate-lock/run-lock-check';
-import { readResumeDownloadedLockEvidence } from '@/lib/rmhr/resume-downloaded-lock';
-import {
-  readRmhrManualCandidateIdentity,
-  redactResumeDownloadedIdentityForLog,
-} from '@/lib/raas-v1/resume-candidate-identity';
+// 查重(invoke 模式):落库前同步调用独立的「候选人查重」函数,拿结论驱动挂老档/新建。
+import { candidateIdentityAgent } from '@/server/inngest/agents/candidate-identity-agent';
+import { isRuleAuditPersistenceFailure } from '@/lib/rule-check/ontology-audit-writer';
 
 // Local alias mirroring the RoboHire parse-resume `data` shape that we
 // historically imported from raas-api-client.ts. After the 2026-05-20
@@ -84,17 +80,6 @@ export const resumeParserAgent = inngest.createFunction(
     //   B) Flat (legacy / publish-test) —
     //      { upload_id, bucket, object_key, parsed, ... }
     const raw = unwrapDownloadedEnvelope(event.data);
-    const authoritativeIdentity = readRmhrManualCandidateIdentity(raw);
-    let processingContract;
-    try {
-      processingContract = parseResumeProcessingContract(raw);
-    } catch (error) {
-      throw new NonRetriableError(
-        `[resume-processing-contract] invalid RESUME_DOWNLOADED: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
     const expectationPayload = normalizeCandidateExpectationPayload(
       raw.expectation_payload ?? raw.expectationPayload,
     );
@@ -116,15 +101,9 @@ export const resumeParserAgent = inngest.createFunction(
       object_key: raw.object_key ?? raw.objectKey,
       filename: raw.filename,
       employee_id: raw.employee_id ?? raw.employeeId ?? raw.operator_employee_id ?? null,
-      operator_id: processingContract?.operator_id ?? raw.operator_id ?? null,
-      processing_mode: processingContract?.processing_mode ?? null,
-      processing_reason: processingContract?.processing_reason ?? null,
-      contract_version: processingContract?.contract_version ?? null,
       locked_by_employee_id: raw.locked_by_employee_id ?? raw.lockedByEmployeeId ?? null,
       client_id: raw.client_id ?? null,
       job_requisition_id: raw.job_requisition_id ?? null,
-      has_rmhr_manual_name: authoritativeIdentity?.name != null,
-      has_rmhr_manual_phone: authoritativeIdentity?.phone != null,
       sourcing_channel_id: raw.sourcing_channel_id ?? raw.sourcingChannelId ?? null,
       hr_folder: raw.hr_folder ?? raw.hrFolder ?? null,
       expectation_payload_keys: expectationPayload
@@ -139,7 +118,7 @@ export const resumeParserAgent = inngest.createFunction(
       from: 'RAAS',
       to: 'AO.resumeParser',
       event_name: event.name,
-      raw_event_data: redactResumeDownloadedIdentityForLog(event.data),
+      raw_event_data: event.data,
     });
 
     // ── 提取 anchor 字段 ──
@@ -149,25 +128,9 @@ export const resumeParserAgent = inngest.createFunction(
     const eventEtag = raw.etag ?? null; // 可能是 null (RAAS 手动上传链路没填)
     const filename = raw.filename;
     const employeeId = raw.employee_id ?? raw.employeeId ?? raw.operator_employee_id ?? null;
-    const operator_id =
-      processingContract?.operator_id ??
-      (typeof raw.operator_id === 'string' && raw.operator_id.trim()
-        ? raw.operator_id.trim()
-        : null);
-    // File-level uploader attribution may use the operator when RAAS
-    // intentionally clears employee_id for rmhr_deferred. Candidate ownership
-    // remains independent and is derived only from locked_by_employee_id.
-    const resumeUploaderEmployeeId =
-      typeof employeeId === 'string' && employeeId.trim()
-        ? employeeId.trim()
-        : operator_id;
+    const operator_id = raw.operator_id ?? null;
     const client_id = raw.client_id ?? null;
     const job_requisition_id = raw.job_requisition_id ?? null;
-    const job_posting_id =
-      typeof (raw.job_posting_id ?? raw.jobPostingId) === 'string' &&
-      (raw.job_posting_id ?? raw.jobPostingId).trim()
-        ? (raw.job_posting_id ?? raw.jobPostingId).trim()
-        : null;
     // RAAS Nextcloud 路径(ADR-0040)在 RESUME_DOWNLOADED 预填窄化后的客户需求 id
     // 数组:已按「文件名岗位名 × 招聘员名下在招岗位」模糊匹配收敛。透传给下游
     // ruleCheckAgent,使其直接对这些 JR 撮合,而非按 employee_id 扫名下全部在招岗位。
@@ -186,14 +149,20 @@ export const resumeParserAgent = inngest.createFunction(
         : typeof raw.sourcingChannelId === 'string' && raw.sourcingChannelId.trim()
           ? raw.sourcingChannelId.trim()
           : null;
-    // RMHR 锁定事实必须完整贯穿：holder 是锁定正证据，locked_at 是防旧写时间。
-    // received_at 仅在 RMHR 旧响应漏时间时提供可重放的观测时间。holder 缺失不等于
-    // unlock，也不能再回落上传者伪造 Candidate.employee_id。
-    const {
-      locked_by_employee_id,
-      locked_at,
-      lock_observed_at,
-    } = readResumeDownloadedLockEvidence(raw);
+    // RMHR 锁定归属透传 (raas 2026-05-27 起在 RESUME_DOWNLOADED 上发
+    // locked_by_employee_id / locked_by_name / locked_at, c200efd)。锁持有人是
+    // 候选人归属权威 — 被他人锁定时 AO 把候选人归属校正为锁持有人而非上传者
+    // (per raas ADR-0041 "锁在他人则同步真实归属")。snake/camel 双形态兼容。
+    const locked_by_employee_id =
+      typeof raw.locked_by_employee_id === 'string' && raw.locked_by_employee_id.trim()
+        ? raw.locked_by_employee_id.trim()
+        : typeof raw.lockedByEmployeeId === 'string' && raw.lockedByEmployeeId.trim()
+          ? raw.lockedByEmployeeId.trim()
+          : null;
+    // 归属生效值: 锁持有人优先, 无锁信息回落上传者。仅用于"归属"语义的写入
+    // (candidate.employee_id / Neo4j Candidate.employee_id); resume.uploaded_by
+    // 与 RESUME_PROCESSED.employee_id (matcher 按上传者扫名下岗位) 保持上传者。
+    const ownerEmployeeId = locked_by_employee_id ?? employeeId;
     const traceId = getTraceId(event.data);
 
     // External-dependency-health context — passed to reportDependencyDegraded
@@ -246,17 +215,17 @@ export const resumeParserAgent = inngest.createFunction(
       parsed = parsedFromEvent;
       logger.info(
         `[resume-persist] legacy path · 事件已带 parsed.data, 跳过 download+parse · ` +
-          `parsed_fields=${Object.keys(parsed).length}`,
+          `name="${parsed.name ?? '?'}"`,
       );
     } else {
       // v7 §4.8 标准路径: 自己拉 PDF 字节 + 自己 parse.
       const stepKey = sanitize(String(upload_id));
       const downloadAndParse = await step.run(`download-and-parse-${stepKey}`, async () => {
         // 1) 直连 MinIO 下载 PDF 字节 (2026-05-20: 不再走 RAAS proxy)
-        let resumeBuffer: Buffer;
+        let pdfBuffer: Buffer;
         let minioContentType: string | null = null;
         try {
-          resumeBuffer = await getResumeBuffer(String(bucket), String(object_key));
+          pdfBuffer = await getResumeBuffer(String(bucket), String(object_key));
           try {
             const stat = await statResume(String(bucket), String(object_key));
             minioContentType = stat.contentType;
@@ -274,42 +243,54 @@ export const resumeParserAgent = inngest.createFunction(
           throw e;
         }
         logger.info(
-          `[resume-persist] downloaded resume from MinIO · upload_id=${upload_id} ` +
-            `bytes=${resumeBuffer.length} content-type=${minioContentType ?? '—'} ` +
+          `[resume-persist] downloaded PDF from MinIO · upload_id=${upload_id} ` +
+            `bytes=${pdfBuffer.length} content-type=${minioContentType ?? '—'} ` +
             `filename="${filename ?? '—'}"`,
         );
 
+        // 1b) 格式护栏(2026-06-12):RoboHire 只支持 PDF,按 magic bytes 识别真实
+        //     格式(扩展名/事件 mime 不可信)。docx → mammoth+系统 Chrome 转成 PDF
+        //     再发;转换失败/老 .doc/unknown → 原样发,由 UNPARSEABLE 路径兜底。
+        //     注意:saveCandidate 的 MD5 etag 仍用**原始字节**算(dedup 语义 = 同一
+        //     上传文件),只有发给 RoboHire 的 buffer 换成转换后的 PDF。
+        const rawFormat = detectResumeFormat(pdfBuffer);
+        let parseBuffer = pdfBuffer;
+        let parseFilename = (filename as string | undefined) ?? 'resume.pdf';
+        if (rawFormat === 'docx') {
+          try {
+            parseBuffer = await convertDocxBufferToPdf(pdfBuffer);
+            parseFilename = parseFilename.replace(/\.docx?$/i, '') + '.pdf';
+            fileLogger.event('docx-converted', {
+              upload_id,
+              original_bytes: pdfBuffer.length,
+              pdf_bytes: parseBuffer.length,
+            });
+            logger.info(
+              `[resume-persist] docx → pdf converted · upload_id=${upload_id} ` +
+                `${pdfBuffer.length}B → ${parseBuffer.length}B`,
+            );
+          } catch (e) {
+            // 转换失败:原样发碰运气(RoboHire 拒了会走 UNPARSEABLE 终止),不在这里断链。
+            fileLogger.event('docx-convert-failed', { upload_id, error: (e as Error).message });
+            logger.warn(
+              `[resume-persist] docx→pdf 转换失败,原样发 RoboHire 兜底 · ${(e as Error).message}`,
+            );
+          }
+        } else if (rawFormat === 'doc' || rawFormat === 'unknown') {
+          fileLogger.event('non-pdf-format', { upload_id, detected: rawFormat });
+          logger.warn(
+            `[resume-persist] 检测到非 PDF 格式 (${rawFormat}) · 原样发 RoboHire(老 .doc 不支持转换,建议上传方转 docx/pdf)`,
+          );
+        }
+
         // 2) POST /api/v1/parse-resume (multipart) — 直连 RoboHire
-        // parseResumeDirect is the single format boundary: PDF passes through;
-        // DOC/DOCX first go through internal Gotenberg; unsupported or failed
-        // conversion never reaches RoboHire. The MD5 below still uses original
-        // MinIO bytes so upload dedup semantics do not change.
-        const documentFilename = (filename as string | undefined) ?? 'resume.pdf';
+        const pdfFilename = parseFilename;
         let parseRes: Awaited<ReturnType<typeof parseResumeDirect>>;
         try {
           // 显式传 fileLogger → RoboHire parse-resume 完整 in/out 进 per-run 审计
           // (Inngest step.run 内 ALS 不可靠,必须显式传闭包 logger).
-          parseRes = await parseResumeDirect(resumeBuffer, documentFilename, { traceId, logger: fileLogger });
+          parseRes = await parseResumeDirect(parseBuffer, pdfFilename, { traceId, logger: fileLogger });
         } catch (e) {
-          if (e instanceof DocumentConversionError) {
-            fileLogger.event('document-conversion.failed', {
-              upload_id,
-              code: e.code,
-              category: e.category,
-              source_format: e.sourceFormat,
-              retryable: e.retryable,
-              error: e.message,
-            });
-
-            await routeDocumentConversionFailure(e, String(upload_id), {
-              markUploadFailed: markResumeUploadFailed,
-              onMarkFailure: (markErr) => {
-                logger.warn(
-                  `[resume-persist] markResumeUploadFailed failed: ${(markErr as Error).message}`,
-                );
-              },
-            });
-          }
           // Document-content failure (image-only / scanned / corrupt PDF — RoboHire
           // truthfully reports "no extractable text"). This is NOT a vendor
           // degradation: do not pollute RoboHire health and do not park-and-retry a
@@ -323,7 +304,6 @@ export const resumeParserAgent = inngest.createFunction(
               logger.warn(
                 `[resume-persist] markResumeUploadFailed failed: ${(markErr as Error).message}`,
               );
-              throw markErr;
             }
             fileLogger.event('parse.unparseable', { upload_id, error: e.message });
             throw new NonRetriableError(
@@ -339,15 +319,14 @@ export const resumeParserAgent = inngest.createFunction(
         // Silent degrade: 200 OK but RoboHire extracted nothing usable.
         const oc = classifyRobohire('parseResume', parseRes);
         if (!oc.ok) await reportDependencyDegraded(oc, depCtx);
-        await recordDependencyOk('robohire', 'parseResume', depCtx);
         logger.info(
           `[resume-persist] RoboHire parse-resume OK · cached=${parseRes.cached} ` +
-            `requestId=${parseRes.requestId}`,
+            `name="${parseRes.data?.name ?? '?'}" requestId=${parseRes.requestId}`,
         );
 
         // 3) 算 MD5 etag 作为 saveCandidate dedup 兜底.
         //    返回 primitive 给下个 step (Buffer 不能跨 step.run 序列化).
-        const md5 = createHash('md5').update(resumeBuffer).digest('hex');
+        const md5 = createHash('md5').update(pdfBuffer).digest('hex');
 
         return {
           // RobohireParseResumeData 与 RaasParseResumeData 形状 1:1 (RAAS 是
@@ -368,6 +347,53 @@ export const resumeParserAgent = inngest.createFunction(
     const finalEtag =
       typeof eventEtag === 'string' && eventEtag.trim() ? eventEtag.trim() : computedEtag;
 
+    // ── 查重(invoke 模式,2026-06-11):同步调用独立的「候选人查重」函数并等待结论。
+    // 该函数只判定 + 落审计、不做任何存储操作(职责:查重=判定,解析=操作);它有
+    // 自己的 run(舰队可管理/可下线)。落库前拿到 sameAsCandidateId 驱动挂老档/新建:
+    //    强命中(auto-merged)→ same_as_candidate_id=老人 ID → 复用老行 UPDATE、新简历挂
+    //    老 Candidate(1:N);弱信号/无命中 → null → 走正常 dedup/新建。
+    // soft-fail:函数下线/超时/出错 → catch 后按「新候选人」降级,主流程零阻塞。
+    interface IdentityVerdict {
+      sameAsCandidateId?: string | null;
+      dedupAction?: string;
+      matchedCandidateId?: string | null;
+      error?: string;
+    }
+    let identityVerdict: IdentityVerdict | null = null;
+    if (process.env.CANDIDATE_IDENTITY_ENABLED !== '0') {
+      try {
+        identityVerdict = (await step.invoke('invoke-candidate-dedup', {
+          function: candidateIdentityAgent,
+          data: {
+            upload_id: String(upload_id),
+            resume_id: raw.resume_id ?? null,
+            trace_id: null,
+            invoked_by: 'resume-parser',
+            // 候选人尚未建库 → candidate_id 用 upload_id 占位(self 排除无影响)。
+            candidate_id: String(upload_id),
+            parsed: { data: parsed },
+          },
+          timeout: '90s',
+        })) as unknown as IdentityVerdict | null;
+        fileLogger.event('candidate-identity.verdict', {
+          upload_id,
+          dedup_action: identityVerdict?.dedupAction ?? null,
+          same_as_candidate_id: identityVerdict?.sameAsCandidateId ?? null,
+          matched_candidate_id: identityVerdict?.matchedCandidateId ?? null,
+          error: identityVerdict?.error ?? null,
+        });
+      } catch (e) {
+        // A business lookup can degrade, but an authoritative rule decision may
+        // never advance without its durable audit row. Propagate this tagged
+        // failure so the parent Inngest run retries before candidate storage.
+        if (isRuleAuditPersistenceFailure(e)) throw e;
+        // 查重函数被下线/超时 → 按新候选人降级,绝不阻塞入库。
+        fileLogger.event('candidate-identity.invoke_failed', { upload_id, error: (e as Error).message });
+        identityVerdict = null;
+      }
+    }
+    const sameAsCandidateId = identityVerdict?.sameAsCandidateId ?? null;
+
     // ── 直写 Partner Postgres (2026-05-20: 不再走 RAAS API) ──
     const saveResult = await step.run('save-candidate', async () => {
       const input: SaveCandidateInput = {
@@ -377,15 +403,14 @@ export const resumeParserAgent = inngest.createFunction(
         etag: finalEtag,
         size: typeof file_size === 'number' ? file_size : null,
         filename: filename ?? undefined,
-        employee_id: resumeUploaderEmployeeId ?? undefined,
+        employee_id: employeeId ?? undefined,
         locked_by_employee_id: locked_by_employee_id ?? undefined,
-        locked_at: locked_at ?? undefined,
-        lock_observed_at: lock_observed_at ?? undefined,
         client_id: client_id ?? undefined,
         job_requisition_id: job_requisition_id ?? undefined,
         sourcing_channel_id: sourcing_channel_id ?? undefined,
         expectation_payload: expectationPayload,
-        authoritative_identity: authoritativeIdentity,
+        // 同一人 → 复用老 candidate_id(UPDATE 挂新简历到老 Candidate,1:N);null → 走兜底 dedup。
+        same_as_candidate_id: sameAsCandidateId ?? undefined,
         parsed: { data: parsed as Record<string, unknown> },
       };
 
@@ -407,10 +432,8 @@ export const resumeParserAgent = inngest.createFunction(
           application_id: r.application_id,
           candidate_created: r.candidate_created,
           resume_created: r.resume_created,
-          authoritative_identity_source: authoritativeIdentity?.source ?? null,
-          has_authoritative_name: authoritativeIdentity?.name != null,
-          has_authoritative_phone: authoritativeIdentity?.phone != null,
-          robohire_parsed_keys: Object.keys(parsed).sort(),
+          full_input_to_save: input,        // 完整传给 saveCandidateToPartnerPg 的入参
+          full_robohire_parsed: parsed,     // 完整 RoboHire parse-resume 输出
         });
         return r;
       } catch (e) {
@@ -433,43 +456,12 @@ export const resumeParserAgent = inngest.createFunction(
     // ── 5b. 写 Neo4j Candidate + Candidate_Expectation + Resume via Allmeta ──
     const stepKeyForNeo4j = sanitize(String(upload_id));
     await step.run(`write-candidate-neo4j-${stepKeyForNeo4j}`, async () => {
-      const lockSnapshot = saveResult.candidate_lock_snapshot;
-      const candidateSnapshot = saveResult.candidate_snapshot;
-      if (!lockSnapshot || !candidateSnapshot) {
-        throw new Error(
-          `[resume-persist] partner-pg returned incomplete Candidate snapshot for ${saveResult.candidate_id}`,
-        );
-      }
-      // New candidates historically projected parser-only graph fields such as
-      // birth date / degree / work years. Keep that behavior while replacing
-      // only the missing name with the exact Partner-PG value. Phone hits use
-      // the full persisted row; transport replays use the identity/lock-only
-      // projection below so PG nulls cannot erase parser-only graph fields.
-      const candidateMirrorParsed = saveResult.candidate_created
-        ? {
-            ...(parsed as Record<string, unknown>),
-            name: candidateSnapshot.name,
-          }
-        : (parsed as Record<string, unknown>);
       const r = await writeCandidateInstance({
         candidate_id: saveResult.candidate_id,
-        // Mirror the exact tuple committed by Partner PG. Re-deriving from the
-        // raw event here would let stale-event protection diverge across stores.
-        employee_id: lockSnapshot.employee_id,
-        is_locked: lockSnapshot.is_locked,
-        lock_start_time: lockSnapshot.lock_start_time,
-        parsed: candidateMirrorParsed,
-        // Candidate contact mirrors the exact 11-digit value committed to partner PG;
-        // raw RoboHire phone remains only in Resume.raw_parse_result.
-        normalized_phone: saveResult.mobile_normalized,
-        // A phone hit may intentionally preserve an established Candidate name
-        // and other identity fields. Mirror the UPDATE RETURNING snapshot so
-        // Allmeta cannot overwrite that candidate with conflicting parser data.
-        persisted_candidate: saveResult.candidate_created ? null : candidateSnapshot,
-        // A replay repairs only identity + lock. Candidate columns that Partner
-        // PG does not populate (birth date / degree / work years) must not be
-        // sent as null and erase the earlier parser-derived graph values.
-        identity_lock_only: saveResult.idempotent_replay,
+        // 归属语义 — 锁持有人优先 (c200efd)。resume.uploaded_by / writeResumeInstance
+        // 仍记上传者; 仅 Candidate 归属随 RMHR 锁权威。
+        employee_id: ownerEmployeeId,
+        parsed: parsed as unknown as Record<string, unknown>,
       });
       if (r.ok) {
         logger.info(`[resume-persist] ✓ allmeta wrote Candidate ${saveResult.candidate_id}`);
@@ -494,19 +486,11 @@ export const resumeParserAgent = inngest.createFunction(
           }).catch(() => { /* never break the agent run on observability */ });
         }
       } else {
-        // RMHR manual identity is the exact bug-fixed path: do not announce a
-        // successfully processed resume while its authoritative Candidate
-        // identity exists only in Partner PG. Inngest retries this failed step;
-        // a later event replay can also re-read and mirror the PG snapshot.
-        if (authoritativeIdentity) {
-          logger.warn('[resume-persist] RMHR manual Candidate mirror failed; retry required');
-          throw new Error('[resume-persist] RMHR manual Candidate mirror failed');
-        }
         logger.warn(`[resume-persist] allmeta Candidate write failed: ${r.error}`);
       }
       return r;
     });
-    if (expectationPayload && !saveResult.idempotent_replay) {
+    if (expectationPayload) {
       const candidateExpectationId = saveResult.candidate_expectation_id;
       if (!candidateExpectationId) {
         throw new Error(
@@ -536,7 +520,7 @@ export const resumeParserAgent = inngest.createFunction(
         resume_id: saveResult.resume_id,
         candidate_id: saveResult.candidate_id,
         job_requisition_id: job_requisition_id ?? null,
-        employee_id: resumeUploaderEmployeeId,
+        employee_id: employeeId,
         file_path: object_key,
         parsed: parsed as unknown as Record<string, unknown>,
       });
@@ -554,14 +538,8 @@ export const resumeParserAgent = inngest.createFunction(
     // (运行轨迹里不再出现 rmhr-lock-check,主流程零影响);恢复 = 打开开关,代码不动。
     // 开启时:调公司 RMHR uploadByRecruiterEmail(上传+锁定合一)拿当前锁定真相、
     // 刷新 AO 认知并据此放行/拦截。
-    const rmhrDeferred = processingContract?.processing_mode === 'rmhr_deferred';
-    if (rmhrDeferred && process.env.LOCK_CHECK_ENABLED === '1') {
-      logger.info(
-        '[resumeParser] rmhr_deferred 已由 RAAS 完成 email_not_found 分类;跳过 AO 二次 RMHR 锁检查',
-      );
-    }
     const lockResult =
-      process.env.LOCK_CHECK_ENABLED === '1' && !rmhrDeferred
+      process.env.LOCK_CHECK_ENABLED === '1'
         ? await step.run('rmhr-lock-check', async () =>
             runLockCheck({
               candidateId: saveResult.candidate_id,
@@ -614,19 +592,14 @@ export const resumeParserAgent = inngest.createFunction(
       // 给 matcher 用的 anchor
       upload_id,
       employee_id: employeeId ?? undefined,
-      operator_id,
-      contract_version: processingContract?.contract_version,
-      processing_mode: processingContract?.processing_mode,
-      processing_reason: processingContract?.processing_reason,
       // parsed.data 透传 (matcher 仍可以用作 resume text 来源)
-      parsed: { data: parsed as Record<string, unknown> },
+      parsed: { data: parsed as unknown as Record<string, unknown> },
       // 持久化的产物 — 让下游知道 candidate_id 已经存在
       candidate_id: saveResult.candidate_id,
       resume_id: saveResult.resume_id,
       // 透传上传时关联的岗位 — matchResumeAgent 据此决定"单岗位精准匹配"
       // 还是"上传者名下全部 recruiting 岗位扫描"。
       job_requisition_id: job_requisition_id ?? null,
-      job_posting_id,
       // ADR-0040 — RAAS 预填的窄化 JR 数组(单数 job_requisition_id 为空时,
       // ruleCheckAgent 直接循环这些 id 取详情撮合,跳过 path-B 名下全量扫描)。
       job_requisition_ids: job_requisition_ids.length > 0 ? job_requisition_ids : undefined,
@@ -655,17 +628,12 @@ export const resumeParserAgent = inngest.createFunction(
       resume_id: saveResult.resume_id,
       application_id: saveResult.application_id,
       job_requisition_id: job_requisition_id ?? null,
-      job_posting_id,
-      operator_id,
-      contract_version: processingContract?.contract_version ?? null,
-      processing_mode: processingContract?.processing_mode ?? null,
-      processing_reason: processingContract?.processing_reason ?? null,
       sourcing_channel_id: sourcing_channel_id ?? null,
       client_id: client_id ?? null,
       filename: (filename ?? 'resume.pdf').trim(),
       bucket,
       object_key,
-      parsed_keys: Object.keys(parsed).sort(),
+      full_payload: processedPayload,    // 完整 emit payload (含 parsed.data, snapshot 等)
     });
     if (!lockOnly) {
       await step.sendEvent('emit-resume-processed', {
@@ -723,8 +691,7 @@ export const resumeParserAgent = inngest.createFunction(
       ok: true,
       upload_id,
       candidate_id: saveResult.candidate_id,
-      candidate_name:
-        saveResult.candidate_snapshot?.name ?? parsed.name ?? null,
+      candidate_name: parsed.name ?? null,
       resume_id: saveResult.resume_id,
       application_id: saveResult.application_id,
       is_new_candidate: saveResult.candidate_created,

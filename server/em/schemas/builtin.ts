@@ -1,4 +1,4 @@
-// Hardcoded fallback schemas for core events.
+// Hardcoded fallback schemas for the 8 core events.
 //
 // Source-of-truth contract: when EventDefinition table has a row from Neo4j,
 // the registry uses that row. When it doesn't (cold start / off-VPN / event
@@ -8,7 +8,6 @@
 
 import { z } from "zod";
 import type { EventSchemaRegistration } from "./types";
-import { validateResumeProcessingContract } from '@/lib/raas-v1/resume-processing-contract';
 
 // ── Common envelope sub-schemas ───────────────────────────────────────────
 
@@ -25,7 +24,7 @@ const TraceSchema = z
 // Most RAAS events are wrapped in an envelope:
 //   { entity_type, entity_id?, event_id, payload: {...}, trace? }
 // Permissive base — individual events tighten the payload.
-function envelope<T extends z.ZodTypeAny>(payload: T) {
+function envelope(payload: z.ZodType) {
   return z.object({
     entity_type: z.string().optional(),
     entity_id: z.union([z.string(), z.null()]).optional(),
@@ -35,57 +34,16 @@ function envelope<T extends z.ZodTypeAny>(payload: T) {
   });
 }
 
-function addResumeProcessingContractIssues(
-  payload: Record<string, unknown>,
-  ctx: z.RefinementCtx,
-) {
-  for (const issue of validateResumeProcessingContract(payload)) {
-    ctx.addIssue({ code: 'custom', path: [issue.path], message: issue.message });
-  }
-  if (
-    payload.candidate_identity_source === 'rmhr_manual_refill' &&
-    payload.candidate_name == null &&
-    payload.candidate_phone == null
-  ) {
-    ctx.addIssue({
-      code: 'custom',
-      path: ['candidate_identity_source'],
-      message: 'rmhr_manual_refill requires candidate_name or candidate_phone',
-    });
-  }
-}
-
 // ── Event schemas ─────────────────────────────────────────────────────────
 
 const REQUIREMENT_LOGGED_v1 = envelope(
   z.object({
-    job_requisition_id: z.string().min(1),
-    requirement_id: z.string().optional(),
-    client_id: z.string().nullable().optional(),
+    requirement_id: z.string(),
+    client_id: z.string().optional(),
+    job_requisition_id: z.string().optional(),
     title: z.string().optional(),
   }).passthrough(),
 );
-
-const CLARIFICATION_READY_v1 = envelope(
-  z.object({
-    // Gate-runner payloads include this field. Manual force_ready events use
-    // canonical envelope.entity_id only, so keep the payload field optional.
-    job_requisition_id: z.string().min(1).optional(),
-    job_requisition_specification_id: z.string().nullable().optional(),
-    client_id: z.string().nullable().optional(),
-    clarification_status: z.string().optional(),
-    clarify_questions: z.array(z.unknown()).optional(),
-    ai_summary: z.string().nullable().optional(),
-  }).passthrough(),
-).superRefine((event, ctx) => {
-  if (!event.entity_id && !event.payload.job_requisition_id) {
-    ctx.addIssue({
-      code: 'custom',
-      path: ['entity_id'],
-      message: 'CLARIFICATION_READY requires entity_id or payload.job_requisition_id',
-    });
-  }
-});
 
 const RESUME_DOWNLOADED_v1 = envelope(
   z.object({
@@ -97,9 +55,6 @@ const RESUME_DOWNLOADED_v1 = envelope(
     size: z.number().nullable().optional(),
     employee_id: z.string().nullable().optional(),
     job_requisition_id: z.string().nullable().optional(),
-    candidate_name: z.string().trim().min(1).nullable().optional(),
-    candidate_phone: z.string().trim().min(1).nullable().optional(),
-    candidate_identity_source: z.literal('rmhr_manual_refill').nullable().optional(),
     // ADR-0040 — RAAS Nextcloud 路径预填的窄化客户需求 id 数组(可空/缺省)。
     job_requisition_ids: z.array(z.string()).optional(),
     // Browser-extension upload contract. RAAS only sends non-empty fields;
@@ -118,7 +73,7 @@ const RESUME_DOWNLOADED_v1 = envelope(
       .nullable()
       .optional(),
     received_at: z.string().optional(),
-  }).passthrough().superRefine(addResumeProcessingContractIssues),
+  }).passthrough(),
 );
 
 // 2026-05-24: upload_id 由必填改可选 — RaaS Web Console "更换关联岗位" / "匹配
@@ -139,30 +94,16 @@ const RESUME_PROCESSED_v1 = envelope(
       })
       .optional(),
     job_requisition_id: z.string().optional(),
-  }).passthrough().superRefine(addResumeProcessingContractIssues),
+  }).passthrough(),
 );
 
 const JD_GENERATED_v1 = envelope(
   z.object({
-    job_posting_id: z.string().min(1),
-    jd_content: z.string().min(1),
     requirement_id: z.string().optional(),
     job_requisition_id: z.string().optional(),
-    client_id: z.string().optional(),
     jd_id: z.string().optional(),
     title: z.string().optional(),
     summary: z.string().optional(),
-  }).passthrough(),
-);
-
-const JD_APPROVED_v1 = envelope(
-  z.object({
-    jd_id: z.string().min(1),
-    job_requisition_id: z.string().min(1),
-    approver_id: z.string().nullable().optional(),
-    target_hiring_manager_id: z.string().nullable().optional(),
-    headcount_total: z.number().int().nonnegative().nullable().optional(),
-    is_confidential: z.boolean().optional(),
   }).passthrough(),
 );
 
@@ -179,8 +120,7 @@ const MATCH_PAYLOAD_v1 = z
     job_posting_id: z.string().nullable().optional(),
     jd_id: z.string().optional(),
   })
-  .passthrough()
-  .superRefine(addResumeProcessingContractIssues);
+  .passthrough();
 
 const MATCH_PASSED_NEED_INTERVIEW_v1 = envelope(MATCH_PAYLOAD_v1);
 const MATCH_PASSED_NO_INTERVIEW_v1 = envelope(MATCH_PAYLOAD_v1);
@@ -212,23 +152,18 @@ const MATCH_RULE_CHECK_PASSED_v1 = envelope(
     parsed_resume: z.record(z.string(), z.unknown()).nullable().optional(),
     parsed_content: z.string().nullable().optional(),
     runtime_context: z.record(z.string(), z.unknown()).optional(),
-  }).passthrough().superRefine(addResumeProcessingContractIssues),
+  }).passthrough(),
 );
 
 // MATCH_RULE_CHECK_FAILED — ruleCheckAgent rule-check 失败时 emit;
 // matching_score 在 rule-check 阶段固定为 null;data 里塞 failed_rules / decision。
 const MATCH_RULE_CHECK_FAILED_v1 = envelope(MATCH_PAYLOAD_v1);
 
-// JD_REJECTED — terminal human review result. It is retained for audit and
-// downstream visibility, but deliberately has no automatic createJD subscriber.
+// JD_REJECTED — when JD generation hits a business reject (unclear req etc.)
 const JD_REJECTED_v1 = envelope(
   z.object({
-    job_requisition_id: z.string().min(1),
-    jd_id: z.string().optional(),
-    rejector_id: z.string().nullable().optional(),
-    rejection_reason_code: z.string().optional(),
-    feedback_details: z.string().optional(),
-    revision_number: z.number().int().positive().optional(),
+    requirement_id: z.string().optional(),
+    reason: z.string(),
   }).passthrough(),
 );
 
@@ -346,17 +281,10 @@ const RESUME_LOCKED_CONFLICT_v1 = envelope(
 export const BUILTIN_SCHEMAS: EventSchemaRegistration[] = [
   {
     name: "REQUIREMENT_LOGGED",
-    description: "客户提交招聘需求；进入需求分析与澄清闸，不直接生成 JD",
+    description: "客户提交了一条招聘需求；触发 JD 生成",
     versions: [{ version: "1.0", schema: REQUIREMENT_LOGGED_v1 }],
     publishers: ["raas-dashboard", "raas-bridge"],
-    subscribers: ["raas-backend.requirement-clarification-gate"],
-  },
-  {
-    name: "CLARIFICATION_READY",
-    description: "需求澄清已收敛；放行 AO createJdAgent 生成或重生成 JD",
-    versions: [{ version: "1.0", schema: CLARIFICATION_READY_v1 }],
-    publishers: ["raas-backend.requirement-clarification-gate"],
-    subscribers: ["ao.createJdAgent"],
+    subscribers: ["createJdAgent"],
   },
   {
     name: "RESUME_DOWNLOADED",
@@ -404,21 +332,14 @@ export const BUILTIN_SCHEMAS: EventSchemaRegistration[] = [
     description: "createJdAgent 输出的 JD",
     versions: [{ version: "1.0", schema: JD_GENERATED_v1 }],
     publishers: ["createJdAgent"],
-    subscribers: ["raas-backend.hitl-event-fanout"],
-  },
-  {
-    name: "JD_APPROVED",
-    description: "HSM 审核通过 JD；触发招聘自动派单决策",
-    versions: [{ version: "1.0", schema: JD_APPROVED_v1 }],
-    publishers: ["raas-backend.jd-review"],
-    subscribers: ["ao.taskAssignerAgent"],
+    subscribers: ["raas-backend.jd-generated-sync"],
   },
   {
     name: "JD_REJECTED",
-    description: "RAAS 审核驳回 JD；保留审核结果，不触发自动重生成",
+    description: "JD 生成被业务拒绝（需澄清等）",
     versions: [{ version: "1.0", schema: JD_REJECTED_v1 }],
-    publishers: ["raas-backend.jd-review"],
-    subscribers: [],
+    publishers: ["createJdAgent"],
+    subscribers: ["raas-backend"],
   },
   {
     name: "MATCH_PASSED_NEED_INTERVIEW",

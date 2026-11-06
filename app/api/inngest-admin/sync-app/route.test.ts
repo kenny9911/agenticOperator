@@ -75,7 +75,7 @@ describe('POST /api/inngest-admin/sync-app', () => {
       )
       .mockResolvedValueOnce(
         new Response(JSON.stringify({
-          data: { apps: [{ name: 'agentic-operator-main', functionCount: 7 }] },
+          data: { apps: [{ name: 'agentic-operator-main', functionCount: 6 }] },
         }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -99,7 +99,7 @@ describe('POST /api/inngest-admin/sync-app', () => {
       )
       .mockResolvedValueOnce(
         new Response(JSON.stringify({
-          data: { apps: [{ name: 'agentic-operator-main', functionCount: 7 }] },
+          data: { apps: [{ name: 'agentic-operator-main', functionCount: 6 }] },
         }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -113,8 +113,8 @@ describe('POST /api/inngest-admin/sync-app', () => {
     expect(j.ok).toBe(true);
     expect(j.appUrl).toBe('http://app:3002/api/inngest');
     expect(j.inngestUrl).toBe('http://test-inngest:8288');
-    expect(j.functionsRegistered).toBe(7);
-    expect(j.expectedFunctions).toBe(7);
+    expect(j.functionsRegistered).toBe(6);
+    expect(j.expectedFunctions).toBe(6);
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     const [calledUrl, calledInit] = fetchSpy.mock.calls[0];

@@ -1,43 +1,5 @@
-import { afterEach, describe, it, expect, vi } from "vitest";
-
-vi.mock("@/lib/agent-logger", () => ({ currentLogger: vi.fn(() => null) }));
-vi.mock("@/lib/external-api-log", () => ({ logApiCall: vi.fn() }));
-
-import { patchInstance, pickDisplayName, pickId } from "./allmeta-client";
-
-afterEach(() => {
-  vi.restoreAllMocks();
-});
-
-describe("patchInstance", () => {
-  it("uses the single-instance PATCH route instead of collection POST replacement", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ candidate_id: "C/1", name: "人工姓名" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-
-    await patchInstance(
-      "Candidate",
-      "C/1",
-      { candidate_id: "C/1", name: "人工姓名" },
-      { baseUrl: "http://allmeta.test", domain: "RAAS-v1" },
-    );
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://allmeta.test/api/v1/ontology/instances/Candidate/C%2F1?domain=RAAS-v1",
-      expect.objectContaining({
-        method: "PATCH",
-        body: JSON.stringify({
-          candidate_id: "C/1",
-          name: "人工姓名",
-          domainId: "RAAS-v1",
-        }),
-      }),
-    );
-  });
-});
+import { describe, it, expect } from "vitest";
+import { pickDisplayName, pickId } from "./allmeta-client";
 
 describe("pickDisplayName", () => {
   it("Candidate: returns name field", () => {

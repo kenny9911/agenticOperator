@@ -8,18 +8,6 @@ vi.mock('./client', () => ({
     const client = {
       query: vi.fn(async (text: string, params: unknown[] = []) => {
         queries.push({ text, params });
-        if (/SELECT candidate_id FROM candidate\b/i.test(text)) {
-          return { rows: [{ candidate_id: 'candidate-1' }] };
-        }
-        if (/UPDATE candidate SET[\s\S]*RETURNING name, mobile/i.test(text)) {
-          return {
-            rows: [{
-              name: '张三', mobile: '13800138000', mobile_normalized: '13800138000',
-              email: null, gender: null, birth_date: null, current_location: null,
-              highest_acquired_degree: null, work_years: null, employee_id: null,
-            }],
-          };
-        }
         if (/SELECT candidate_expectation_id[\s\S]+FROM candidate/i.test(text)) {
           return { rows: [{ candidate_expectation_id: linkedExpectationIds }] };
         }
@@ -42,7 +30,8 @@ const baseInput = {
   upload_id: 'up-expectation',
   bucket: 'recruit-resume-raw',
   object_key: 'resumes/expectation.pdf',
-  parsed: { data: { name: '张三', phone: '13800138000' } },
+  candidate_id: 'candidate-1',
+  parsed: { data: { name: '张三' } },
 };
 
 function expectationUpsert() {

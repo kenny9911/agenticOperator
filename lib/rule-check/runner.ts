@@ -28,20 +28,13 @@ import type {
 import { chatComplete } from '@/server/llm/gateway';
 import { ruleCheckLog } from './log';
 import { createNullLogger, type AgentLogger } from '@/lib/agent-logger';
-import { createGuardedDispatcher } from './tool-guard';
-
-/** Tool-call rounds allowed per rule check (each round may hold several parallel calls). */
-export const RULE_CHECK_MAX_TOOL_ROUNDS = 8;
-const TOOL_BUDGET_HINT =
-  `Budget: at most ${RULE_CHECK_MAX_TOOL_ROUNDS} rounds in total — batch independent lookups into ONE round (parallel calls). ` +
-  'If a lookup returns null / [] / error, do NOT guess other labels or filters; mark the dependent rules insufficient_info and output the final JSON.';
 
 const TOOL_SCHEMA = [
   {
     type: 'function' as const,
     function: {
       name: 'get_instance',
-      description: `Fetch one ontology instance by label + primary key value. Only for data NOT already in GRAPH_CONTEXT. ${TOOL_BUDGET_HINT}`,
+      description: 'Fetch one ontology instance by label + primary key value.',
       parameters: {
         type: 'object',
         properties: {
@@ -56,7 +49,7 @@ const TOOL_SCHEMA = [
     type: 'function' as const,
     function: {
       name: 'list_instances',
-      description: `List instances of a label filtered by property equality. Only for data NOT already in GRAPH_CONTEXT. ${TOOL_BUDGET_HINT}`,
+      description: 'List instances of a label filtered by property equality.',
       parameters: {
         type: 'object',
         properties: {
@@ -71,7 +64,7 @@ const TOOL_SCHEMA = [
     type: 'function' as const,
     function: {
       name: 'list_links',
-      description: `List ontology links by from/to/type filters. Only for data NOT already in GRAPH_CONTEXT. ${TOOL_BUDGET_HINT}`,
+      description: 'List ontology links by from/to/type filters.',
       parameters: {
         type: 'object',
         properties: {
@@ -145,7 +138,6 @@ function failSafe(
       llm_raw_text: base.llm_raw_text ?? base.raw_llm_text,
       llm_finish_reason: base.llm_finish_reason,
       llm_error_detail: base.llm_error_detail,
-      llm_tool_trace: base.llm_tool_trace,
       parse_error: base.parse_error,
       user_prompt: base.user_prompt,
       system_prompt: base.system_prompt,
@@ -546,9 +538,7 @@ export async function runRuleCheck(
     steps: filteredSteps,
   });
 
-  // Guarded: repeated calls answered from cache, empty/error results carry a
-  // "stop guessing → insufficient_info" note, every call traced for the audit.
-  const guard = createGuardedDispatcher(createDispatcher(graph));
+  const dispatcher = createDispatcher(graph);
 
   ruleCheckLog.data('llm.request', {
     model: opts.model ?? null,
@@ -588,18 +578,8 @@ export async function runRuleCheck(
       // code works for Kimi K2.6 AND Gemini-3-flash-preview without changes.
       tools: {
         schema: TOOL_SCHEMA,
-        onToolCall: guard.dispatch,
-        // 5 rounds was too tight for JRs with many relationship rules
-        // (亲属关系 / 合规文档 …): the model legitimately fetches one entity per
-        // round and the whole run was parked as tool-use-loop-exceeded.
-        maxIterations: RULE_CHECK_MAX_TOOL_ROUNDS,
-        // Budget spent → force a final tools-disabled answer from what was
-        // already fetched; rules still unresolved become insufficient_info
-        // (→ supplement / human review) instead of failing the whole check.
-        finalizeOnLimit:
-          '工具调用次数已用完,不能再调用任何 tool。请立即基于 INPUT、GRAPH_CONTEXT 与已返回的 tool 结果,' +
-          '按要求输出最终 JSON(rule_results[] 覆盖全部规则)。仍无法确认的规则一律标记 insufficient_info,' +
-          '并在 reason 中说明缺少哪项信息。',
+        onToolCall: dispatcher,
+        maxIterations: 5,
       },
     });
   } catch (err) {
@@ -607,19 +587,14 @@ export async function runRuleCheck(
     const reason: MatchResumeCheckResult['audit']['fail_reason'] = /tool-use loop/.test(msg)
       ? 'tool-use-loop-exceeded'
       : 'llm-call-error';
-    // For a loop overrun, say WHAT the model kept asking for (the guard trace):
-    // that's the actionable part — usually a rule needing data the ontology
-    // doesn't have, not a timeout or token cap.
-    const detail = reason === 'tool-use-loop-exceeded' ? `${msg} | ${guard.summary()}` : msg;
-    ruleCheckLog.error('llm.failed', { reason, message: detail, tool_trace: guard.trace });
-    logger.event('llm.failed', { from: 'AI 模型', to: '智能体', reason, message: detail, tool_trace: guard.trace });
+    ruleCheckLog.error('llm.failed', { reason, message: msg });
+    logger.event('llm.failed', { from: 'AI 模型', to: '智能体', reason, message: msg });
     return failSafe(reason, {
       ...fetchedAudit,
       rules_evaluated: expectedRuleCount,
       graph_calls: graph.fetch_count,
       rule_source: sourceResult.source,
-      llm_error_detail: detail,
-      llm_tool_trace: guard.trace,
+      llm_error_detail: msg,
       user_prompt: userPrompt,
       system_prompt: MATCH_RESUME_SYSTEM_PROMPT,
     });
@@ -731,7 +706,6 @@ export async function runRuleCheck(
       llm_model: llmResult.modelUsed,
       llm_duration_ms: llmResult.durationMs,
       llm_round_trips: llmResult.toolUseIterations,
-      llm_tool_trace: guard.trace.length > 0 ? guard.trace : undefined,
       llm_prompt_tokens: llmResult.usage?.promptTokens,
       llm_completion_tokens: llmResult.usage?.completionTokens,
       rule_source: sourceResult.source,

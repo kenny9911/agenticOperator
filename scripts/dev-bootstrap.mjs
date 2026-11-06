@@ -6,19 +6,16 @@
 //
 // Steps (each one is no-op when already satisfied):
 //   1. Create `.env.local` from `.env.example` if missing.
-//   2. Start the local document converter when the configured URL is loopback.
-//   3. Provision the local Postgres (docker-compose.postgres.yml) and sync the
+//   2. Provision the local Postgres (docker-compose.postgres.yml) and sync the
 //      Prisma schema. Soft-fail if Docker is down so `next dev` still launches.
-//   4. Best-effort start the native Inngest dev server/CLI (soft-fail).
-//   5. Best-effort start the Inngest archiver in the background (dedup-guarded,
+//   3. Best-effort start the Inngest dev container (soft-fail).
+//   4. Best-effort start the Inngest archiver in the background (dedup-guarded,
 //      soft-fail) so the durable mirror keeps filling while you develop.
-//   6. Best-effort start the monitor sweeper (dedup-guarded, soft-fail).
 
 import { existsSync, copyFileSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { execFileSync, execSync, spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ensureLocalDocumentConverter } from "./local-converter-bootstrap.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const log = (m) => console.log(`[bootstrap] ${m}`);
@@ -74,18 +71,7 @@ const dockerUp = (() => {
   }
 })();
 
-// 2. Local Gotenberg/LibreOffice converter (soft-fail). Only a loopback
-//    DOCUMENT_CONVERTER_URL is owned by this local bootstrap; shared/remote
-//    converter origins must never cause a local container to be started.
-ensureLocalDocumentConverter({
-  env: process.env,
-  dockerAvailable: dockerUp,
-  root: ROOT,
-  log,
-  warn,
-});
-
-// 3. Local Postgres + schema sync
+// 2. Local Postgres + schema sync
 let pgReady = false;
 if (dockerUp) {
   try {
@@ -109,7 +95,7 @@ if (dockerUp) {
   warn("start Docker, then run `npm run pg:up && npx prisma db push`.");
 }
 
-// 4. Inngest event bus (soft-fail) — NATIVE inngest-cli only, NEVER Docker.
+// 3. Inngest event bus (soft-fail) — NATIVE inngest-cli only, NEVER Docker.
 //    A Docker-hosted Inngest can't reach the host app at localhost:3002 to
 //    complete SDK registration (agents fail to register with ECONNREFUSED),
 //    and it also breaks RAAS partner LAN access. The local CLI runs on the
@@ -209,7 +195,7 @@ if (inngestReachable(inngestBaseUrl)) {
   }
 }
 
-// 5. Inngest archiver (durable mirror) — background, dedup-guarded, soft-fail.
+// 4. Inngest archiver (durable mirror) — background, dedup-guarded, soft-fail.
 if (pgReady && process.env.ARCHIVE_ENABLED !== "0") {
   const alreadyRunning = hasRunningScript("scripts/inngest-archiver.ts");
   if (alreadyRunning) {
@@ -236,7 +222,7 @@ if (pgReady && process.env.ARCHIVE_ENABLED !== "0") {
   warn("skipping archiver (Postgres not ready). Start it later with `npm run archive`.");
 }
 
-// 6. Monitor sweeper (deterministic health/SLA/cost/error monitors) — background,
+// 5. Monitor sweeper (deterministic health/SLA/cost/error monitors) — background,
 //    dedup-guarded, soft-fail. Off-Inngest; reads the archive, writes Notification.
 if (pgReady && process.env.MONITOR_SWEEP !== "0") {
   const alreadyRunning = hasRunningScript("scripts/monitor-sweeper.ts");

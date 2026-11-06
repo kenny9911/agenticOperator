@@ -13,15 +13,6 @@ x-ao-service: &ao-service
   env_file:
     - ${AO_ENV_FILE:-.env.deploy}
   environment: &ao-environment
-    DEPLOY_MODE: ${DEPLOY_MODE:?DEPLOY_MODE must be shared or bundled}
-    AO_POSTGRES_VOLUME_MODE: ${AO_POSTGRES_VOLUME_MODE:?AO_POSTGRES_VOLUME_MODE must be new or external}
-    AO_EXISTING_POSTGRES_VOLUME: ${AO_EXISTING_POSTGRES_VOLUME:-}
-    DATABASE_SCHEMA_SYNC: ${DATABASE_SCHEMA_SYNC:?DATABASE_SCHEMA_SYNC must be 0 or 1}
-    # Forward the interpolation-time values explicitly. Otherwise bundled/external
-    # shell overrides affect Compose topology and preflight, while the container
-    # still sees stale shared/new values from env_file.
-    RAAS_SHARED_NETWORK: ${RAAS_SHARED_NETWORK:-}
-    AO_SHARED_NETWORK_ALIAS: ${AO_SHARED_NETWORK_ALIAS:-}
     NODE_ENV: production
     PORT: 3002
     HOSTNAME: 0.0.0.0
@@ -29,19 +20,13 @@ x-ao-service: &ao-service
     AO_LOG_DIR: /app/persist/logs
     AO_BASE_URL: http://app:3002
     INNGEST_DEV: "1"
-    # No fallback is intentional. Production defaults to a shared Inngest;
-    # both directions must be explicit so a typo cannot silently create an
-    # isolated event plane. Bundled mode must declare its own
-    # http://inngest:8288 / http://app:3002 values in .env.deploy.
-    INNGEST_BASE_URL: ${INNGEST_BASE_URL:?INNGEST_BASE_URL is required}
-    INNGEST_SERVE_ORIGIN: ${INNGEST_SERVE_ORIGIN:?INNGEST_SERVE_ORIGIN is required}
+    # Defaults target the bundled inngest service. For a SHARED Inngest
+    # (e.g. reusing an existing raas-inngest container on the same host),
+    # override both in .env.deploy and disable the bundled service by
+    # clearing COMPOSE_PROFILES. See docs/deploy/deployment.md.
+    INNGEST_BASE_URL: ${INNGEST_BASE_URL:-http://inngest:8288}
+    INNGEST_SERVE_ORIGIN: ${INNGEST_SERVE_ORIGIN:-http://app:3002}
     INNGEST_SERVE_PATH: /api/inngest
-    # PDF inputs pass through locally. DOC/DOCX inputs must be converted by the
-    # private Gotenberg service before any RoboHire request is attempted.
-    DOCUMENT_CONVERTER_URL: ${DOCUMENT_CONVERTER_URL:?DOCUMENT_CONVERTER_URL is required}
-    DOCUMENT_CONVERTER_TIMEOUT_MS: ${DOCUMENT_CONVERTER_TIMEOUT_MS:-130000}
-    DOCUMENT_CONVERTER_MAX_INPUT_BYTES: ${DOCUMENT_CONVERTER_MAX_INPUT_BYTES:-10485760}
-    DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES: ${DOCUMENT_CONVERTER_MAX_OUTPUT_BYTES:-10485760}
     NEXT_PUBLIC_BASE_URL: ${AO_PUBLIC_ORIGIN:-http://localhost:3002}
     NEXT_PUBLIC_INNGEST_URL: ${INNGEST_PUBLIC_ORIGIN:-http://localhost:8288}
     ARCHIVE_ENABLED: "1"
@@ -91,41 +76,6 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # Internal-only DOC/DOCX -> PDF conversion. There is deliberately no host
-  # port and no persistent volume: uploaded documents live only for the
-  # duration of a request. Both private and public outbound fetches are denied
-  # so links embedded in an untrusted Office document cannot reach the network.
-  gotenberg:
-    image: ${GOTENBERG_IMAGE:-gotenberg/gotenberg:8.34.0-libreoffice}
-    environment:
-      API_TIMEOUT: ${GOTENBERG_API_TIMEOUT:-120s}
-      API_BODY_LIMIT: ${GOTENBERG_API_BODY_LIMIT:-12MB}
-      API_DISABLE_DOWNLOAD_FROM: "true"
-      WEBHOOK_DISABLE: "true"
-      LIBREOFFICE_AUTO_START: "true"
-      LIBREOFFICE_MAX_QUEUE_SIZE: ${GOTENBERG_MAX_QUEUE_SIZE:-8}
-      LIBREOFFICE_DENY_PRIVATE_IPS: "true"
-      LIBREOFFICE_DENY_PUBLIC_IPS: "true"
-      LOG_STD_FORMAT: json
-    networks:
-      - converter-internal
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    init: true
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          cpus: ${GOTENBERG_CPUS:-1.0}
-          memory: ${GOTENBERG_MEMORY_LIMIT:-1G}
-          pids: ${GOTENBERG_PIDS_LIMIT:-256}
-
   app:
     <<: *ao-service
     command: ["web"]
@@ -134,11 +84,6 @@ services:
     depends_on:
       ao-postgres:
         condition: service_healthy
-      gotenberg:
-        condition: service_healthy
-    networks:
-      - default
-      - converter-internal
     healthcheck:
       test:
         [
@@ -153,9 +98,9 @@ services:
       start_period: 60s
 
   inngest:
-    # Explicit opt-in only. deploy-compose.sh clears host overrides, reads the
-    # authoritative profile from .env.deploy, and includes the shared overlay
-    # unless that file explicitly selects bundled mode.
+    # Bundled event engine — only started when COMPOSE_PROFILES includes
+    # "bundled-inngest". Deployments that join an existing shared Inngest
+    # (AO + RAAS on one instance) leave the profile unset.
     profiles: ["bundled-inngest"]
     image: ${INNGEST_IMAGE:-inngest/inngest:v1.19.2}
     working_dir: /var/lib/inngest
@@ -224,7 +169,3 @@ volumes:
     name: ${COMPOSE_PROJECT_NAME:-agentic-operator}-inngest-data
   ao-logs:
     name: ${COMPOSE_PROJECT_NAME:-agentic-operator}-logs
-
-networks:
-  converter-internal:
-    internal: true

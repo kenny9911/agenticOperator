@@ -94,7 +94,7 @@ describe('fetchLiveRegistry', () => {
         id: '4f667637-588a-53bf-ab83-a9245a9f8acc',  // ← UUID, not 'create-jd-agent'
         slug: 'agentic-operator-main-create-jd-agent',
         name: 'Create JD Agent',
-        triggers: [{ value: 'CLARIFICATION_READY' }],
+        triggers: [{ value: 'JD_REJECTED' }],
       },
     ]);
     const { fetchLiveRegistry } = await import('./inngest-registry');

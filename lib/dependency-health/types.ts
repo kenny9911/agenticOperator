@@ -23,12 +23,8 @@ export type DepProvider = 'robohire' | 'llm' | 'rmhr';
  */
 export type DepReason = 'quota' | 'auth' | 'rate_limit' | 'empty' | 'server' | 'network';
 
-/**
- * The windowed judgment the monitor renders to the operator.
- *   fault_warning — a few clean 5xx/timeouts: 故障预警 (warn), not yet confirmed
- *   fault         — failures persisted past the confirm threshold: 故障 (critical)
- */
-export type DepLabel = 'out_of_funds' | 'fault_warning' | 'fault' | 'unknown'; // 没钱了 / 故障预警 / 故障了 / 说不准
+/** The windowed judgment the monitor renders to the operator. */
+export type DepLabel = 'out_of_funds' | 'fault' | 'unknown'; // 没钱了 / 故障了 / 说不准
 
 /** The result of classifying one external call. */
 export type DepOutcome =
@@ -44,15 +40,4 @@ export interface DepFailure {
   runId: string | null;
   ts: Date;
   anchors?: Record<string, string>;
-}
-
-/**
- * A successful call to a dependency, reconstructed from a `dependency_ok`
- * LogEvent. Failures at/before the latest success for the same
- * (provider, domain) are dropped — the dependency has demonstrably recovered.
- */
-export interface DepSuccess {
-  provider: DepProvider;
-  domain: string;
-  ts: Date;
 }
